@@ -1,0 +1,12 @@
+# Limit test parallelism to prevent CPU saturation.
+#
+# Each integration test spawns a tokio runtime with TCP server + client.
+# Running 285+ tests in parallel creates hundreds of runtimes competing
+# for CPU, which can freeze the system. 4 threads keeps throughput high
+# while staying well within CPU budget.
+#
+# For benchmarks or real-GPU tests (which are already sequential by nature),
+# use --test-threads=1 explicitly.
+
+[env]
+RUST_TEST_THREADS = "4"

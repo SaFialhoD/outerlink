@@ -8,121 +8,11 @@
 //! than `OuterLinkClient` because `OuterLinkClient::send_request` calls
 //! `runtime.block_on()`, which panics when called from within a tokio context.
 
-use std::sync::Arc;
+mod common;
+use common::*;
 
-use tokio::net::TcpListener;
-
-use outerlink_common::cuda_types::CuResult;
-use outerlink_common::error::OuterLinkError;
-use outerlink_common::protocol::{MessageHeader, MessageType};
-use outerlink_common::tcp_transport::TcpTransportConnection;
-use outerlink_common::transport::TransportConnection;
-use outerlink_server::gpu_backend::{GpuBackend, StubGpuBackend};
-use outerlink_server::handler::handle_request;
-use outerlink_server::session::ConnectionSession;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Extract the `CuResult` from the first 4 bytes of a response payload.
-fn response_result(payload: &[u8]) -> CuResult {
-    assert!(
-        payload.len() >= 4,
-        "response payload too short ({} bytes)",
-        payload.len()
-    );
-    CuResult::from_raw(u32::from_le_bytes(payload[..4].try_into().unwrap()))
-}
-
-/// Assert the response indicates success and return the data portion (after
-/// the 4-byte `CuResult` prefix).
-fn assert_success(payload: &[u8]) -> &[u8] {
-    let result = response_result(payload);
-    assert_eq!(
-        result,
-        CuResult::Success,
-        "expected CuResult::Success, got {:?}",
-        result
-    );
-    &payload[4..]
-}
-
-/// Spawn a server task that accepts ONE connection on `listener`, runs the
-/// recv-handle-send loop until the client disconnects, then exits.
-///
-/// Returns a `JoinHandle` so the test can await server completion and catch
-/// any panics.
-fn spawn_server(
-    listener: TcpListener,
-    backend: Arc<dyn GpuBackend>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let (stream, _peer) = listener.accept().await.expect("accept failed");
-        let conn = TcpTransportConnection::new(stream).expect("server conn init failed");
-
-        let mut session = ConnectionSession::new();
-        loop {
-            let (header, payload) = match conn.recv_message().await {
-                Ok(msg) => msg,
-                Err(OuterLinkError::ConnectionClosed) => break,
-                Err(e) => panic!("server recv error: {e:?}"),
-            };
-
-            let (resp_header, resp_payload) = handle_request(&*backend, &header, &payload, &mut session);
-            conn.send_message(&resp_header, &resp_payload)
-                .await
-                .expect("server send failed");
-        }
-    })
-}
-
-/// Bind a TCP listener on localhost with an OS-assigned port and return
-/// both the listener and the address string suitable for client connection.
-async fn bind_server() -> (TcpListener, String) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind");
-    let addr = listener.local_addr().unwrap().to_string();
-    (listener, addr)
-}
-
-/// Connect a raw `TcpTransportConnection` to the given address.
-async fn connect_client(addr: &str) -> TcpTransportConnection {
-    let stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("client connect failed");
-    TcpTransportConnection::new(stream).expect("client conn init failed")
-}
-
-/// Send a request and receive the response. The caller provides the
-/// `request_id` so that multi-request tests can use incrementing IDs.
-///
-/// Asserts that the response header has `msg_type == Response` and that the
-/// `request_id` in the response matches what was sent.
-async fn roundtrip(
-    conn: &TcpTransportConnection,
-    msg_type: MessageType,
-    payload: &[u8],
-    request_id: u64,
-) -> (MessageHeader, Vec<u8>) {
-    let header = MessageHeader::new_request(request_id, msg_type, payload.len() as u32);
-    conn.send_message(&header, payload)
-        .await
-        .expect("client send failed");
-    let (resp_hdr, resp_payload) = conn.recv_message().await.expect("client recv failed");
-    assert_eq!(
-        resp_hdr.msg_type,
-        MessageType::Response,
-        "expected Response msg_type, got {:?}",
-        resp_hdr.msg_type
-    );
-    assert_eq!(
-        resp_hdr.request_id, request_id,
-        "response request_id should match the sent request_id"
-    );
-    (resp_hdr, resp_payload)
-}
+use outerlink_common::protocol::MessageType;
+use outerlink_server::gpu_backend::StubGpuBackend;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1053,6 +943,277 @@ async fn test_memcpy_dtod_invalid_src_e2e() {
         response_result(&payload),
         CuResult::InvalidValue,
         "MemcpyDtoD with invalid source should return InvalidValue"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Async memory copy E2E tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_memcpy_htod_async_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Allocate device memory.
+    let alloc_payload = 64_u64.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 1).await;
+    let data = assert_success(&payload);
+    let dev_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Create a stream.
+    let stream_payload = 0_u32.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::StreamCreate, &stream_payload, 2).await;
+    let data = assert_success(&payload);
+    let stream = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 3. MemcpyHtoDAsync: [8B dst][8B stream][data...]
+    let src_data = vec![0xABu8; 32];
+    let mut htod_payload = Vec::new();
+    htod_payload.extend_from_slice(&dev_ptr.to_le_bytes());
+    htod_payload.extend_from_slice(&stream.to_le_bytes());
+    htod_payload.extend_from_slice(&src_data);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemcpyHtoDAsync, &htod_payload, 3).await;
+    assert_success(&payload);
+
+    // 4. Verify data was written by reading it back (sync DtoH).
+    let mut dtoh_payload = [0u8; 16];
+    dtoh_payload[0..8].copy_from_slice(&dev_ptr.to_le_bytes());
+    dtoh_payload[8..16].copy_from_slice(&32_u64.to_le_bytes());
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyDtoH, &dtoh_payload, 4).await;
+    let data = assert_success(&payload);
+    assert_eq!(&data[..32], &src_data[..]);
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_memcpy_dtoh_async_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Allocate device memory and write data.
+    let alloc_payload = 64_u64.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 1).await;
+    let data = assert_success(&payload);
+    let dev_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    let src_data = vec![0xCDu8; 16];
+    let mut htod_payload = Vec::new();
+    htod_payload.extend_from_slice(&dev_ptr.to_le_bytes());
+    htod_payload.extend_from_slice(&src_data);
+    let (_hdr, _payload) = roundtrip(&client, MessageType::MemcpyHtoD, &htod_payload, 2).await;
+
+    // 2. Create a stream.
+    let stream_payload = 0_u32.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::StreamCreate, &stream_payload, 3).await;
+    let data = assert_success(&payload);
+    let stream = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 3. MemcpyDtoHAsync: [8B src][8B size][8B stream]
+    let mut dtoh_payload = [0u8; 24];
+    dtoh_payload[0..8].copy_from_slice(&dev_ptr.to_le_bytes());
+    dtoh_payload[8..16].copy_from_slice(&16_u64.to_le_bytes());
+    dtoh_payload[16..24].copy_from_slice(&stream.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemcpyDtoHAsync, &dtoh_payload, 4).await;
+    let data = assert_success(&payload);
+    assert_eq!(&data[..16], &src_data[..]);
+
+    drop(client);
+    server.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Memset E2E tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_memset_d8_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Allocate device memory.
+    let alloc_payload = 64_u64.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 1).await;
+    let data = assert_success(&payload);
+    let dev_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. MemsetD8: [8B dst][1B value][8B count]
+    let mut memset_payload = [0u8; 17];
+    memset_payload[0..8].copy_from_slice(&dev_ptr.to_le_bytes());
+    memset_payload[8] = 0x42;
+    memset_payload[9..17].copy_from_slice(&32_u64.to_le_bytes());
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemsetD8, &memset_payload, 2).await;
+    assert_success(&payload);
+
+    // 3. Read back and verify.
+    let mut dtoh_payload = [0u8; 16];
+    dtoh_payload[0..8].copy_from_slice(&dev_ptr.to_le_bytes());
+    dtoh_payload[8..16].copy_from_slice(&32_u64.to_le_bytes());
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyDtoH, &dtoh_payload, 3).await;
+    let data = assert_success(&payload);
+    assert!(data[..32].iter().all(|&b| b == 0x42));
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_memset_d32_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Allocate device memory (must be multiple of 4).
+    let alloc_payload = 64_u64.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 1).await;
+    let data = assert_success(&payload);
+    let dev_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. MemsetD32: [8B dst][4B value][8B count] -- count is # of u32 elements
+    let mut memset_payload = [0u8; 20];
+    memset_payload[0..8].copy_from_slice(&dev_ptr.to_le_bytes());
+    memset_payload[8..12].copy_from_slice(&0xDEADBEEF_u32.to_le_bytes());
+    memset_payload[12..20].copy_from_slice(&8_u64.to_le_bytes()); // 8 u32s = 32 bytes
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemsetD32, &memset_payload, 2).await;
+    assert_success(&payload);
+
+    // 3. Read back and verify.
+    let mut dtoh_payload = [0u8; 16];
+    dtoh_payload[0..8].copy_from_slice(&dev_ptr.to_le_bytes());
+    dtoh_payload[8..16].copy_from_slice(&32_u64.to_le_bytes()); // 8 * 4 = 32 bytes
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyDtoH, &dtoh_payload, 3).await;
+    let data = assert_success(&payload);
+    // Verify each u32 element
+    for i in 0..8 {
+        let val = u32::from_le_bytes(data[i * 4..(i + 1) * 4].try_into().unwrap());
+        assert_eq!(val, 0xDEADBEEF, "u32 element {i} mismatch");
+    }
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_memset_d8_async_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Allocate device memory.
+    let alloc_payload = 64_u64.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 1).await;
+    let data = assert_success(&payload);
+    let dev_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Create a stream.
+    let stream_payload = 0_u32.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::StreamCreate, &stream_payload, 2).await;
+    let data = assert_success(&payload);
+    let stream = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 3. MemsetD8Async: [8B dst][1B value][8B count][8B stream]
+    let mut memset_payload = [0u8; 25];
+    memset_payload[0..8].copy_from_slice(&dev_ptr.to_le_bytes());
+    memset_payload[8] = 0x77;
+    memset_payload[9..17].copy_from_slice(&16_u64.to_le_bytes());
+    memset_payload[17..25].copy_from_slice(&stream.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemsetD8Async, &memset_payload, 3).await;
+    assert_success(&payload);
+
+    // 4. Read back and verify.
+    let mut dtoh_payload = [0u8; 16];
+    dtoh_payload[0..8].copy_from_slice(&dev_ptr.to_le_bytes());
+    dtoh_payload[8..16].copy_from_slice(&16_u64.to_le_bytes());
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyDtoH, &dtoh_payload, 4).await;
+    let data = assert_success(&payload);
+    assert!(data[..16].iter().all(|&b| b == 0x77));
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_memset_d32_async_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Allocate device memory.
+    let alloc_payload = 64_u64.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 1).await;
+    let data = assert_success(&payload);
+    let dev_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Create a stream.
+    let stream_payload = 0_u32.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::StreamCreate, &stream_payload, 2).await;
+    let data = assert_success(&payload);
+    let stream = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 3. MemsetD32Async: [8B dst][4B value][8B count][8B stream]
+    let mut memset_payload = [0u8; 28];
+    memset_payload[0..8].copy_from_slice(&dev_ptr.to_le_bytes());
+    memset_payload[8..12].copy_from_slice(&0xCAFEBABE_u32.to_le_bytes());
+    memset_payload[12..20].copy_from_slice(&4_u64.to_le_bytes()); // 4 u32s = 16 bytes
+    memset_payload[20..28].copy_from_slice(&stream.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemsetD32Async, &memset_payload, 3).await;
+    assert_success(&payload);
+
+    // 4. Read back and verify.
+    let mut dtoh_payload = [0u8; 16];
+    dtoh_payload[0..8].copy_from_slice(&dev_ptr.to_le_bytes());
+    dtoh_payload[8..16].copy_from_slice(&16_u64.to_le_bytes());
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyDtoH, &dtoh_payload, 4).await;
+    let data = assert_success(&payload);
+    for i in 0..4 {
+        let val = u32::from_le_bytes(data[i * 4..(i + 1) * 4].try_into().unwrap());
+        assert_eq!(val, 0xCAFEBABE, "u32 element {i} mismatch");
+    }
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_memset_d8_short_payload_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // Send a too-short payload for MemsetD8 (needs 17 bytes minimum).
+    let short_payload = [0u8; 8];
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemsetD8, &short_payload, 1).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::InvalidValue,
+        "MemsetD8 with short payload should return InvalidValue"
     );
 
     drop(client);

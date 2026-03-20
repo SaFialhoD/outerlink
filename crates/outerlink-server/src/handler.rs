@@ -494,6 +494,95 @@ pub fn handle_request(
             }
         }
 
+        MessageType::MemcpyHtoDAsync => {
+            // [8B dst][8B stream][data...]
+            if payload.len() < 16 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let dst = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let stream = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            let data = &payload[16..];
+            if data.is_empty() {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            match backend.memcpy_htod_async(dst, data, stream) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemcpyDtoHAsync => {
+            // [8B src][8B size][8B stream]
+            if payload.len() < 24 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let src = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let size = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+            let stream = u64::from_le_bytes(payload[16..24].try_into().unwrap());
+            match backend.memcpy_dtoh_async(src, size, stream) {
+                Ok(buf) => success_with(rid, &buf),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemsetD8 => {
+            // [8B dst][1B value][8B count]
+            if payload.len() < 17 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let dst = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let value = payload[8];
+            let count = u64::from_le_bytes(payload[9..17].try_into().unwrap()) as usize;
+            match backend.memset_d8(dst, value, count) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemsetD32 => {
+            // [8B dst][4B value][8B count]
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let dst = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let value = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let count = u64::from_le_bytes(payload[12..20].try_into().unwrap()) as usize;
+            match backend.memset_d32(dst, value, count) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemsetD8Async => {
+            // [8B dst][1B value][8B count][8B stream]
+            if payload.len() < 25 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let dst = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let value = payload[8];
+            let count = u64::from_le_bytes(payload[9..17].try_into().unwrap()) as usize;
+            let stream = u64::from_le_bytes(payload[17..25].try_into().unwrap());
+            match backend.memset_d8_async(dst, value, count, stream) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemsetD32Async => {
+            // [8B dst][4B value][8B count][8B stream]
+            if payload.len() < 28 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let dst = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let value = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let count = u64::from_le_bytes(payload[12..20].try_into().unwrap()) as usize;
+            let stream = u64::from_le_bytes(payload[20..28].try_into().unwrap());
+            match backend.memset_d32_async(dst, value, count, stream) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         MessageType::MemcpyDtoD => {
             // [8B dst][8B src][8B size] = 24 bytes minimum
             if payload.len() < 24 {
@@ -1580,5 +1669,234 @@ mod tests {
         let hdr = req(MessageType::LaunchKernel, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr, &payload);
         assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    // ----- MemcpyHtoDAsync / MemcpyDtoHAsync handler tests -----
+
+    #[test]
+    fn test_memcpy_htod_async_handler() {
+        let gpu = StubGpuBackend::new();
+
+        // Alloc 64 bytes.
+        let alloc_payload = 64u64.to_le_bytes();
+        let hdr = req(MessageType::MemAlloc, alloc_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &alloc_payload);
+        let ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Create a stream.
+        let stream_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::StreamCreate, stream_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &stream_payload);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // HtoDAsync: [8B dst][8B stream][data]
+        let mut payload = ptr.to_le_bytes().to_vec();
+        payload.extend_from_slice(&stream.to_le_bytes());
+        payload.extend_from_slice(&vec![0xEE; 64]);
+        let hdr = req(MessageType::MemcpyHtoDAsync, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Read back to verify.
+        let mut dtoh_payload = ptr.to_le_bytes().to_vec();
+        dtoh_payload.extend_from_slice(&64u64.to_le_bytes());
+        let hdr = req(MessageType::MemcpyDtoH, dtoh_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &dtoh_payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(&resp[4..], &vec![0xEE; 64]);
+    }
+
+    #[test]
+    fn test_memcpy_htod_async_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 10]; // too short (needs >= 17)
+        let hdr = req(MessageType::MemcpyHtoDAsync, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_memcpy_dtoh_async_handler() {
+        let gpu = StubGpuBackend::new();
+
+        // Alloc and fill.
+        let alloc_payload = 32u64.to_le_bytes();
+        let hdr = req(MessageType::MemAlloc, alloc_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &alloc_payload);
+        let ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        let mut htod_payload = ptr.to_le_bytes().to_vec();
+        htod_payload.extend_from_slice(&vec![0xBB; 32]);
+        let hdr = req(MessageType::MemcpyHtoD, htod_payload.len() as u32);
+        dispatch(&gpu, &hdr, &htod_payload);
+
+        // Create a stream.
+        let stream_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::StreamCreate, stream_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &stream_payload);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // DtoHAsync: [8B src][8B size][8B stream]
+        let mut payload = ptr.to_le_bytes().to_vec();
+        payload.extend_from_slice(&32u64.to_le_bytes());
+        payload.extend_from_slice(&stream.to_le_bytes());
+        let hdr = req(MessageType::MemcpyDtoHAsync, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(&resp[4..], &vec![0xBB; 32]);
+    }
+
+    #[test]
+    fn test_memcpy_dtoh_async_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 10]; // too short (needs 24)
+        let hdr = req(MessageType::MemcpyDtoHAsync, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- MemsetD8 / MemsetD32 handler tests -----
+
+    #[test]
+    fn test_memset_d8_handler() {
+        let gpu = StubGpuBackend::new();
+
+        // Alloc 64 bytes.
+        let alloc_payload = 64u64.to_le_bytes();
+        let hdr = req(MessageType::MemAlloc, alloc_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &alloc_payload);
+        let ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // MemsetD8: [8B dst][1B value][8B count]
+        let mut payload = ptr.to_le_bytes().to_vec();
+        payload.push(0xAA); // value
+        payload.extend_from_slice(&64u64.to_le_bytes()); // count
+        let hdr = req(MessageType::MemsetD8, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Read back to verify.
+        let mut dtoh_payload = ptr.to_le_bytes().to_vec();
+        dtoh_payload.extend_from_slice(&64u64.to_le_bytes());
+        let hdr = req(MessageType::MemcpyDtoH, dtoh_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &dtoh_payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert!(resp[4..].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn test_memset_d8_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 10]; // too short (needs 17)
+        let hdr = req(MessageType::MemsetD8, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_memset_d32_handler() {
+        let gpu = StubGpuBackend::new();
+
+        // Alloc 16 bytes (4 u32 elements).
+        let alloc_payload = 16u64.to_le_bytes();
+        let hdr = req(MessageType::MemAlloc, alloc_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &alloc_payload);
+        let ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // MemsetD32: [8B dst][4B value][8B count]
+        let mut payload = ptr.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0xDEADBEEFu32.to_le_bytes()); // value
+        payload.extend_from_slice(&4u64.to_le_bytes()); // count (4 elements)
+        let hdr = req(MessageType::MemsetD32, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Read back to verify.
+        let mut dtoh_payload = ptr.to_le_bytes().to_vec();
+        dtoh_payload.extend_from_slice(&16u64.to_le_bytes());
+        let hdr = req(MessageType::MemcpyDtoH, dtoh_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &dtoh_payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let val_bytes = 0xDEADBEEFu32.to_le_bytes();
+        for i in 0..4 {
+            assert_eq!(&resp[4+i*4..4+i*4+4], &val_bytes);
+        }
+    }
+
+    #[test]
+    fn test_memset_d32_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 10]; // too short (needs 20)
+        let hdr = req(MessageType::MemsetD32, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- MemsetD8Async / MemsetD32Async handler tests -----
+
+    #[test]
+    fn test_memset_d8_async_handler() {
+        let gpu = StubGpuBackend::new();
+
+        let alloc_payload = 32u64.to_le_bytes();
+        let hdr = req(MessageType::MemAlloc, alloc_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &alloc_payload);
+        let ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        let stream_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::StreamCreate, stream_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &stream_payload);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // MemsetD8Async: [8B dst][1B value][8B count][8B stream]
+        let mut payload = ptr.to_le_bytes().to_vec();
+        payload.push(0x55); // value
+        payload.extend_from_slice(&32u64.to_le_bytes()); // count
+        payload.extend_from_slice(&stream.to_le_bytes()); // stream
+        let hdr = req(MessageType::MemsetD8Async, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_memset_d8_async_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 10]; // too short (needs 25)
+        let hdr = req(MessageType::MemsetD8Async, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_memset_d32_async_handler() {
+        let gpu = StubGpuBackend::new();
+
+        let alloc_payload = 16u64.to_le_bytes();
+        let hdr = req(MessageType::MemAlloc, alloc_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &alloc_payload);
+        let ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        let stream_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::StreamCreate, stream_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &stream_payload);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // MemsetD32Async: [8B dst][4B value][8B count][8B stream]
+        let mut payload = ptr.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0xCAFEu32.to_le_bytes()); // value
+        payload.extend_from_slice(&4u64.to_le_bytes()); // count
+        payload.extend_from_slice(&stream.to_le_bytes()); // stream
+        let hdr = req(MessageType::MemsetD32Async, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_memset_d32_async_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 10]; // too short (needs 28)
+        let hdr = req(MessageType::MemsetD32Async, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }

@@ -128,6 +128,10 @@ CUresult cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteC
 CUresult cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount);
 CUresult cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice, const void *srcHost, size_t ByteCount, CUstream hStream);
 CUresult cuMemcpyDtoHAsync_v2(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream);
+CUresult cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N);
+CUresult cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N);
+CUresult cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUstream hStream);
+CUresult cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui, size_t N, CUstream hStream);
 CUresult cuMemAllocHost(void **pp, size_t bytesize);
 CUresult cuMemAllocHost_v2(void **pp, size_t bytesize);
 CUresult cuMemFreeHost(void *p);

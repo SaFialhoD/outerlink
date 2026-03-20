@@ -53,6 +53,12 @@ extern CUresult ol_cuMemcpyDtoH_v2(void *dstHost, unsigned long long srcDevice, 
 extern CUresult ol_cuMemcpyDtoD(unsigned long long dst, unsigned long long src, size_t ByteCount);
 extern CUresult ol_cuMemAllocHost(void **pp, size_t bytesize);
 extern CUresult ol_cuMemFreeHost(void *p);
+extern CUresult ol_cuMemcpyHtoDAsync_v2(unsigned long long dstDevice, const void *srcHost, size_t ByteCount, unsigned long long hStream);
+extern CUresult ol_cuMemcpyDtoHAsync_v2(void *dstHost, unsigned long long srcDevice, size_t ByteCount, unsigned long long hStream);
+extern CUresult ol_cuMemsetD8(unsigned long long dstDevice, unsigned char value, size_t count);
+extern CUresult ol_cuMemsetD32(unsigned long long dstDevice, unsigned int value, size_t count);
+extern CUresult ol_cuMemsetD8Async(unsigned long long dstDevice, unsigned char value, size_t count, unsigned long long hStream);
+extern CUresult ol_cuMemsetD32Async(unsigned long long dstDevice, unsigned int value, size_t count, unsigned long long hStream);
 extern CUresult ol_cuMemGetInfo_v2(size_t *free, size_t *total);
 
 /* Error handling -- CUresult is an enum (int-sized) */
@@ -134,6 +140,12 @@ CUresult hook_cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice, size_t ByteC
 CUresult hook_cuMemcpyDtoD(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount);
 CUresult hook_cuMemAllocHost(void **pp, size_t bytesize);
 CUresult hook_cuMemFreeHost(void *p);
+CUresult hook_cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice, const void *srcHost, size_t ByteCount, CUstream hStream);
+CUresult hook_cuMemcpyDtoHAsync_v2(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream);
+CUresult hook_cuMemsetD8(CUdeviceptr dstDevice, unsigned char value, size_t count);
+CUresult hook_cuMemsetD32(CUdeviceptr dstDevice, unsigned int value, size_t count);
+CUresult hook_cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char value, size_t count, CUstream hStream);
+CUresult hook_cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int value, size_t count, CUstream hStream);
 CUresult hook_cuMemGetInfo_v2(size_t *free, size_t *total);
 
 /* Error */
