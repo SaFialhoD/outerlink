@@ -3,16 +3,16 @@
 //! Used by `integration.rs`, `bench_transport.rs`, and `real_gpu_test.rs`
 //! via `mod common;` + `use common::*;`.
 
-use std::sync::Arc;
+pub use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use outerlink_common::cuda_types::CuResult;
+pub use outerlink_common::cuda_types::CuResult;
 use outerlink_common::error::OuterLinkError;
-use outerlink_common::protocol::{MessageHeader, MessageType};
-use outerlink_common::tcp_transport::TcpTransportConnection;
+pub use outerlink_common::protocol::{MessageHeader, MessageType};
+pub use outerlink_common::tcp_transport::TcpTransportConnection;
 use outerlink_common::transport::TransportConnection;
-use outerlink_server::gpu_backend::GpuBackend;
+pub use outerlink_server::gpu_backend::GpuBackend;
 use outerlink_server::handler::handle_request;
 use outerlink_server::session::ConnectionSession;
 
