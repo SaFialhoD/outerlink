@@ -51,6 +51,24 @@ pub trait GpuBackend: Send + Sync {
 
     /// Return `(free, total)` memory in bytes.
     fn mem_get_info(&self) -> Result<(usize, usize), CuResult>;
+
+    /// Create a new CUDA context on the given device.
+    fn ctx_create(&self, flags: u32, device: i32) -> Result<u64, CuResult>;
+
+    /// Destroy a CUDA context.
+    fn ctx_destroy(&self, ctx: u64) -> Result<(), CuResult>;
+
+    /// Set the current CUDA context for the calling thread.
+    fn ctx_set_current(&self, ctx: u64) -> Result<(), CuResult>;
+
+    /// Get the current CUDA context.
+    fn ctx_get_current(&self) -> Result<u64, CuResult>;
+
+    /// Get the device ordinal for a context.
+    fn ctx_get_device(&self, ctx: u64) -> Result<i32, CuResult>;
+
+    /// Synchronize the current context (block until all work completes).
+    fn ctx_synchronize(&self) -> Result<(), CuResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +81,12 @@ const STUB_TOTAL_MEM: usize = 24 * 1024 * 1024 * 1024;
 /// Simulated GPU name.
 const STUB_GPU_NAME: &str = "OuterLink Virtual GPU";
 
+/// Metadata for a stub CUDA context.
+struct StubContext {
+    device: i32,
+    flags: u32,
+}
+
 /// Combined state for the stub GPU backend, protected by a single `Mutex`
 /// to prevent deadlocks from multi-lock acquisition ordering.
 struct StubState {
@@ -70,6 +94,12 @@ struct StubState {
     allocations: HashMap<u64, Vec<u8>>,
     /// Monotonically increasing counter for fake device pointers.
     next_ptr: u64,
+    /// Simulated CUDA contexts: maps context handle -> context info.
+    contexts: HashMap<u64, StubContext>,
+    /// Counter for generating context handles (starts at a distinctive address).
+    next_ctx_id: u64,
+    /// The current context handle (0 = none).
+    current_ctx: u64,
 }
 
 impl StubState {
@@ -98,6 +128,10 @@ impl StubGpuBackend {
                 allocations: HashMap::new(),
                 // Start at a recognisable fake base address.
                 next_ptr: 0x0000_DEAD_0000_0000,
+                contexts: HashMap::new(),
+                // Start at a distinctive base so context handles are debuggable.
+                next_ctx_id: 0xC000_0000_0000_0001,
+                current_ctx: 0,
             }),
         }
     }
@@ -228,6 +262,58 @@ impl GpuBackend for StubGpuBackend {
         let used = self.state.lock().unwrap().used_bytes();
         Ok((STUB_TOTAL_MEM - used, STUB_TOTAL_MEM))
     }
+
+    fn ctx_create(&self, flags: u32, device: i32) -> Result<u64, CuResult> {
+        Self::check_device(device)?;
+        let mut state = self.state.lock().unwrap();
+        let id = state.next_ctx_id;
+        state.next_ctx_id += 1;
+        state.contexts.insert(id, StubContext { device, flags });
+        state.current_ctx = id;
+        Ok(id)
+    }
+
+    fn ctx_destroy(&self, ctx: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if state.contexts.remove(&ctx).is_none() {
+            return Err(CuResult::InvalidContext);
+        }
+        if state.current_ctx == ctx {
+            state.current_ctx = 0;
+        }
+        Ok(())
+    }
+
+    fn ctx_set_current(&self, ctx: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if ctx == 0 {
+            state.current_ctx = 0;
+            return Ok(());
+        }
+        if !state.contexts.contains_key(&ctx) {
+            return Err(CuResult::InvalidContext);
+        }
+        state.current_ctx = ctx;
+        Ok(())
+    }
+
+    fn ctx_get_current(&self) -> Result<u64, CuResult> {
+        let state = self.state.lock().unwrap();
+        Ok(state.current_ctx)
+    }
+
+    fn ctx_get_device(&self, ctx: u64) -> Result<i32, CuResult> {
+        let state = self.state.lock().unwrap();
+        match state.contexts.get(&ctx) {
+            Some(c) => Ok(c.device),
+            None => Err(CuResult::InvalidContext),
+        }
+    }
+
+    fn ctx_synchronize(&self) -> Result<(), CuResult> {
+        // Stub has no asynchronous work to synchronize.
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -349,5 +435,53 @@ mod tests {
         assert_eq!(free2, total - 1024);
 
         gpu.mem_free(ptr);
+    }
+
+    #[test]
+    fn test_ctx_create_and_destroy() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        assert_ne!(ctx, 0);
+        // Should be set as current.
+        assert_eq!(gpu.ctx_get_current().unwrap(), ctx);
+        // Destroy it.
+        assert!(gpu.ctx_destroy(ctx).is_ok());
+        // Current should now be cleared.
+        assert_eq!(gpu.ctx_get_current().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_ctx_set_current() {
+        let gpu = StubGpuBackend::new();
+        let ctx1 = gpu.ctx_create(0, 0).unwrap();
+        let ctx2 = gpu.ctx_create(0, 0).unwrap();
+        // ctx2 should be current (most recently created).
+        assert_eq!(gpu.ctx_get_current().unwrap(), ctx2);
+        // Switch to ctx1.
+        assert!(gpu.ctx_set_current(ctx1).is_ok());
+        assert_eq!(gpu.ctx_get_current().unwrap(), ctx1);
+        // Unset current (ctx=0).
+        assert!(gpu.ctx_set_current(0).is_ok());
+        assert_eq!(gpu.ctx_get_current().unwrap(), 0);
+        // Invalid context should error.
+        assert_eq!(gpu.ctx_set_current(0xBAAD), Err(CuResult::InvalidContext));
+    }
+
+    #[test]
+    fn test_ctx_get_device() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        assert_eq!(gpu.ctx_get_device(ctx).unwrap(), 0);
+        // Invalid context should error.
+        assert_eq!(gpu.ctx_get_device(0xBAAD), Err(CuResult::InvalidContext));
+    }
+
+    #[test]
+    fn test_ctx_double_destroy() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        assert!(gpu.ctx_destroy(ctx).is_ok());
+        // Second destroy should fail.
+        assert_eq!(gpu.ctx_destroy(ctx), Err(CuResult::InvalidContext));
     }
 }

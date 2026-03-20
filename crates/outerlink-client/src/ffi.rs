@@ -4,12 +4,16 @@
 //! directly. These form the boundary between the thin C interposition layer and
 //! the Rust client logic.
 //!
-//! Current implementation: stub values that prove the FFI link works.
-//! Next phase: serialize calls and send to remote OuterLink server.
+//! When the client is connected to a server, requests are serialized and sent
+//! over TCP. When disconnected (no server available), stub values are returned
+//! so tests and local development continue to work.
 
 use std::ffi::CStr;
 use std::ptr;
+use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
+
+use outerlink_common::protocol::MessageType;
 
 use crate::OuterLinkClient;
 
@@ -23,6 +27,7 @@ const CUDA_ERROR_NOT_INITIALIZED: u32 = 3;
 const CUDA_ERROR_INVALID_DEVICE: u32 = 101;
 const CUDA_ERROR_INVALID_CONTEXT: u32 = 201;
 const CUDA_ERROR_NOT_FOUND: u32 = 500;
+const CUDA_ERROR_UNKNOWN: u32 = 999;
 
 // ---------------------------------------------------------------------------
 // Global client singleton
@@ -53,10 +58,28 @@ fn get_client() -> &'static OuterLinkClient {
     })
 }
 
+/// Extract the CuResult (first 4 LE bytes) from a response payload.
+/// Returns `CUDA_ERROR_UNKNOWN` when the payload is too short.
+fn parse_result(resp: &[u8]) -> u32 {
+    if resp.len() < 4 {
+        return CUDA_ERROR_UNKNOWN;
+    }
+    u32::from_le_bytes(resp[0..4].try_into().unwrap())
+}
+
 /// Explicit init entry point for the C layer.
+///
+/// Initializes the global client singleton and attempts to connect to the
+/// server. If the connection fails, the client stays in disconnected stub
+/// mode and a warning is logged.
 #[no_mangle]
 pub extern "C" fn ol_client_init() {
-    let _ = get_client();
+    let client = get_client();
+    if !client.connected.load(Ordering::Acquire) {
+        if let Err(e) = client.connect() {
+            tracing::warn!("OuterLink: failed to connect to server: {}", e);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -72,11 +95,27 @@ pub extern "C" fn ol_cuInit(flags: u32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn ol_cuDriverGetVersion(driver_version: *mut i32) -> u32 {
-    let _ = get_client();
+    let client = get_client();
     if driver_version.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // Report CUDA 12.4 (12040) -- must match server stub version
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DriverGetVersion, &[]) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe {
+                    *driver_version = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: report CUDA 12.4 (12040)
     unsafe { *driver_version = 12040 };
     CUDA_SUCCESS
 }
@@ -87,9 +126,24 @@ pub extern "C" fn ol_cuDriverGetVersion(driver_version: *mut i32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn ol_cuDeviceGetCount(count: *mut i32) -> u32 {
-    let _ = get_client();
+    let client = get_client();
     if count.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DeviceGetCount, &[]) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe {
+                    *count = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
     }
     // Stub: report 1 virtual GPU
     unsafe { *count = 1 };
@@ -111,10 +165,41 @@ pub extern "C" fn ol_cuDeviceGet(device: *mut i32, ordinal: i32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn ol_cuDeviceGetName(name: *mut u8, len: i32, dev: i32) -> u32 {
-    let _ = get_client();
+    let client = get_client();
     if name.is_null() || len <= 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let payload = dev.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DeviceGetName, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            // Response data: 4 bytes CuResult + 4 bytes u32 name_len + name_len bytes UTF-8
+            if resp.len() >= 8 {
+                let name_len =
+                    u32::from_le_bytes(resp[4..8].try_into().unwrap()) as usize;
+                if resp.len() >= 8 + name_len {
+                    let name_bytes = &resp[8..8 + name_len];
+                    let buf_size = len as usize;
+                    let copy_len =
+                        std::cmp::min(buf_size.saturating_sub(1), name_bytes.len());
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            name_bytes.as_ptr(),
+                            name,
+                            copy_len,
+                        );
+                        *name.add(copy_len) = 0; // null-terminate
+                    }
+                    return CUDA_SUCCESS;
+                }
+            }
+        }
+    }
+    // Stub fallback
     if dev < 0 || dev >= 1 {
         return CUDA_ERROR_INVALID_DEVICE;
     }
@@ -130,14 +215,34 @@ pub extern "C" fn ol_cuDeviceGetName(name: *mut u8, len: i32, dev: i32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn ol_cuDeviceGetAttribute(pi: *mut i32, attrib: i32, dev: i32) -> u32 {
-    let _ = get_client();
+    let client = get_client();
     if pi.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = [0u8; 8];
+        payload[0..4].copy_from_slice(&attrib.to_le_bytes());
+        payload[4..8].copy_from_slice(&dev.to_le_bytes());
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::DeviceGetAttribute, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe {
+                    *pi = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback
     if dev < 0 || dev >= 1 {
         return CUDA_ERROR_INVALID_DEVICE;
     }
-    // Stub attribute values for common queries
     let value = match attrib {
         1 => 1024,   // MAX_THREADS_PER_BLOCK
         2 => 1024,   // MAX_BLOCK_DIM_X
@@ -158,28 +263,67 @@ pub extern "C" fn ol_cuDeviceGetAttribute(pi: *mut i32, attrib: i32, dev: i32) -
 
 #[no_mangle]
 pub extern "C" fn ol_cuDeviceTotalMem_v2(bytes: *mut usize, dev: i32) -> u32 {
-    let _ = get_client();
+    let client = get_client();
     if bytes.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // Connected: ask the server
+    // Response format: 4 bytes CuResult + 8 bytes u64 (total mem)
+    if client.connected.load(Ordering::Acquire) {
+        let payload = dev.to_le_bytes();
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::DeviceTotalMem, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let total = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                unsafe {
+                    *bytes = total as usize;
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback
     if dev < 0 || dev >= 1 {
         return CUDA_ERROR_INVALID_DEVICE;
     }
-    // Stub: 24 GB VRAM
     unsafe { *bytes = 24 * 1024 * 1024 * 1024 };
     CUDA_SUCCESS
 }
 
 #[no_mangle]
 pub extern "C" fn ol_cuDeviceGetUuid(uuid: *mut u8, dev: i32) -> u32 {
-    let _ = get_client();
+    let client = get_client();
     if uuid.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // Connected: ask the server
+    // Response format: 4 bytes CuResult + 16 bytes UUID
+    if client.connected.load(Ordering::Acquire) {
+        let payload = dev.to_le_bytes();
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::DeviceGetUuid, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 20 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(resp[4..20].as_ptr(), uuid, 16);
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback
     if dev < 0 || dev >= 1 {
         return CUDA_ERROR_INVALID_DEVICE;
     }
-    // Stub: deterministic UUID based on device ordinal
     unsafe {
         std::ptr::write_bytes(uuid, 0, 16);
         *uuid.add(0) = b'O';
@@ -316,9 +460,28 @@ pub extern "C" fn ol_cuMemcpyDtoH_v2(
 
 #[no_mangle]
 pub extern "C" fn ol_cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> u32 {
-    let _ = get_client();
+    let client = get_client();
     if free.is_null() || total.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    // Response format: 4 bytes CuResult + 8 bytes u64 free + 8 bytes u64 total
+    if client.connected.load(Ordering::Acquire) {
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemGetInfo, &[]) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 20 {
+                let free_val = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let total_val = u64::from_le_bytes(resp[12..20].try_into().unwrap());
+                unsafe {
+                    *free = free_val as usize;
+                    *total = total_val as usize;
+                }
+                return CUDA_SUCCESS;
+            }
+        }
     }
     // Stub: 24 GB total, 20 GB free
     unsafe {
