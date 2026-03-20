@@ -67,6 +67,44 @@
 - P3 (CI/CD) missing from "next steps" sequence in pre-plan
 - No contingency plan for protocol/serialization format issues
 
+### Implementation Review Round 2 (2026-03-20) - Code Reviews
+
+**TCP Transport - 3 Critical:**
+1. `recv_message` error loses msg_type diagnostic value
+2. `set_nodelay` error mapped inconsistently + doc claims buffer tuning that doesn't exist
+3. `recv_bulk` has no upper bound on size - OOM DoS from malicious peer
+
+**Server - 4 Critical:**
+1. Handshake message type never handled (returns error)
+2. TOCTOU race in mem_alloc (concurrent allocs can exceed VRAM limit)
+3. main.rs bypasses TcpTransportConnection (no TCP_NODELAY, duplicated logic)
+4. MemcpyHtoD with zero bytes has ambiguous behavior
+
+**Client FFI - 5 Critical:**
+1. ol_cuDeviceGetName null termination bug on exact-length buffers
+2. ol_cuCtxCreate inserts wrong remote value (deduplication collision)
+3. dlsym override -> ensure_init -> ol_client_init may trigger recursive dlsym (latent)
+4. cuGetProcAddress hook skips version negotiation with real driver
+5. OuterLinkClient.connected is plain bool on shared reference (needs AtomicBool)
+
+**Integration Readiness - 5 Critical:**
+1. OuterLinkClient has no transport connection (just a struct with no networking)
+2. No sync/async bridge (CUDA API is sync, tokio is async, no block_on anywhere)
+3. No serialization code in any FFI function (all stubs return hardcoded values)
+4. Handle translation wired backwards (inserts fake remote values, not real server handles)
+5. Server main.rs doesn't use TcpTransportConnection
+
+**Integration: 9-Step Roadmap to First E2E Call:**
+1. Add tokio runtime + TCP connection to OuterLinkClient
+2. Add send_request() helper method
+3. Wire ol_cuDeviceGetCount (FIRST REAL NETWORKED CALL)
+4. Wire remaining device queries
+5. Wire CtxCreate with real handle translation
+6. Extend server handler for context operations
+7. Wire MemAlloc/MemFree with handle translation
+8. Wire MemcpyHtoD/DtoH (actual GPU data over network)
+9. Migrate server main.rs to TcpTransportConnection
+
 ### For Implementation Phase (Not Plan Fixes)
 10. Convert CUDA handle types to newtypes
 11. Add CuResult::Other(u32) for unknown error codes
