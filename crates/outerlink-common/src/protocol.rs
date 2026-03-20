@@ -168,10 +168,18 @@ impl MessageHeader {
         }
 
         let version = u16::from_be_bytes([buf[4], buf[5]]);
+        if version != VERSION {
+            return None; // Version mismatch
+        }
+
         let flags = u16::from_be_bytes([buf[6], buf[7]]);
         let request_id = u64::from_be_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
         let msg_type_raw = u16::from_be_bytes([buf[16], buf[17]]);
         let payload_len = u32::from_be_bytes([buf[18], buf[19], buf[20], buf[21]]);
+
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return None; // Payload too large
+        }
 
         let msg_type = MessageType::from_raw(msg_type_raw)?;
 

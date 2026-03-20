@@ -32,7 +32,7 @@ pub struct HandleMap {
 
 impl HandleMap {
     /// Create a new handle map with the given type prefix.
-    fn new(prefix: u64) -> Self {
+    pub fn new(prefix: u64) -> Self {
         Self {
             local_to_remote: DashMap::new(),
             remote_to_local: DashMap::new(),
@@ -42,17 +42,19 @@ impl HandleMap {
     }
 
     /// Allocate a new synthetic local handle and map it to a remote handle.
+    /// Thread-safe: uses DashMap entry API to avoid TOCTOU race.
     pub fn insert(&self, remote: u64) -> u64 {
-        // Check if we already have a mapping for this remote handle
-        if let Some(existing) = self.remote_to_local.get(&remote) {
-            return *existing;
+        use dashmap::mapref::entry::Entry;
+        match self.remote_to_local.entry(remote) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                let local = self.prefix | id;
+                e.insert(local);
+                self.local_to_remote.insert(local, remote);
+                local
+            }
         }
-
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let local = self.prefix | id;
-        self.local_to_remote.insert(local, remote);
-        self.remote_to_local.insert(remote, local);
-        local
     }
 
     /// Look up the remote handle for a local synthetic handle.

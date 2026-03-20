@@ -1,10 +1,10 @@
-# OutterLink
+# OuterLink
 
 ## What Is This
 
-OutterLink is a Rust software layer that makes GPUs across separate PCs work as a unified pool - shared VRAM, shared compute, shared system RAM. Any CUDA application runs unmodified. Written in Rust, licensed Apache 2.0.
+OuterLink is a Rust software layer that makes GPUs across separate PCs work as a unified pool - shared VRAM, shared compute, shared system RAM. Any CUDA application runs unmodified. Written in Rust, licensed Apache 2.0.
 
-**OpenDMA** is OutterLink's killer feature: non-proprietary direct NIC-to-GPU VRAM access via PCIe BAR1, bypassing NVIDIA's artificial GPUDirect restriction. Works on ALL NVIDIA GPUs including GeForce.
+**OpenDMA** is OuterLink's killer feature: non-proprietary direct NIC-to-GPU VRAM access via PCIe BAR1, bypassing NVIDIA's artificial GPUDirect restriction. Works on ALL NVIDIA GPUs including GeForce.
 
 ## Project Phase
 
@@ -16,12 +16,12 @@ Pre-planning and research are complete (7 research documents, consolidation, con
 
 **Be ambitious. Always aim for the best path, not the easiest.** We have contingency plans (Plan B, C, D) but we always pursue Plan A first - the one that gives us the best result. Innovation is real. What others said was impossible (GPU RDMA on GeForce) has a viable path through PCIe BAR1 + open kernel patches. We don't settle for "good enough" when "breakthrough" is within reach.
 
-Contingencies exist for safety, not as the default. When making decisions, choose the option that makes OutterLink the project no one else could build.
+Contingencies exist for safety, not as the default. When making decisions, choose the option that makes OuterLink the project no one else could build.
 
 ## Architecture
 
 ```
-App -> LD_PRELOAD -> OutterLink Client (.so) -> Transport -> OutterLink Server -> Real GPU
+App -> LD_PRELOAD -> OuterLink Client (.so) -> Transport -> OuterLink Server -> Real GPU
 ```
 
 ### Two Data Paths
@@ -57,11 +57,11 @@ outterlink/
 │   ├── references/      # External links and papers
 │   ├── notes/           # Working notes and brainstorms
 │   └── diagrams/        # Visual diagrams
-├── crates/              # Rust source (future)
-│   ├── outterlink-client/   # LD_PRELOAD interception library
-│   ├── outterlink-server/   # GPU node daemon
-│   ├── outterlink-common/   # Shared protocol, types, transport
-│   └── outterlink-cli/      # Management CLI
+├── crates/              # Rust source
+│   ├── outerlink-client/   # LD_PRELOAD interception library
+│   ├── outerlink-server/   # GPU node daemon
+│   ├── outerlink-common/   # Shared protocol, types, transport
+│   └── outerlink-cli/      # Management CLI
 └── opendma/             # OpenDMA kernel module (future, C)
 ```
 

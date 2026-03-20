@@ -39,7 +39,7 @@ Even a 1 GB/s link between PCs transforms what's possible - models that didn't f
 | PCIe 4.0 x4 (riser) | ~8 GB/s | Common in multi-GPU rigs |
 | PCIe 4.0 x16 (direct slot) | ~32 GB/s | Full speed, limited slots per motherboard |
 | PCIe 5.0 x16 | ~64 GB/s | Next gen, available on TRX50 |
-| NVLink (3090 Ti) | ~600 GB/s | Physical bridge, same machine (or cross-PC??) |
+| NVLink (3090 Ti pair) | ~112.5 GB/s | Physical bridge, same machine only |
 
 **Key takeaway:** The bandwidth gap between "no connection" and OutterLink is infinite. And with 100GbE ConnectX-5 cards, the network can actually exceed local PCIe bandwidth. A remote GPU over 4x100GbE is faster than a local GPU on a x4 riser.
 
@@ -49,8 +49,8 @@ Bandwidth enables the connection. But **memory pooling** is the killer feature:
 
 ```
 Without OutterLink:              With OutterLink:
-PC1: 24 GB VRAM (3090 Ti)       Combined: 112 GB VRAM
-PC2: 24 GB VRAM (3090 Ti)       + 512 GB system RAM
+PC1: 2x 24GB + 1x 32GB VRAM    Combined: 112 GB VRAM (2x3090Ti + 2x5090)
+PC2: 2x 24GB + 1x 32GB VRAM    + 512 GB system RAM
 Can't share. Period.            Any process sees ALL of it.
 
 Max model: ~13B params          Max model: ~70B+ params
@@ -106,9 +106,9 @@ App -> LD_PRELOAD -> OutterLink Client (.so) -> Transport -> OutterLink Server -
 ## Open Questions
 
 - [x] What network hardware? -> 4x ConnectX-5 100GbE (dual port) total
+- [x] Can PCIe BAR1 direct access bypass GPUDirect restriction? -> YES, viable via tinygrad patches + custom RDMA module (R7)
+- [x] Can NVLink physically bridge across PCs? -> NO, not feasible. ConnectX-5 covers the gap (R6)
 - [ ] What Linux distributions on target machines?
 - [ ] What CUDA version and driver versions?
 - [ ] First test workload? (LLM inference most likely)
-- [ ] Can PCIe BAR1 direct access bypass GPUDirect restriction? (R6 research)
-- [ ] Can NVLink physically bridge across PCs? (R6 research)
 - [ ] Maximum nodes to support in v1?

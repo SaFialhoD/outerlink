@@ -9,7 +9,6 @@ description = "OuterLink client library - CUDA interception and remote GPU acces
 outerlink-common = { path = "../outerlink-common" }
 tokio = { workspace = true }
 tracing = { workspace = true }
-dashmap = { workspace = true }
 
 [build-dependencies]
 cc = "1"

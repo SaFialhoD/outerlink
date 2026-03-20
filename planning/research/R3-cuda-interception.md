@@ -166,7 +166,7 @@ Page fault handling is internal to NVIDIA driver - extremely hard to virtualize.
 | **rCUDA** | Runtime API | TCP, InfiniBand | Modern | No | Research, active |
 | **Cricket** | Driver API | Yes | Modern | Yes (GPLv3) | Active |
 | **HAMi-core** | Driver API + NVML | N/A (local only) | 10.x-12.x | Yes | Active, production |
-| **GVirtuS** | Runtime API | TCP, VMSocket | 6.5 | Yes | Inactive |
+| **GVirtuS** | Runtime API | TCP, VMSocket | 12.6+ | Yes | Active |
 | **vCUDA** | Runtime API | Shared memory | 1.1 | No | Dead |
 | **AVEC** | API interception | TCP/IP | Modern | Unknown | Research |
 

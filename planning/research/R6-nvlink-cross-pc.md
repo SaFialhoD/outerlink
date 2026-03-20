@@ -7,7 +7,7 @@
 
 ## Purpose
 
-Evaluate whether NVLink can be used to connect GPUs across separate physical PCs for 600 GB/s inter-node bandwidth.
+Evaluate whether NVLink can be used to connect GPUs across separate physical PCs for 112.5 GB/s inter-node bandwidth (RTX 3090 Ti NVLink aggregate bandwidth).
 
 ---
 

@@ -16,7 +16,7 @@ description = "Unified GPU pool across networked PCs"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-bincode = "2.0.0-rc.3"
+bincode = "1"
 dashmap = "6"
 thiserror = "2"
 tracing = "0.1"

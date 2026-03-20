@@ -2,7 +2,9 @@
 
 **Created:** 2026-03-19
 **Last Updated:** 2026-03-19
-**Status:** Complete
+**Status:** SUPERSEDED by [CONSOLIDATION-all-research.md](CONSOLIDATION-all-research.md)
+
+> **Note:** This document covers R1-R3 only. It was written before R4-R7 were completed. For the complete picture, read the [Consolidation](CONSOLIDATION-all-research.md) document instead. This file is kept for historical reference and its detailed architecture diagram.
 
 ## Purpose
 

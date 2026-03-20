@@ -170,7 +170,7 @@ Now with ConnectX-5 and our actual hardware:
 
 | Connection | Bandwidth | Status for Us |
 |-----------|-----------|--------------|
-| NVLink 3090 Ti | ~600 GB/s | Available if open-air riser works |
+| NVLink 3090 Ti pair | ~112.5 GB/s | Same-machine only, cross-PC not feasible (see R6) |
 | PCIe 5.0 x16 (TRX50 slot) | ~64 GB/s | Threadripper native |
 | PCIe 4.0 x16 (3090 Ti direct) | ~32 GB/s | GPU ceiling |
 | Dual-channel RAM (MS-01) | ~90 GB/s | Not the bottleneck |

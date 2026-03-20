@@ -1,6 +1,4 @@
 # OuterLink Development Environment
-version: "3.8"
-
 services:
   dev:
     build: .
