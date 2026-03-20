@@ -100,8 +100,15 @@ static const hook_entry_t hook_table[] = {
     { "cuCtxDestroy_v2",         (void *)hook_cuCtxDestroy_v2 },
     { "cuCtxSetCurrent",         (void *)hook_cuCtxSetCurrent },
     { "cuCtxGetCurrent",         (void *)hook_cuCtxGetCurrent },
+    { "cuCtxPushCurrent",        (void *)hook_cuCtxPushCurrent_v2 },
+    { "cuCtxPushCurrent_v2",     (void *)hook_cuCtxPushCurrent_v2 },
+    { "cuCtxPopCurrent",         (void *)hook_cuCtxPopCurrent_v2 },
+    { "cuCtxPopCurrent_v2",      (void *)hook_cuCtxPopCurrent_v2 },
     { "cuCtxGetDevice",          (void *)hook_cuCtxGetDevice },
     { "cuCtxSynchronize",        (void *)hook_cuCtxSynchronize },
+
+    /* Function attributes */
+    { "cuFuncGetAttribute",      (void *)hook_cuFuncGetAttribute },
 
     /* Memory */
     { "cuMemAlloc_v2",           (void *)hook_cuMemAlloc_v2 },
@@ -294,9 +301,31 @@ CUresult hook_cuCtxGetDevice(CUdevice *dev) {
     return ol_cuCtxGetDevice(dev);
 }
 
+CUresult hook_cuCtxPushCurrent_v2(CUcontext ctx) {
+    ensure_init();
+    return ol_cuCtxPushCurrent((unsigned long long)(uintptr_t)ctx);
+}
+
+CUresult hook_cuCtxPopCurrent_v2(CUcontext *pctx) {
+    ensure_init();
+    unsigned long long ctx_u64 = 0;
+    CUresult r = ol_cuCtxPopCurrent(&ctx_u64);
+    if (r == CUDA_SUCCESS && pctx) {
+        *pctx = (CUcontext)(uintptr_t)ctx_u64;
+    }
+    return r;
+}
+
 CUresult hook_cuCtxSynchronize(void) {
     ensure_init();
     return ol_cuCtxSynchronize();
+}
+
+/* -- Function attributes -- */
+
+CUresult hook_cuFuncGetAttribute(int *pi, CUdevice_attribute attrib, CUfunction hfunc) {
+    ensure_init();
+    return ol_cuFuncGetAttribute(pi, (int)attrib, (unsigned long long)(uintptr_t)hfunc);
 }
 
 /* -- Memory -- */

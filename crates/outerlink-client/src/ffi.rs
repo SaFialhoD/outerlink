@@ -550,6 +550,130 @@ pub extern "C" fn ol_cuCtxSynchronize() -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Context stack (push/pop)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxPushCurrent(ctx: u64) -> u32 {
+    let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_ctx = if ctx == 0 {
+            0u64
+        } else {
+            match client.handles.contexts.to_remote(ctx) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_CONTEXT,
+            }
+        };
+        let payload = remote_ctx.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxPushCurrent, &payload) {
+            let result = parse_result(&resp);
+            if result == CUDA_SUCCESS {
+                client.current_remote_ctx.store(remote_ctx, Ordering::Release);
+            }
+            return result;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: just update the current context tracking
+    if ctx != 0 {
+        match client.handles.contexts.to_remote(ctx) {
+            Some(r) => {
+                client.current_remote_ctx.store(r, Ordering::Release);
+            }
+            None => return CUDA_ERROR_INVALID_CONTEXT,
+        }
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxPopCurrent(pctx: *mut u64) -> u32 {
+    let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxPopCurrent, &[]) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                // The popped context: translate back to local handle
+                if !pctx.is_null() {
+                    let local = if remote_ctx == 0 {
+                        0
+                    } else {
+                        client.handles.contexts.to_local(remote_ctx).unwrap_or(0)
+                    };
+                    unsafe { *pctx = local };
+                }
+                // Update current context tracking -- after pop, the server
+                // has a different current context. We need another query or
+                // rely on local tracking. For now, set to 0 (the caller
+                // should use CtxGetCurrent to find the new current).
+                // Actually, a proper implementation would track the stack
+                // client-side too, but for now we just clear it.
+                client.current_remote_ctx.store(0, Ordering::Release);
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: no actual stack state locally, return null
+    if !pctx.is_null() {
+        unsafe { *pctx = 0 };
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Function attribute queries
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuFuncGetAttribute(pi: *mut i32, attrib: i32, func: u64) -> u32 {
+    let client = get_client();
+    if pi.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = remote_func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&attrib.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::FuncGetAttribute, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe {
+                    *pi = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: return sensible defaults
+    let val = match attrib {
+        0 => 1024,   // MAX_THREADS_PER_BLOCK
+        1 => 49152,  // SHARED_SIZE_BYTES
+        2 => 0,      // CONST_SIZE_BYTES
+        3 => 0,      // LOCAL_SIZE_BYTES
+        4 => 32,     // NUM_REGS
+        _ => return CUDA_ERROR_INVALID_VALUE,
+    };
+    unsafe { *pi = val };
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // Memory management
 // ---------------------------------------------------------------------------
 

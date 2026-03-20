@@ -137,6 +137,23 @@ pub trait GpuBackend: Send + Sync {
     /// Copy `size` bytes from one device pointer to another.
     fn memcpy_dtod(&self, dst: u64, src: u64, size: u64) -> Result<(), CuResult>;
 
+    // --- Context stack operations ---
+
+    /// Push a context onto the per-thread context stack.
+    fn ctx_push_current(&self, ctx: u64) -> Result<(), CuResult>;
+
+    /// Pop a context from the per-thread context stack.
+    /// Returns the popped context handle.
+    fn ctx_pop_current(&self) -> Result<u64, CuResult>;
+
+    /// Get the current context from the top of the context stack.
+    fn ctx_get_current(&self) -> Result<u64, CuResult>;
+
+    // --- Function attribute queries ---
+
+    /// Query an attribute of a kernel function.
+    fn func_get_attribute(&self, func: u64, attrib: i32) -> Result<i32, CuResult>;
+
     // --- Kernel launch ---
 
     /// Launch a kernel on a stream.
@@ -223,6 +240,12 @@ struct StubState {
     host_allocations: HashMap<u64, Vec<u8>>,
     /// Counter for generating host memory handles.
     next_host_ptr: u64,
+    /// Context stack for push/pop operations.
+    /// Note: in the real CUDA driver, the context stack is per-thread.
+    /// In OuterLink, context stack state is per-connection (in ConnectionSession).
+    /// This stub-level stack exists only for GpuBackend trait compliance when
+    /// called directly (not through the handler/session layer).
+    context_stack: Vec<u64>,
 }
 
 impl StubState {
@@ -265,6 +288,7 @@ impl StubGpuBackend {
                 event_timestamp_counter: 1000,
                 host_allocations: HashMap::new(),
                 next_host_ptr: 0x0000_CAFE_0000_0000,
+                context_stack: Vec::new(),
             }),
         }
     }
@@ -307,6 +331,8 @@ impl GpuBackend for StubGpuBackend {
     fn device_get_attribute(&self, attrib: i32, device: i32) -> Result<i32, CuResult> {
         Self::check_device(device)?;
         // Return plausible values that match an RTX 3090-class card.
+        // Many applications query dozens of attributes; return sensible defaults
+        // for all commonly queried ones.
         let val = match attrib {
             1 => 1024,  // MaxThreadsPerBlock
             2 => 1024,  // MaxBlockDimX
@@ -315,10 +341,47 @@ impl GpuBackend for StubGpuBackend {
             5 => 2_147_483_647, // MaxGridDimX
             6 => 65535,  // MaxGridDimY
             7 => 65535,  // MaxGridDimZ
+            8 => 49152,  // MaxSharedMemoryPerBlock (48 KB)
+            9 => 65536,  // TotalConstantMemory (64 KB)
+            10 => 32,    // WarpSize
+            11 => 2048,  // MaxPitch (just a value, real is larger)
+            13 => 48,    // MaxRegistersPerBlock (simplified)
+            14 => 1000,  // ClockRate (MHz, simplified)
+            15 => 1,     // TextureAlignment
             16 => 82,    // MultiprocessorCount
+            17 => 1,     // KernelExecTimeout
+            18 => 0,     // Integrated (discrete GPU)
+            19 => 1,     // CanMapHostMemory
+            20 => 0,     // ComputeMode (CU_COMPUTEMODE_DEFAULT)
+            21 => 131072, // MaxTexture1DWidth
+            36 => 1,     // ConcurrentKernels
+            37 => 1,     // EccEnabled (but actually not on GeForce)
+            38 => 0,     // PciBusId
+            39 => 0,     // PciDeviceId
+            40 => 0,     // TccDriver
+            41 => 2097152, // MemoryClockRate (kHz)
+            42 => 384,   // GlobalMemoryBusWidth (bits)
+            43 => 6144,  // L2CacheSize (6 MB)
+            44 => 1536,  // MaxThreadsPerMultiprocessor
+            47 => 1,     // UnifiedAddressing
             75 => 8,     // ComputeCapabilityMajor
             76 => 6,     // ComputeCapabilityMinor
-            81 => 102400, // MaxSharedMemoryPerMultiprocessor (100 KB)
+            77 => 0,     // StreamPrioritiesSupported
+            78 => 1,     // GlobalL1CacheSupported
+            79 => 1,     // LocalL1CacheSupported
+            80 => 49152, // MaxSharedMemoryPerMultiprocessor (48 KB base)
+            81 => 102400, // MaxSharedMemoryPerMultiprocessor (100 KB with opt-in)
+            82 => 65536, // MaxRegistersPerMultiprocessor
+            83 => 1,     // ManagedMemory
+            84 => 1,     // IsMultiGpuBoard
+            86 => 1,     // HostNativeAtomicSupported
+            87 => 128,   // SingleToDoublePrecisionPerfRatio
+            88 => 1,     // PageableMemoryAccess
+            89 => 1,     // ConcurrentManagedAccess
+            90 => 1,     // ComputePreemptionSupported
+            91 => 1,     // CanUseHostPointerForRegisteredMem
+            95 => 1,     // CooperativeLaunch
+            96 => 1,     // CooperativeMultiDeviceLaunch
             _ => return Err(CuResult::InvalidValue),
         };
         Ok(val)
@@ -599,6 +662,52 @@ impl GpuBackend for StubGpuBackend {
         }
         // Stub: no actual waiting.
         Ok(())
+    }
+
+    // --- Context stack operations ---
+
+    fn ctx_push_current(&self, ctx: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if !state.contexts.contains_key(&ctx) {
+            return Err(CuResult::InvalidContext);
+        }
+        state.context_stack.push(ctx);
+        Ok(())
+    }
+
+    fn ctx_pop_current(&self) -> Result<u64, CuResult> {
+        let mut state = self.state.lock().unwrap();
+        state.context_stack.pop().ok_or(CuResult::InvalidContext)
+    }
+
+    fn ctx_get_current(&self) -> Result<u64, CuResult> {
+        let state = self.state.lock().unwrap();
+        Ok(state.context_stack.last().copied().unwrap_or(0))
+    }
+
+    // --- Function attribute queries ---
+
+    fn func_get_attribute(&self, func: u64, attrib: i32) -> Result<i32, CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.functions.contains_key(&func) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Return sensible defaults for common attributes.
+        // Attribute codes from the CUDA Driver API:
+        let val = match attrib {
+            0 => 1024,   // CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK
+            1 => 49152,  // CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES
+            2 => 0,      // CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES
+            3 => 0,      // CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES
+            4 => 32,     // CU_FUNC_ATTRIBUTE_NUM_REGS
+            5 => 0,      // CU_FUNC_ATTRIBUTE_PTX_VERSION
+            6 => 0,      // CU_FUNC_ATTRIBUTE_BINARY_VERSION
+            7 => 0,      // CU_FUNC_ATTRIBUTE_CACHE_MODE_CA
+            8 => 1024,   // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+            9 => 1024,   // CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT
+            _ => return Err(CuResult::InvalidValue),
+        };
+        Ok(val)
     }
 
     // --- Memory: host pinned ---
@@ -1080,6 +1189,130 @@ mod tests {
             gpu.launch_kernel(func, [1,1,1], [1,1,1], 0, 0xBAD, &[]),
             Err(CuResult::InvalidValue)
         );
+    }
+
+    // ----- Context stack tests -----
+
+    #[test]
+    fn test_ctx_push_current() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        assert!(gpu.ctx_push_current(ctx).is_ok());
+    }
+
+    #[test]
+    fn test_ctx_push_current_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_push_current(0xBAD), Err(CuResult::InvalidContext));
+    }
+
+    #[test]
+    fn test_ctx_pop_current() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        gpu.ctx_push_current(ctx).unwrap();
+        let popped = gpu.ctx_pop_current().unwrap();
+        assert_eq!(popped, ctx);
+    }
+
+    #[test]
+    fn test_ctx_pop_current_empty_stack() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_pop_current(), Err(CuResult::InvalidContext));
+    }
+
+    #[test]
+    fn test_ctx_get_current_empty() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_get_current().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_ctx_get_current_after_push() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        gpu.ctx_push_current(ctx).unwrap();
+        assert_eq!(gpu.ctx_get_current().unwrap(), ctx);
+    }
+
+    #[test]
+    fn test_ctx_push_pop_multiple() {
+        let gpu = StubGpuBackend::new();
+        let ctx1 = gpu.ctx_create(0, 0).unwrap();
+        let ctx2 = gpu.ctx_create(0, 0).unwrap();
+        gpu.ctx_push_current(ctx1).unwrap();
+        gpu.ctx_push_current(ctx2).unwrap();
+        assert_eq!(gpu.ctx_get_current().unwrap(), ctx2);
+        assert_eq!(gpu.ctx_pop_current().unwrap(), ctx2);
+        assert_eq!(gpu.ctx_get_current().unwrap(), ctx1);
+        assert_eq!(gpu.ctx_pop_current().unwrap(), ctx1);
+        assert_eq!(gpu.ctx_get_current().unwrap(), 0);
+    }
+
+    // ----- FuncGetAttribute tests -----
+
+    #[test]
+    fn test_func_get_attribute_max_threads() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "kern").unwrap();
+        assert_eq!(gpu.func_get_attribute(func, 0).unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_func_get_attribute_shared_mem() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "kern").unwrap();
+        assert_eq!(gpu.func_get_attribute(func, 1).unwrap(), 49152);
+    }
+
+    #[test]
+    fn test_func_get_attribute_num_regs() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "kern").unwrap();
+        assert_eq!(gpu.func_get_attribute(func, 4).unwrap(), 32);
+    }
+
+    #[test]
+    fn test_func_get_attribute_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.func_get_attribute(0xBAD, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_func_get_attribute_invalid_attrib() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "kern").unwrap();
+        assert_eq!(gpu.func_get_attribute(func, 99999), Err(CuResult::InvalidValue));
+    }
+
+    // ----- Expanded DeviceGetAttribute tests -----
+
+    #[test]
+    fn test_device_attribute_warp_size() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_get_attribute(10, 0).unwrap(), 32);
+    }
+
+    #[test]
+    fn test_device_attribute_shared_mem_per_block() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_get_attribute(8, 0).unwrap(), 49152);
+    }
+
+    #[test]
+    fn test_device_attribute_concurrent_kernels() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_get_attribute(36, 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_device_attribute_unified_addressing() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_get_attribute(47, 0).unwrap(), 1);
     }
 
     // ----- MemcpyDtoD tests -----

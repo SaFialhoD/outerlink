@@ -42,8 +42,13 @@ extern CUresult ol_cuCtxCreate_v2(unsigned long long *pctx, unsigned int flags, 
 extern CUresult ol_cuCtxDestroy_v2(unsigned long long ctx);
 extern CUresult ol_cuCtxSetCurrent(unsigned long long ctx);
 extern CUresult ol_cuCtxGetCurrent(unsigned long long *pctx);
+extern CUresult ol_cuCtxPushCurrent(unsigned long long ctx);
+extern CUresult ol_cuCtxPopCurrent(unsigned long long *pctx);
 extern CUresult ol_cuCtxGetDevice(int *dev);
 extern CUresult ol_cuCtxSynchronize(void);
+
+/* Function attributes */
+extern CUresult ol_cuFuncGetAttribute(int *pi, int attrib, unsigned long long func);
 
 /* Memory management -- CUdeviceptr is unsigned long long */
 extern CUresult ol_cuMemAlloc_v2(unsigned long long *dptr, size_t bytesize);
@@ -123,8 +128,13 @@ CUresult hook_cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev);
 CUresult hook_cuCtxDestroy_v2(CUcontext ctx);
 CUresult hook_cuCtxSetCurrent(CUcontext ctx);
 CUresult hook_cuCtxGetCurrent(CUcontext *pctx);
+CUresult hook_cuCtxPushCurrent_v2(CUcontext ctx);
+CUresult hook_cuCtxPopCurrent_v2(CUcontext *pctx);
 CUresult hook_cuCtxGetDevice(CUdevice *dev);
 CUresult hook_cuCtxSynchronize(void);
+
+/* Function attributes */
+CUresult hook_cuFuncGetAttribute(int *pi, CUdevice_attribute attrib, CUfunction hfunc);
 
 /* Memory */
 CUresult hook_cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize);

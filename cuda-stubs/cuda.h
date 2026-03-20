@@ -58,10 +58,40 @@ typedef enum {
     CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X = 5,
     CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y = 6,
     CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z = 7,
+    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK = 8,
+    CU_DEVICE_ATTRIBUTE_TOTAL_CONSTANT_MEMORY = 9,
+    CU_DEVICE_ATTRIBUTE_WARP_SIZE = 10,
+    CU_DEVICE_ATTRIBUTE_MAX_PITCH = 11,
+    CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK = 13,
+    CU_DEVICE_ATTRIBUTE_CLOCK_RATE = 14,
+    CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT = 15,
     CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16,
+    CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT = 17,
+    CU_DEVICE_ATTRIBUTE_INTEGRATED = 18,
+    CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY = 19,
+    CU_DEVICE_ATTRIBUTE_COMPUTE_MODE = 20,
+    CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS = 36,
+    CU_DEVICE_ATTRIBUTE_ECC_ENABLED = 37,
+    CU_DEVICE_ATTRIBUTE_PCI_BUS_ID = 38,
+    CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID = 39,
+    CU_DEVICE_ATTRIBUTE_TCC_DRIVER = 40,
+    CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE = 41,
+    CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH = 42,
+    CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE = 43,
+    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR = 44,
+    CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING = 47,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75,
     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76,
+    CU_DEVICE_ATTRIBUTE_STREAM_PRIORITIES_SUPPORTED = 77,
+    CU_DEVICE_ATTRIBUTE_GLOBAL_L1_CACHE_SUPPORTED = 78,
+    CU_DEVICE_ATTRIBUTE_LOCAL_L1_CACHE_SUPPORTED = 79,
     CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR = 81,
+    CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR = 82,
+    CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY = 83,
+    CU_DEVICE_ATTRIBUTE_MULTI_GPU_BOARD = 84,
+    CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED = 86,
+    CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH = 95,
+    CU_DEVICE_ATTRIBUTE_COOPERATIVE_MULTI_DEVICE_LAUNCH = 96,
 } CUdevice_attribute;
 
 /* Memory copy direction */
@@ -94,6 +124,20 @@ typedef enum {
     CU_EVENT_DISABLE_TIMING = 0x2,
 } CUevent_flags;
 
+/* Function attributes */
+typedef enum {
+    CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 0,
+    CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES = 1,
+    CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES = 2,
+    CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES = 3,
+    CU_FUNC_ATTRIBUTE_NUM_REGS = 4,
+    CU_FUNC_ATTRIBUTE_PTX_VERSION = 5,
+    CU_FUNC_ATTRIBUTE_BINARY_VERSION = 6,
+    CU_FUNC_ATTRIBUTE_CACHE_MODE_CA = 7,
+    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8,
+    CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 9,
+} CUfunction_attribute;
+
 /* Kernel launch params */
 #define CU_LAUNCH_PARAM_END            ((void*)0x00)
 #define CU_LAUNCH_PARAM_BUFFER_POINTER ((void*)0x01)
@@ -116,6 +160,10 @@ CUresult cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev);
 CUresult cuCtxDestroy_v2(CUcontext ctx);
 CUresult cuCtxSetCurrent(CUcontext ctx);
 CUresult cuCtxGetCurrent(CUcontext *pctx);
+CUresult cuCtxPushCurrent(CUcontext ctx);
+CUresult cuCtxPushCurrent_v2(CUcontext ctx);
+CUresult cuCtxPopCurrent(CUcontext *pctx);
+CUresult cuCtxPopCurrent_v2(CUcontext *pctx);
 CUresult cuCtxGetDevice(CUdevice *device);
 CUresult cuCtxSynchronize(void);
 
@@ -139,6 +187,9 @@ CUresult cuModuleLoadDataEx(CUmodule *module, const void *image, unsigned int nu
 CUresult cuModuleUnload(CUmodule hmod);
 CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name);
 CUresult cuModuleGetGlobal_v2(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name);
+
+/* Function declarations - Function attributes */
+CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc);
 
 /* Function declarations - Execution */
 CUresult cuLaunchKernel(CUfunction f,

@@ -1058,3 +1058,283 @@ async fn test_memcpy_dtod_invalid_src_e2e() {
     drop(client);
     server.await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Context push/pop E2E tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_ctx_push_pop_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Create two contexts.
+    let mut create_payload = 0_u32.to_le_bytes().to_vec();
+    create_payload.extend_from_slice(&0_i32.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxCreate, &create_payload, 1).await;
+    let data = assert_success(&payload);
+    let ctx1 = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxCreate, &create_payload, 2).await;
+    let data = assert_success(&payload);
+    let ctx2 = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Push ctx1 onto the stack.
+    let push_payload = ctx1.to_le_bytes();
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxPushCurrent, &push_payload, 3).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "CtxPushCurrent should succeed"
+    );
+
+    // 3. Get current -- should be ctx1.
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxGetCurrent, &[], 4).await;
+    let data = assert_success(&payload);
+    let current = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_eq!(current, ctx1, "current context should be ctx1 after push");
+
+    // 4. Push ctx2 on top.
+    let push_payload = ctx2.to_le_bytes();
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxPushCurrent, &push_payload, 5).await;
+    assert_eq!(response_result(&payload), CuResult::Success);
+
+    // 5. Get current -- should be ctx2.
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxGetCurrent, &[], 6).await;
+    let data = assert_success(&payload);
+    let current = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_eq!(current, ctx2, "current context should be ctx2 after second push");
+
+    // 6. Pop -- should return ctx2, current becomes ctx1.
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxPopCurrent, &[], 7).await;
+    let data = assert_success(&payload);
+    let popped = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_eq!(popped, ctx2, "popped context should be ctx2");
+
+    // 7. Verify current is now ctx1.
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxGetCurrent, &[], 8).await;
+    let data = assert_success(&payload);
+    let current = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_eq!(current, ctx1, "current context should be ctx1 after pop");
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_ctx_push_invalid_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // Push an invalid context handle.
+    let push_payload = 0xBAD_u64.to_le_bytes();
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxPushCurrent, &push_payload, 1).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::InvalidContext,
+        "CtxPushCurrent with invalid handle should return InvalidContext"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_ctx_pop_empty_stack_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // Pop from empty stack.
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxPopCurrent, &[], 1).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::InvalidContext,
+        "CtxPopCurrent on empty stack should return InvalidContext"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// FuncGetAttribute E2E tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_func_get_attribute_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Load a module.
+    let mod_data = b"fake ptx data";
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleLoadData, mod_data, 1).await;
+    let data = assert_success(&payload);
+    let module = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Get a function from the module.
+    let kern_name = b"my_kernel";
+    let mut func_payload = module.to_le_bytes().to_vec();
+    func_payload.extend_from_slice(&(kern_name.len() as u32).to_le_bytes());
+    func_payload.extend_from_slice(kern_name);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleGetFunction, &func_payload, 2).await;
+    let data = assert_success(&payload);
+    let func = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 3. Query MAX_THREADS_PER_BLOCK (attrib 0).
+    let mut attr_payload = func.to_le_bytes().to_vec();
+    attr_payload.extend_from_slice(&0_i32.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::FuncGetAttribute, &attr_payload, 3).await;
+    let data = assert_success(&payload);
+    let max_threads = i32::from_le_bytes(data[..4].try_into().unwrap());
+    assert_eq!(max_threads, 1024, "max threads per block should be 1024");
+
+    // 4. Query SHARED_SIZE_BYTES (attrib 1).
+    let mut attr_payload = func.to_le_bytes().to_vec();
+    attr_payload.extend_from_slice(&1_i32.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::FuncGetAttribute, &attr_payload, 4).await;
+    let data = assert_success(&payload);
+    let shared_mem = i32::from_le_bytes(data[..4].try_into().unwrap());
+    assert_eq!(shared_mem, 49152, "shared mem size should be 49152");
+
+    // 5. Query NUM_REGS (attrib 4).
+    let mut attr_payload = func.to_le_bytes().to_vec();
+    attr_payload.extend_from_slice(&4_i32.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::FuncGetAttribute, &attr_payload, 5).await;
+    let data = assert_success(&payload);
+    let num_regs = i32::from_le_bytes(data[..4].try_into().unwrap());
+    assert_eq!(num_regs, 32, "num regs should be 32");
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_func_get_attribute_invalid_func_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // Query attribute on a non-existent function.
+    let mut attr_payload = 0xBAD_u64.to_le_bytes().to_vec();
+    attr_payload.extend_from_slice(&0_i32.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::FuncGetAttribute, &attr_payload, 1).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::InvalidValue,
+        "FuncGetAttribute with invalid func should return InvalidValue"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_func_get_attribute_invalid_attrib_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Load a module and get a function.
+    let mod_data = b"ptx";
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleLoadData, mod_data, 1).await;
+    let data = assert_success(&payload);
+    let module = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    let kern_name = b"kern";
+    let mut func_payload = module.to_le_bytes().to_vec();
+    func_payload.extend_from_slice(&(kern_name.len() as u32).to_le_bytes());
+    func_payload.extend_from_slice(kern_name);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleGetFunction, &func_payload, 2).await;
+    let data = assert_success(&payload);
+    let func = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Query with an invalid attribute code.
+    let mut attr_payload = func.to_le_bytes().to_vec();
+    attr_payload.extend_from_slice(&99999_i32.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::FuncGetAttribute, &attr_payload, 3).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::InvalidValue,
+        "FuncGetAttribute with invalid attrib should return InvalidValue"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Expanded DeviceGetAttribute E2E test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_device_get_attribute_expanded_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // Query a range of attributes that real apps commonly request.
+    let attributes_and_expected: Vec<(i32, i32)> = vec![
+        (1, 1024),   // MaxThreadsPerBlock
+        (10, 32),    // WarpSize
+        (16, 82),    // MultiprocessorCount
+        (75, 8),     // ComputeCapabilityMajor
+        (76, 6),     // ComputeCapabilityMinor
+        (8, 49152),  // MaxSharedMemoryPerBlock
+        (36, 1),     // ConcurrentKernels
+        (47, 1),     // UnifiedAddressing
+    ];
+
+    for (i, (attrib, expected)) in attributes_and_expected.iter().enumerate() {
+        let mut payload = attrib.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0_i32.to_le_bytes()); // device 0
+        let (_hdr, resp) =
+            roundtrip(&client, MessageType::DeviceGetAttribute, &payload, (i + 1) as u64).await;
+        let data = assert_success(&resp);
+        let val = i32::from_le_bytes(data[..4].try_into().unwrap());
+        assert_eq!(
+            val, *expected,
+            "attribute {} should return {}, got {}",
+            attrib, expected, val
+        );
+    }
+
+    drop(client);
+    server.await.unwrap();
+}

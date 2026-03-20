@@ -45,6 +45,8 @@ pub enum MessageType {
     CtxGetCurrent = 0x0023,
     CtxGetDevice = 0x0024,
     CtxSynchronize = 0x0025,
+    CtxPushCurrent = 0x0026,
+    CtxPopCurrent = 0x0027,
 
     // Memory
     MemAlloc = 0x0030,
@@ -64,6 +66,7 @@ pub enum MessageType {
 
     // Execution
     LaunchKernel = 0x0050,
+    FuncGetAttribute = 0x0051,
 
     // Stream
     StreamCreate = 0x0060,
@@ -105,6 +108,8 @@ impl MessageType {
             0x0023 => Some(Self::CtxGetCurrent),
             0x0024 => Some(Self::CtxGetDevice),
             0x0025 => Some(Self::CtxSynchronize),
+            0x0026 => Some(Self::CtxPushCurrent),
+            0x0027 => Some(Self::CtxPopCurrent),
             0x0030 => Some(Self::MemAlloc),
             0x0031 => Some(Self::MemFree),
             0x0032 => Some(Self::MemcpyHtoD),
@@ -118,6 +123,7 @@ impl MessageType {
             0x0042 => Some(Self::ModuleGetFunction),
             0x0043 => Some(Self::ModuleGetGlobal),
             0x0050 => Some(Self::LaunchKernel),
+            0x0051 => Some(Self::FuncGetAttribute),
             0x0060 => Some(Self::StreamCreate),
             0x0061 => Some(Self::StreamDestroy),
             0x0062 => Some(Self::StreamSynchronize),

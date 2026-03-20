@@ -51,6 +51,9 @@ type FnCuDeviceGetUuid = unsafe extern "C" fn(uuid: *mut CuUuidFfi, dev: i32) ->
 type FnCuCtxCreate = unsafe extern "C" fn(pctx: *mut usize, flags: u32, dev: i32) -> i32;
 type FnCuCtxDestroy = unsafe extern "C" fn(ctx: usize) -> i32;
 type FnCuCtxSetCurrent = unsafe extern "C" fn(ctx: usize) -> i32;
+type FnCuCtxGetCurrent = unsafe extern "C" fn(pctx: *mut usize) -> i32;
+type FnCuCtxPushCurrent = unsafe extern "C" fn(ctx: usize) -> i32;
+type FnCuCtxPopCurrent = unsafe extern "C" fn(pctx: *mut usize) -> i32;
 type FnCuCtxGetApiVersion = unsafe extern "C" fn(ctx: usize, version: *mut u32) -> i32;
 type FnCuCtxSynchronize = unsafe extern "C" fn() -> i32;
 type FnCuCtxGetDevice = unsafe extern "C" fn(device: *mut i32) -> i32;
@@ -95,6 +98,9 @@ type FnCuMemFreeHost = unsafe extern "C" fn(p: *mut std::ffi::c_void) -> i32;
 // Stream wait event
 type FnCuStreamWaitEvent = unsafe extern "C" fn(stream: usize, event: usize, flags: u32) -> i32;
 
+// Function attributes
+type FnCuFuncGetAttribute = unsafe extern "C" fn(pi: *mut i32, attrib: i32, hfunc: usize) -> i32;
+
 // Kernel launch
 type FnCuLaunchKernel = unsafe extern "C" fn(
     f: usize,
@@ -132,6 +138,9 @@ struct CudaApi {
     cu_ctx_create: Option<FnCuCtxCreate>,
     cu_ctx_destroy: Option<FnCuCtxDestroy>,
     cu_ctx_set_current: Option<FnCuCtxSetCurrent>,
+    cu_ctx_get_current: Option<FnCuCtxGetCurrent>,
+    cu_ctx_push_current: Option<FnCuCtxPushCurrent>,
+    cu_ctx_pop_current: Option<FnCuCtxPopCurrent>,
     cu_ctx_get_api_version: Option<FnCuCtxGetApiVersion>,
     cu_ctx_synchronize: Option<FnCuCtxSynchronize>,
     cu_ctx_get_device: Option<FnCuCtxGetDevice>,
@@ -164,6 +173,7 @@ struct CudaApi {
     cu_event_query: Option<FnCuEventQuery>,
 
     cu_launch_kernel: Option<FnCuLaunchKernel>,
+    cu_func_get_attribute: Option<FnCuFuncGetAttribute>,
 }
 
 // Safety: The function pointers in CudaApi are plain function pointers
@@ -234,6 +244,9 @@ impl CudaApi {
             cu_ctx_create: load_sym!(lib, b"cuCtxCreate_v2\0", b"cuCtxCreate\0"),
             cu_ctx_destroy: load_sym!(lib, b"cuCtxDestroy_v2\0", b"cuCtxDestroy\0"),
             cu_ctx_set_current: load_sym!(lib, b"cuCtxSetCurrent\0"),
+            cu_ctx_get_current: load_sym!(lib, b"cuCtxGetCurrent\0"),
+            cu_ctx_push_current: load_sym!(lib, b"cuCtxPushCurrent_v2\0", b"cuCtxPushCurrent\0"),
+            cu_ctx_pop_current: load_sym!(lib, b"cuCtxPopCurrent_v2\0", b"cuCtxPopCurrent\0"),
             cu_ctx_get_api_version: load_sym!(lib, b"cuCtxGetApiVersion\0"),
             cu_ctx_synchronize: load_sym!(lib, b"cuCtxSynchronize\0"),
             cu_ctx_get_device: load_sym!(lib, b"cuCtxGetDevice\0"),
@@ -266,6 +279,7 @@ impl CudaApi {
             cu_event_query: load_sym!(lib, b"cuEventQuery\0"),
 
             cu_launch_kernel: load_sym!(lib, b"cuLaunchKernel\0"),
+            cu_func_get_attribute: load_sym!(lib, b"cuFuncGetAttribute\0"),
         }
     }
 }
@@ -768,6 +782,47 @@ impl GpuBackend for CudaGpuBackend {
             map_cuda_result(func(stream as usize, event as usize, flags))?;
         }
         Ok(())
+    }
+
+    // --- Context stack operations ---
+
+    fn ctx_push_current(&self, ctx: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_ctx_push_current)?;
+        unsafe {
+            map_cuda_result(func(ctx as usize))?;
+        }
+        tracing::trace!(ctx, "CUDA context pushed");
+        Ok(())
+    }
+
+    fn ctx_pop_current(&self) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_ctx_pop_current)?;
+        let mut ctx: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut ctx))?;
+        }
+        tracing::trace!(ctx, "CUDA context popped");
+        Ok(ctx as u64)
+    }
+
+    fn ctx_get_current(&self) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_ctx_get_current)?;
+        let mut ctx: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut ctx))?;
+        }
+        Ok(ctx as u64)
+    }
+
+    // --- Function attribute queries ---
+
+    fn func_get_attribute(&self, func: u64, attrib: i32) -> Result<i32, CuResult> {
+        let api_fn = require_fn(&self.api.cu_func_get_attribute)?;
+        let mut value: i32 = 0;
+        unsafe {
+            map_cuda_result(api_fn(&mut value, attrib, func as usize))?;
+        }
+        Ok(value)
     }
 
     // --- Memory: host pinned ---
