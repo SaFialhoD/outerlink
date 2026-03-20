@@ -108,6 +108,11 @@ static const hook_entry_t hook_table[] = {
     { "cuMemFree_v2",            (void *)hook_cuMemFree_v2 },
     { "cuMemcpyHtoD_v2",        (void *)hook_cuMemcpyHtoD_v2 },
     { "cuMemcpyDtoH_v2",        (void *)hook_cuMemcpyDtoH_v2 },
+    { "cuMemcpyDtoD",            (void *)hook_cuMemcpyDtoD },
+    { "cuMemcpyDtoD_v2",        (void *)hook_cuMemcpyDtoD },
+    { "cuMemAllocHost",          (void *)hook_cuMemAllocHost },
+    { "cuMemAllocHost_v2",      (void *)hook_cuMemAllocHost },
+    { "cuMemFreeHost",           (void *)hook_cuMemFreeHost },
     { "cuMemGetInfo_v2",         (void *)hook_cuMemGetInfo_v2 },
 
     /* Error */
@@ -126,6 +131,7 @@ static const hook_entry_t hook_table[] = {
     { "cuStreamDestroy_v2",      (void *)hook_cuStreamDestroy },
     { "cuStreamSynchronize",     (void *)hook_cuStreamSynchronize },
     { "cuStreamQuery",           (void *)hook_cuStreamQuery },
+    { "cuStreamWaitEvent",       (void *)hook_cuStreamWaitEvent },
 
     /* Event */
     { "cuEventCreate",           (void *)hook_cuEventCreate },
@@ -315,6 +321,21 @@ CUresult hook_cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice, size_t ByteC
     return ol_cuMemcpyDtoH_v2(dstHost, srcDevice, ByteCount);
 }
 
+CUresult hook_cuMemcpyDtoD(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount) {
+    ensure_init();
+    return ol_cuMemcpyDtoD((unsigned long long)dst, (unsigned long long)src, ByteCount);
+}
+
+CUresult hook_cuMemAllocHost(void **pp, size_t bytesize) {
+    ensure_init();
+    return ol_cuMemAllocHost(pp, bytesize);
+}
+
+CUresult hook_cuMemFreeHost(void *p) {
+    ensure_init();
+    return ol_cuMemFreeHost(p);
+}
+
 CUresult hook_cuMemGetInfo_v2(size_t *free, size_t *total) {
     ensure_init();
     return ol_cuMemGetInfo_v2(free, total);
@@ -404,6 +425,13 @@ CUresult hook_cuStreamSynchronize(CUstream hStream) {
 CUresult hook_cuStreamQuery(CUstream hStream) {
     ensure_init();
     return ol_cuStreamQuery((unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int Flags) {
+    ensure_init();
+    return ol_cuStreamWaitEvent((unsigned long long)(uintptr_t)hStream,
+                                (unsigned long long)(uintptr_t)hEvent,
+                                Flags);
 }
 
 /* -- Event -- */

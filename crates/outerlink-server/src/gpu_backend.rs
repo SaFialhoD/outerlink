@@ -121,6 +121,22 @@ pub trait GpuBackend: Send + Sync {
     /// `Ok(())` = recorded, `Err(NotReady)` = not yet.
     fn event_query(&self, event: u64) -> Result<(), CuResult>;
 
+    /// Make a stream wait on an event before executing further work.
+    fn stream_wait_event(&self, stream: u64, event: u64, flags: u32) -> Result<(), CuResult>;
+
+    // --- Memory: host pinned ---
+
+    /// Allocate pinned (page-locked) host memory.
+    fn mem_alloc_host(&self, size: usize) -> Result<u64, CuResult>;
+
+    /// Free pinned host memory.
+    fn mem_free_host(&self, ptr: u64) -> Result<(), CuResult>;
+
+    // --- Memory: device-to-device ---
+
+    /// Copy `size` bytes from one device pointer to another.
+    fn memcpy_dtod(&self, dst: u64, src: u64, size: u64) -> Result<(), CuResult>;
+
     // --- Kernel launch ---
 
     /// Launch a kernel on a stream.
@@ -203,6 +219,10 @@ struct StubState {
     next_event_id: u64,
     /// Monotonically increasing fake timestamp for events.
     event_timestamp_counter: u64,
+    /// Pinned host memory allocations: handle -> byte buffer.
+    host_allocations: HashMap<u64, Vec<u8>>,
+    /// Counter for generating host memory handles.
+    next_host_ptr: u64,
 }
 
 impl StubState {
@@ -243,6 +263,8 @@ impl StubGpuBackend {
                 events: HashMap::new(),
                 next_event_id: 0xE000_0000_0000_0001,
                 event_timestamp_counter: 1000,
+                host_allocations: HashMap::new(),
+                next_host_ptr: 0x0000_CAFE_0000_0000,
             }),
         }
     }
@@ -563,6 +585,59 @@ impl GpuBackend for StubGpuBackend {
             return Err(CuResult::InvalidValue);
         }
         // Stub: events are always "complete".
+        Ok(())
+    }
+
+    fn stream_wait_event(&self, stream: u64, event: u64, _flags: u32) -> Result<(), CuResult> {
+        let state = self.state.lock().unwrap();
+        // stream 0 = default stream, always valid.
+        if stream != 0 && !state.streams.contains_key(&stream) {
+            return Err(CuResult::InvalidValue);
+        }
+        if !state.events.contains_key(&event) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Stub: no actual waiting.
+        Ok(())
+    }
+
+    // --- Memory: host pinned ---
+
+    fn mem_alloc_host(&self, size: usize) -> Result<u64, CuResult> {
+        if size == 0 {
+            return Err(CuResult::InvalidValue);
+        }
+        let mut state = self.state.lock().unwrap();
+        let ptr = state.next_host_ptr;
+        state.next_host_ptr += size as u64;
+        state.host_allocations.insert(ptr, vec![0u8; size]);
+        Ok(ptr)
+    }
+
+    fn mem_free_host(&self, ptr: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if state.host_allocations.remove(&ptr).is_none() {
+            return Err(CuResult::InvalidValue);
+        }
+        Ok(())
+    }
+
+    // --- Memory: device-to-device ---
+
+    fn memcpy_dtod(&self, dst: u64, src: u64, size: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        // Read source data first.
+        let src_buf = state.allocations.get(&src).ok_or(CuResult::InvalidValue)?;
+        if (size as usize) > src_buf.len() {
+            return Err(CuResult::InvalidValue);
+        }
+        let data = src_buf[..size as usize].to_vec();
+        // Write to destination.
+        let dst_buf = state.allocations.get_mut(&dst).ok_or(CuResult::InvalidValue)?;
+        if (size as usize) > dst_buf.len() {
+            return Err(CuResult::InvalidValue);
+        }
+        dst_buf[..size as usize].copy_from_slice(&data);
         Ok(())
     }
 
@@ -1005,5 +1080,141 @@ mod tests {
             gpu.launch_kernel(func, [1,1,1], [1,1,1], 0, 0xBAD, &[]),
             Err(CuResult::InvalidValue)
         );
+    }
+
+    // ----- MemcpyDtoD tests -----
+
+    #[test]
+    fn test_memcpy_dtod() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        let dst = gpu.mem_alloc(64).unwrap();
+
+        // Write pattern to source.
+        let data: Vec<u8> = (0..64).collect();
+        assert_eq!(gpu.memcpy_htod(src, &data), CuResult::Success);
+
+        // Copy device-to-device.
+        assert!(gpu.memcpy_dtod(dst, src, 64).is_ok());
+
+        // Read back from destination.
+        let out = gpu.memcpy_dtoh(dst, 64).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_memcpy_dtod_partial() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        let dst = gpu.mem_alloc(64).unwrap();
+
+        let data: Vec<u8> = (0..64).collect();
+        gpu.memcpy_htod(src, &data);
+
+        // Copy only 32 bytes.
+        assert!(gpu.memcpy_dtod(dst, src, 32).is_ok());
+
+        let out = gpu.memcpy_dtoh(dst, 64).unwrap();
+        assert_eq!(&out[..32], &data[..32]);
+        // Rest should be zeros.
+        assert_eq!(&out[32..], &[0u8; 32]);
+    }
+
+    #[test]
+    fn test_memcpy_dtod_invalid_src() {
+        let gpu = StubGpuBackend::new();
+        let dst = gpu.mem_alloc(64).unwrap();
+        assert_eq!(gpu.memcpy_dtod(dst, 0xBAD, 64), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_memcpy_dtod_invalid_dst() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        assert_eq!(gpu.memcpy_dtod(0xBAD, src, 64), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_memcpy_dtod_size_exceeds_src() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(32).unwrap();
+        let dst = gpu.mem_alloc(64).unwrap();
+        assert_eq!(gpu.memcpy_dtod(dst, src, 64), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_memcpy_dtod_size_exceeds_dst() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        let dst = gpu.mem_alloc(32).unwrap();
+        assert_eq!(gpu.memcpy_dtod(dst, src, 64), Err(CuResult::InvalidValue));
+    }
+
+    // ----- MemAllocHost / MemFreeHost tests -----
+
+    #[test]
+    fn test_mem_alloc_host() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_host(4096).unwrap();
+        assert_ne!(ptr, 0);
+    }
+
+    #[test]
+    fn test_mem_alloc_host_zero_size() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_alloc_host(0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_free_host() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_host(4096).unwrap();
+        assert!(gpu.mem_free_host(ptr).is_ok());
+    }
+
+    #[test]
+    fn test_mem_free_host_double_free() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_host(4096).unwrap();
+        assert!(gpu.mem_free_host(ptr).is_ok());
+        assert_eq!(gpu.mem_free_host(ptr), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_free_host_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_free_host(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    // ----- StreamWaitEvent tests -----
+
+    #[test]
+    fn test_stream_wait_event() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        let event = gpu.event_create(0).unwrap();
+        assert!(gpu.stream_wait_event(stream, event, 0).is_ok());
+    }
+
+    #[test]
+    fn test_stream_wait_event_default_stream() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        // stream=0 is the default stream, always valid.
+        assert!(gpu.stream_wait_event(0, event, 0).is_ok());
+    }
+
+    #[test]
+    fn test_stream_wait_event_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        assert_eq!(gpu.stream_wait_event(0xBAD, event, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_stream_wait_event_invalid_event() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        assert_eq!(gpu.stream_wait_event(stream, 0xBAD, 0), Err(CuResult::InvalidValue));
     }
 }

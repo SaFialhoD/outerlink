@@ -50,6 +50,9 @@ extern CUresult ol_cuMemAlloc_v2(unsigned long long *dptr, size_t bytesize);
 extern CUresult ol_cuMemFree_v2(unsigned long long dptr);
 extern CUresult ol_cuMemcpyHtoD_v2(unsigned long long dstDevice, const void *srcHost, size_t ByteCount);
 extern CUresult ol_cuMemcpyDtoH_v2(void *dstHost, unsigned long long srcDevice, size_t ByteCount);
+extern CUresult ol_cuMemcpyDtoD(unsigned long long dst, unsigned long long src, size_t ByteCount);
+extern CUresult ol_cuMemAllocHost(void **pp, size_t bytesize);
+extern CUresult ol_cuMemFreeHost(void *p);
 extern CUresult ol_cuMemGetInfo_v2(size_t *free, size_t *total);
 
 /* Error handling -- CUresult is an enum (int-sized) */
@@ -67,6 +70,7 @@ extern CUresult ol_cuStreamCreate(unsigned long long *stream, unsigned int flags
 extern CUresult ol_cuStreamDestroy(unsigned long long stream);
 extern CUresult ol_cuStreamSynchronize(unsigned long long stream);
 extern CUresult ol_cuStreamQuery(unsigned long long stream);
+extern CUresult ol_cuStreamWaitEvent(unsigned long long stream, unsigned long long event, unsigned int flags);
 
 /* Event management */
 extern CUresult ol_cuEventCreate(unsigned long long *event, unsigned int flags);
@@ -116,6 +120,9 @@ CUresult hook_cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize);
 CUresult hook_cuMemFree_v2(CUdeviceptr dptr);
 CUresult hook_cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost, size_t ByteCount);
 CUresult hook_cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount);
+CUresult hook_cuMemcpyDtoD(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount);
+CUresult hook_cuMemAllocHost(void **pp, size_t bytesize);
+CUresult hook_cuMemFreeHost(void *p);
 CUresult hook_cuMemGetInfo_v2(size_t *free, size_t *total);
 
 /* Error */
@@ -133,6 +140,7 @@ CUresult hook_cuStreamCreate(CUstream *phStream, unsigned int Flags);
 CUresult hook_cuStreamDestroy(CUstream hStream);
 CUresult hook_cuStreamSynchronize(CUstream hStream);
 CUresult hook_cuStreamQuery(CUstream hStream);
+CUresult hook_cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int Flags);
 
 /* Event */
 CUresult hook_cuEventCreate(CUevent *phEvent, unsigned int Flags);

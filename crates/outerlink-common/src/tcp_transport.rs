@@ -474,9 +474,12 @@ mod tests {
         client.close().await.unwrap();
         assert!(!client.is_connected());
 
-        // The server should get an error when trying to receive (peer closed).
+        // The server should get ConnectionClosed when trying to receive (peer closed).
         let result = server.recv_message().await;
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(OuterLinkError::ConnectionClosed)),
+            "expected ConnectionClosed, got: {result:?}"
+        );
         assert!(!server.is_connected());
     }
 

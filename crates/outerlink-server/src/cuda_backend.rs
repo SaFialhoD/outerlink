@@ -85,6 +85,16 @@ type FnCuEventElapsedTime =
     unsafe extern "C" fn(ms: *mut f32, start: usize, end: usize) -> i32;
 type FnCuEventQuery = unsafe extern "C" fn(event: usize) -> i32;
 
+// Device-to-device memory copy
+type FnCuMemcpyDtoD = unsafe extern "C" fn(dst: u64, src: u64, bytecount: usize) -> i32;
+
+// Host pinned memory
+type FnCuMemAllocHost = unsafe extern "C" fn(pp: *mut *mut std::ffi::c_void, bytesize: usize) -> i32;
+type FnCuMemFreeHost = unsafe extern "C" fn(p: *mut std::ffi::c_void) -> i32;
+
+// Stream wait event
+type FnCuStreamWaitEvent = unsafe extern "C" fn(stream: usize, event: usize, flags: u32) -> i32;
+
 // Kernel launch
 type FnCuLaunchKernel = unsafe extern "C" fn(
     f: usize,
@@ -131,6 +141,9 @@ struct CudaApi {
     cu_memcpy_htod: Option<FnCuMemcpyHtoD>,
     cu_memcpy_dtoh: Option<FnCuMemcpyDtoH>,
     cu_mem_get_info: Option<FnCuMemGetInfo>,
+    cu_memcpy_dtod: Option<FnCuMemcpyDtoD>,
+    cu_mem_alloc_host: Option<FnCuMemAllocHost>,
+    cu_mem_free_host: Option<FnCuMemFreeHost>,
 
     cu_module_load_data: Option<FnCuModuleLoadData>,
     cu_module_unload: Option<FnCuModuleUnload>,
@@ -141,6 +154,7 @@ struct CudaApi {
     cu_stream_destroy: Option<FnCuStreamDestroy>,
     cu_stream_synchronize: Option<FnCuStreamSynchronize>,
     cu_stream_query: Option<FnCuStreamQuery>,
+    cu_stream_wait_event: Option<FnCuStreamWaitEvent>,
 
     cu_event_create: Option<FnCuEventCreate>,
     cu_event_destroy: Option<FnCuEventDestroy>,
@@ -229,6 +243,9 @@ impl CudaApi {
             cu_memcpy_htod: load_sym!(lib, b"cuMemcpyHtoD_v2\0", b"cuMemcpyHtoD\0"),
             cu_memcpy_dtoh: load_sym!(lib, b"cuMemcpyDtoH_v2\0", b"cuMemcpyDtoH\0"),
             cu_mem_get_info: load_sym!(lib, b"cuMemGetInfo_v2\0", b"cuMemGetInfo\0"),
+            cu_memcpy_dtod: load_sym!(lib, b"cuMemcpyDtoD_v2\0", b"cuMemcpyDtoD\0"),
+            cu_mem_alloc_host: load_sym!(lib, b"cuMemAllocHost_v2\0", b"cuMemAllocHost\0"),
+            cu_mem_free_host: load_sym!(lib, b"cuMemFreeHost\0"),
 
             cu_module_load_data: load_sym!(lib, b"cuModuleLoadData\0"),
             cu_module_unload: load_sym!(lib, b"cuModuleUnload\0"),
@@ -239,6 +256,7 @@ impl CudaApi {
             cu_stream_destroy: load_sym!(lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0"),
             cu_stream_synchronize: load_sym!(lib, b"cuStreamSynchronize\0"),
             cu_stream_query: load_sym!(lib, b"cuStreamQuery\0"),
+            cu_stream_wait_event: load_sym!(lib, b"cuStreamWaitEvent\0"),
 
             cu_event_create: load_sym!(lib, b"cuEventCreate\0"),
             cu_event_destroy: load_sym!(lib, b"cuEventDestroy_v2\0", b"cuEventDestroy\0"),
@@ -681,6 +699,48 @@ impl GpuBackend for CudaGpuBackend {
         let func = require_fn(&self.api.cu_event_query)?;
         unsafe {
             map_cuda_result(func(event as usize))?;
+        }
+        Ok(())
+    }
+
+    fn stream_wait_event(&self, stream: u64, event: u64, flags: u32) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_stream_wait_event)?;
+        unsafe {
+            map_cuda_result(func(stream as usize, event as usize, flags))?;
+        }
+        Ok(())
+    }
+
+    // --- Memory: host pinned ---
+
+    fn mem_alloc_host(&self, size: usize) -> Result<u64, CuResult> {
+        if size == 0 {
+            return Err(CuResult::InvalidValue);
+        }
+        let func = require_fn(&self.api.cu_mem_alloc_host)?;
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe {
+            map_cuda_result(func(&mut ptr, size))?;
+        }
+        tracing::trace!(ptr = ?ptr, size, "pinned host memory allocated");
+        Ok(ptr as u64)
+    }
+
+    fn mem_free_host(&self, ptr: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_mem_free_host)?;
+        unsafe {
+            map_cuda_result(func(ptr as *mut std::ffi::c_void))?;
+        }
+        tracing::trace!(ptr, "pinned host memory freed");
+        Ok(())
+    }
+
+    // --- Memory: device-to-device ---
+
+    fn memcpy_dtod(&self, dst: u64, src: u64, size: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_memcpy_dtod)?;
+        unsafe {
+            map_cuda_result(func(dst, src, size as usize))?;
         }
         Ok(())
     }

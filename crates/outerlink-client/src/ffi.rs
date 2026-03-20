@@ -1336,6 +1336,178 @@ pub extern "C" fn ol_cuLaunchKernel(
     CUDA_SUCCESS
 }
 
+// ---------------------------------------------------------------------------
+// MemcpyDtoD
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemcpyDtoD(dst: u64, src: u64, byte_count: usize) -> u32 {
+    let client = get_client();
+    if byte_count == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: translate both handles and send to server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_dst = match client.handles.device_ptrs.to_remote(dst) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_src = match client.handles.device_ptrs.to_remote(src) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        // Payload: [8B remote_dst][8B remote_src][8B size as u64]
+        let mut payload = [0u8; 24];
+        payload[0..8].copy_from_slice(&remote_dst.to_le_bytes());
+        payload[8..16].copy_from_slice(&remote_src.to_le_bytes());
+        payload[16..24].copy_from_slice(&(byte_count as u64).to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemcpyDtoD, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate both handles exist
+    if client.handles.device_ptrs.to_remote(dst).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.handles.device_ptrs.to_remote(src).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// MemAllocHost / MemFreeHost
+// ---------------------------------------------------------------------------
+
+/// Tracking set for host-allocated pointers (stub mode).
+/// In connected mode the server manages host memory; in stub mode we allocate
+/// real host memory and track pointers here for safe deallocation.
+static HOST_ALLOCS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+fn host_allocs() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
+    HOST_ALLOCS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Tracking map for host-allocated pointer sizes (stub mode).
+/// Needed for correct deallocation with matching layout.
+static HOST_ALLOC_SIZES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, usize>>> =
+    std::sync::OnceLock::new();
+
+fn host_alloc_sizes() -> &'static std::sync::Mutex<std::collections::HashMap<u64, usize>> {
+    HOST_ALLOC_SIZES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemAllocHost(pp: *mut *mut u8, byte_size: usize) -> u32 {
+    let client = get_client();
+    if pp.is_null() || byte_size == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let payload = (byte_size as u64).to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemAllocHost, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            // Response: 4B result + 8B host_ptr
+            if resp.len() >= 12 {
+                let host_ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                unsafe { *pp = host_ptr as *mut u8 };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: allocate real host memory
+    let layout = std::alloc::Layout::from_size_align(byte_size, 8).unwrap();
+    let allocated = unsafe { std::alloc::alloc_zeroed(layout) };
+    if allocated.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let ptr_val = allocated as u64;
+    host_allocs().lock().unwrap().insert(ptr_val);
+    host_alloc_sizes().lock().unwrap().insert(ptr_val, byte_size);
+    unsafe { *pp = allocated };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemFreeHost(p: *mut u8) -> u32 {
+    let client = get_client();
+    if p.is_null() {
+        return CUDA_SUCCESS; // Freeing null is a no-op
+    }
+    // Connected: tell the server
+    if client.connected.load(Ordering::Acquire) {
+        let payload = (p as u64).to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemFreeHost, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: remove from tracking set and deallocate
+    let ptr_val = p as u64;
+    let mut set = host_allocs().lock().unwrap();
+    if !set.remove(&ptr_val) {
+        return CUDA_ERROR_INVALID_VALUE; // Double-free or unknown pointer
+    }
+    drop(set);
+    let size = host_alloc_sizes().lock().unwrap().remove(&ptr_val).unwrap_or(1);
+    unsafe {
+        let layout = std::alloc::Layout::from_size_align_unchecked(size, 8);
+        std::alloc::dealloc(p, layout);
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// StreamWaitEvent
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuStreamWaitEvent(stream: u64, event: u64, flags: u32) -> u32 {
+    let client = get_client();
+    // Connected: translate handles and send to server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        let remote_event = match client.handles.events.to_remote(event) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        // Payload: [8B remote_stream][8B remote_event][4B flags]
+        let mut payload = [0u8; 20];
+        payload[0..8].copy_from_slice(&remote_stream.to_le_bytes());
+        payload[8..16].copy_from_slice(&remote_event.to_le_bytes());
+        payload[16..20].copy_from_slice(&flags.to_le_bytes());
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::StreamWaitEvent, &payload)
+        {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate event handle exists
+    if client.handles.events.to_remote(event).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Validate stream handle (0 = default stream, always valid)
+    if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -2027,5 +2199,115 @@ mod tests {
     #[test]
     fn test_ol_cu_event_query_invalid() {
         assert_eq!(ol_cuEventQuery(0xDEAD), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- MemcpyDtoD tests --
+
+    #[test]
+    fn test_ol_cu_memcpy_dtod() {
+        let mut src: u64 = 0;
+        let mut dst: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut src, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemAlloc_v2(&mut dst, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpyDtoD(dst, src, 512), CUDA_SUCCESS);
+        let _ = ol_cuMemFree_v2(src);
+        let _ = ol_cuMemFree_v2(dst);
+    }
+
+    #[test]
+    fn test_ol_cu_memcpy_dtod_invalid_dst() {
+        let mut src: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut src, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpyDtoD(0xBAAD, src, 512), CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuMemFree_v2(src);
+    }
+
+    #[test]
+    fn test_ol_cu_memcpy_dtod_invalid_src() {
+        let mut dst: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dst, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpyDtoD(dst, 0xBAAD, 512), CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuMemFree_v2(dst);
+    }
+
+    #[test]
+    fn test_ol_cu_memcpy_dtod_zero_size() {
+        assert_eq!(ol_cuMemcpyDtoD(0x1000, 0x2000, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- MemAllocHost / MemFreeHost tests --
+
+    #[test]
+    fn test_ol_cu_mem_alloc_host_and_free() {
+        let mut ptr: *mut u8 = ptr::null_mut();
+        assert_eq!(ol_cuMemAllocHost(&mut ptr, 4096), CUDA_SUCCESS);
+        assert!(!ptr.is_null());
+        // Write to the allocated memory to verify it is accessible
+        unsafe { *ptr = 42 };
+        assert_eq!(unsafe { *ptr }, 42);
+        assert_eq!(ol_cuMemFreeHost(ptr), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_alloc_host_null_pp() {
+        assert_eq!(ol_cuMemAllocHost(ptr::null_mut(), 4096), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_alloc_host_zero_size() {
+        let mut ptr: *mut u8 = ptr::null_mut();
+        assert_eq!(ol_cuMemAllocHost(&mut ptr, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_free_host_null() {
+        // Freeing null is a no-op
+        assert_eq!(ol_cuMemFreeHost(ptr::null_mut()), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_free_host_double_free() {
+        let mut ptr: *mut u8 = ptr::null_mut();
+        assert_eq!(ol_cuMemAllocHost(&mut ptr, 256), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemFreeHost(ptr), CUDA_SUCCESS);
+        // Second free should fail
+        assert_eq!(ol_cuMemFreeHost(ptr), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_free_host_unknown_ptr() {
+        // A pointer never allocated by us
+        assert_eq!(ol_cuMemFreeHost(0xDEAD as *mut u8), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- StreamWaitEvent tests --
+
+    #[test]
+    fn test_ol_cu_stream_wait_event() {
+        let mut event: u64 = 0;
+        assert_eq!(ol_cuEventCreate(&mut event, 0), CUDA_SUCCESS);
+        // Default stream (0) with valid event
+        assert_eq!(ol_cuStreamWaitEvent(0, event, 0), CUDA_SUCCESS);
+
+        // Created stream with valid event
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuStreamWaitEvent(stream, event, 0), CUDA_SUCCESS);
+
+        let _ = ol_cuStreamDestroy(stream);
+        let _ = ol_cuEventDestroy(event);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_wait_event_invalid_event() {
+        assert_eq!(ol_cuStreamWaitEvent(0, 0xDEAD, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_wait_event_invalid_stream() {
+        let mut event: u64 = 0;
+        assert_eq!(ol_cuEventCreate(&mut event, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuStreamWaitEvent(0xDEAD, event, 0), CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuEventDestroy(event);
     }
 }
