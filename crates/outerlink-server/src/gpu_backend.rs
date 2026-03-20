@@ -171,19 +171,18 @@ impl GpuBackend for StubGpuBackend {
         if size == 0 {
             return Err(CuResult::InvalidValue);
         }
-        if self.used_bytes() + size > STUB_TOTAL_MEM {
+        // Hold allocations lock for the entire check-and-insert to prevent a
+        // TOCTOU race where two concurrent callers both pass the capacity check
+        // and together exceed STUB_TOTAL_MEM.
+        let mut allocs = self.allocations.lock().unwrap();
+        let used: usize = allocs.values().map(|v| v.len()).sum();
+        if used + size > STUB_TOTAL_MEM {
             return Err(CuResult::OutOfMemory);
         }
-
         let mut next = self.next_ptr.lock().unwrap();
         let ptr = *next;
         *next += size as u64;
-
-        // Allocate zeroed buffer.
-        self.allocations
-            .lock()
-            .unwrap()
-            .insert(ptr, vec![0u8; size]);
+        allocs.insert(ptr, vec![0u8; size]);
         Ok(ptr)
     }
 

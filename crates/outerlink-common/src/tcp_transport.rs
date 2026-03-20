@@ -20,6 +20,12 @@ use crate::protocol::{MessageHeader, HEADER_SIZE, MAGIC, MAX_PAYLOAD_SIZE, VERSI
 use crate::transport::{async_trait, TransportConnection, TransportFactory, TransportListener};
 use crate::Result;
 
+/// Maximum number of bytes allowed in a single [`TcpTransportConnection::recv_bulk`] call.
+///
+/// Matches [`MAX_PAYLOAD_SIZE`] (256 MiB) to prevent OOM from malicious or
+/// buggy callers supplying an unbounded size.
+const MAX_BULK_SIZE: usize = MAX_PAYLOAD_SIZE as usize;
+
 /// A TCP transport connection wrapping a tokio [`TcpStream`].
 ///
 /// The stream is split into independent read and write halves so that
@@ -35,11 +41,13 @@ pub struct TcpTransportConnection {
 impl TcpTransportConnection {
     /// Wrap a connected [`TcpStream`] into a `TcpTransportConnection`.
     ///
-    /// Enables `TCP_NODELAY` and sets socket buffer sizes. The stream is
-    /// split into owned read/write halves protected by async mutexes.
+    /// Enables `TCP_NODELAY`. The stream is split into owned read/write
+    /// halves protected by async mutexes.
     pub fn new(stream: TcpStream) -> Result<Self> {
         // Enable TCP_NODELAY to avoid Nagle buffering latency.
-        stream.set_nodelay(true)?;
+        stream.set_nodelay(true).map_err(|e| {
+            OuterLinkError::Connection(format!("failed to set TCP_NODELAY: {e}"))
+        })?;
 
         let remote_addr = stream
             .peer_addr()
@@ -139,10 +147,16 @@ impl TransportConnection for TcpTransportConnection {
             )));
         }
 
-        let header = MessageHeader::from_bytes(&header_buf).ok_or_else(|| {
-            self.mark_disconnected();
-            OuterLinkError::Protocol("malformed header".into())
-        })?;
+        let header = match MessageHeader::from_bytes(&header_buf) {
+            Some(h) => h,
+            None => {
+                let msg_type_raw = u16::from_be_bytes([header_buf[16], header_buf[17]]);
+                self.mark_disconnected();
+                return Err(OuterLinkError::Protocol(format!(
+                    "malformed header: unknown msg_type 0x{msg_type_raw:04x}"
+                )));
+            }
+        };
 
         let mut payload = vec![0u8; header.payload_len as usize];
         if !payload.is_empty() {
@@ -176,9 +190,23 @@ impl TransportConnection for TcpTransportConnection {
     }
 
     /// Read exactly `size` bytes of raw bulk data from the stream.
+    ///
+    /// Returns an empty [`Vec`] immediately when `size` is zero. Returns a
+    /// [`OuterLinkError::Protocol`] error when `size` exceeds [`MAX_BULK_SIZE`]
+    /// to prevent unbounded heap allocation from malicious or buggy callers.
     async fn recv_bulk(&self, size: usize) -> Result<Vec<u8>> {
         if !self.is_connected() {
             return Err(OuterLinkError::Connection("not connected".into()));
+        }
+
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+
+        if size > MAX_BULK_SIZE {
+            return Err(OuterLinkError::Protocol(format!(
+                "recv_bulk size {size} exceeds maximum {MAX_BULK_SIZE}"
+            )));
         }
 
         let mut buf = vec![0u8; size];
@@ -434,6 +462,30 @@ mod tests {
 
         assert!(client.remote_addr().contains("127.0.0.1"));
         assert!(server.remote_addr().contains("127.0.0.1"));
+    }
+
+    // -- Test: recv_bulk(0) returns empty vec without touching the stream --
+
+    #[tokio::test]
+    async fn test_recv_bulk_zero_returns_empty() {
+        let (_client, server) = connected_pair().await;
+        let result = server.recv_bulk(0).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    // -- Test: recv_bulk rejects sizes above MAX_BULK_SIZE --
+
+    #[tokio::test]
+    async fn test_recv_bulk_over_max_size_returns_error() {
+        let (_client, server) = connected_pair().await;
+        let result = server.recv_bulk(MAX_BULK_SIZE + 1).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            OuterLinkError::Protocol(msg) => {
+                assert!(msg.contains("exceeds maximum"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected Protocol error, got: {other:?}"),
+        }
     }
 
     // -- Test: multiple messages in sequence --

@@ -10,6 +10,8 @@
 //! - Serialize CUDA calls and send over transport
 //! - Deserialize responses and return to application
 
+use std::sync::atomic::AtomicBool;
+
 use outerlink_common::handle::HandleStore;
 
 /// Global client state, initialized on first CUDA call.
@@ -18,8 +20,9 @@ pub struct OuterLinkClient {
     pub handles: HandleStore,
     /// Server address
     pub server_addr: String,
-    /// Connection state
-    pub connected: bool,
+    /// Connection state — AtomicBool so it can be mutated through a shared
+    /// (&self) reference, which is required when the client lives in a OnceLock.
+    pub connected: AtomicBool,
 }
 
 impl OuterLinkClient {
@@ -28,7 +31,7 @@ impl OuterLinkClient {
         Self {
             handles: HandleStore::new(),
             server_addr,
-            connected: false,
+            connected: AtomicBool::new(false),
         }
     }
 }

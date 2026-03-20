@@ -67,6 +67,11 @@ pub fn handle_request(
     let rid = header.request_id;
 
     match header.msg_type {
+        MessageType::Handshake => {
+            tracing::info!("client handshake received");
+            result_only(rid, CuResult::Success)
+        }
+
         MessageType::Init => {
             let r = backend.init();
             result_only(rid, r)
@@ -225,6 +230,15 @@ mod tests {
     /// Extract the CuResult from the first 4 bytes of a response payload.
     fn response_result(payload: &[u8]) -> CuResult {
         CuResult::from_raw(u32::from_le_bytes(payload[..4].try_into().unwrap()))
+    }
+
+    #[test]
+    fn test_handshake() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::Handshake, 0);
+        let (resp_hdr, resp) = handle_request(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(resp_hdr.msg_type, MessageType::Response);
     }
 
     #[test]

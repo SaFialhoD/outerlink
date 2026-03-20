@@ -32,6 +32,12 @@ const CUDA_ERROR_NOT_FOUND: u32 = 500;
 /// OnceLock guarantees exactly-once, thread-safe initialization.
 static CLIENT: OnceLock<OuterLinkClient> = OnceLock::new();
 
+/// Monotonic counter for generating unique stub remote handle values.
+/// Prevents handle collision when the same device is used for multiple contexts
+/// or when allocation sizes happen to collide.
+static STUB_HANDLE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x1000);
+
 /// Initialize the global client. Called by the C layer via pthread_once,
 /// but also called lazily from each FFI function as a safety net.
 fn get_client() -> &'static OuterLinkClient {
@@ -107,16 +113,12 @@ pub extern "C" fn ol_cuDeviceGetName(name: *mut u8, len: i32, dev: i32) -> u32 {
     if dev < 0 || dev >= 1 {
         return CUDA_ERROR_INVALID_DEVICE;
     }
-    let device_name = b"OuterLink Virtual GPU\0";
-    let copy_len = std::cmp::min(len as usize, device_name.len());
+    let device_name = b"OuterLink Virtual GPU";  // no embedded null
+    let buf_size = len as usize;
+    let copy_len = std::cmp::min(buf_size.saturating_sub(1), device_name.len());
     unsafe {
-        ptr::copy_nonoverlapping(device_name.as_ptr(), name, copy_len);
-        // Ensure null termination
-        if copy_len < len as usize {
-            *name.add(copy_len) = 0;
-        } else {
-            *name.add(copy_len - 1) = 0;
-        }
+        std::ptr::copy_nonoverlapping(device_name.as_ptr(), name, copy_len);
+        *name.add(copy_len) = 0;  // always null-terminate
     }
     CUDA_SUCCESS
 }
@@ -198,8 +200,10 @@ pub extern "C" fn ol_cuCtxCreate_v2(pctx: *mut u64, flags: u32, dev: i32) -> u32
         return CUDA_ERROR_INVALID_DEVICE;
     }
     let _ = flags;
-    // Create a synthetic context handle
-    let synthetic = client.handles.contexts.insert(0x1000 + dev as u64);
+    // Create a synthetic context handle using a monotonic counter so that
+    // multiple contexts on the same device get distinct remote values.
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.contexts.insert(stub_remote);
     unsafe { *pctx = synthetic };
     CUDA_SUCCESS
 }
@@ -242,9 +246,10 @@ pub extern "C" fn ol_cuMemAlloc_v2(dptr: *mut u64, size: usize) -> u32 {
     if dptr.is_null() || size == 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // Create a synthetic device pointer
-    // In real implementation, this would allocate on the remote GPU
-    let synthetic = client.handles.device_ptrs.insert(size as u64);
+    // Create a synthetic device pointer using a monotonic counter so that
+    // allocations of the same size get distinct remote values.
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.device_ptrs.insert(stub_remote);
     unsafe { *dptr = synthetic };
     CUDA_SUCCESS
 }
@@ -437,6 +442,44 @@ mod tests {
         let mut buf = [0u8; 256];
         let result = ol_cuDeviceGetName(buf.as_mut_ptr(), 256, 5);
         assert_eq!(result, CUDA_ERROR_INVALID_DEVICE);
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_name_small_buffer() {
+        // Buffer smaller than the name — must still be null-terminated and not overflow.
+        let mut buf = [0xFFu8; 5];
+        let result = ol_cuDeviceGetName(buf.as_mut_ptr(), 5, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        // Last byte must be null terminator.
+        assert_eq!(buf[4], 0);
+        // First 4 bytes hold the truncated name prefix.
+        assert_eq!(&buf[..4], b"Oute");
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_name_exact_buffer() {
+        // Buffer is exactly the length of the name plus a null byte.
+        // "OuterLink Virtual GPU" is 21 bytes, so buf_size = 22.
+        let name_str = b"OuterLink Virtual GPU";
+        let buf_size = name_str.len() + 1; // 22
+        let mut buf = vec![0xFFu8; buf_size];
+        let result = ol_cuDeviceGetName(buf.as_mut_ptr(), buf_size as i32, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(buf[name_str.len()], 0); // null terminator in last slot
+        assert_eq!(&buf[..name_str.len()], name_str.as_slice());
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_create_twice_same_device_different_handles() {
+        let mut ctx1: u64 = 0;
+        let mut ctx2: u64 = 0;
+        assert_eq!(ol_cuCtxCreate_v2(&mut ctx1, 0, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuCtxCreate_v2(&mut ctx2, 0, 0), CUDA_SUCCESS);
+        // Each call must return a distinct synthetic handle.
+        assert_ne!(ctx1, ctx2);
+        // Clean up so handle store stays consistent across test runs.
+        let _ = ol_cuCtxDestroy_v2(ctx1);
+        let _ = ol_cuCtxDestroy_v2(ctx2);
     }
 
     #[test]

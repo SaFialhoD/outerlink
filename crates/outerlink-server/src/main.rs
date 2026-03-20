@@ -7,10 +7,10 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use outerlink_common::protocol::{MessageHeader, HEADER_SIZE};
+use outerlink_common::tcp_transport::TcpTransportConnection;
+use outerlink_common::transport::TransportConnection;
 use outerlink_server::gpu_backend::{GpuBackend, StubGpuBackend};
 use outerlink_server::handler::handle_request;
 
@@ -63,7 +63,14 @@ async fn main() -> anyhow::Result<()> {
 
         let backend = Arc::clone(&backend);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, backend).await {
+            let conn = match TcpTransportConnection::new(stream) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(%peer, error = %e, "failed to initialise transport");
+                    return;
+                }
+            };
+            if let Err(e) = handle_connection(conn, backend).await {
                 tracing::error!(%peer, error = %e, "connection handler error");
             }
             tracing::info!(%peer, "connection closed");
@@ -73,30 +80,29 @@ async fn main() -> anyhow::Result<()> {
 
 /// Drive a single client connection to completion.
 ///
-/// Reads messages in a loop, dispatches each to [`handle_request`],
-/// and writes the response back. Returns when the client disconnects
-/// or a fatal I/O error occurs.
+/// Reads messages in a loop via [`TcpTransportConnection`] (which provides
+/// TCP_NODELAY, magic/version validation, and payload-size bounds checking),
+/// dispatches each to [`handle_request`], and writes the response back.
+/// Returns when the client disconnects or a fatal I/O error occurs.
 async fn handle_connection(
-    mut stream: tokio::net::TcpStream,
+    conn: TcpTransportConnection,
     backend: Arc<dyn GpuBackend>,
 ) -> anyhow::Result<()> {
     loop {
-        // 1. Read the fixed-size header.
-        let mut hdr_buf = [0u8; HEADER_SIZE];
-        match stream.read_exact(&mut hdr_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // Client closed the connection gracefully.
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        }
-
-        let header = match MessageHeader::from_bytes(&hdr_buf) {
-            Some(h) => h,
-            None => {
-                tracing::warn!("invalid header, closing connection");
-                return Ok(());
+        // 1. Receive the next framed message (header + payload).
+        let (header, payload) = match conn.recv_message().await {
+            Ok(msg) => msg,
+            Err(e) => {
+                // Distinguish a clean client disconnect from a real error.
+                let msg = e.to_string();
+                if msg.contains("failed to read header")
+                    && (msg.contains("unexpected end of file")
+                        || msg.contains("connection reset"))
+                {
+                    // Client closed the connection gracefully.
+                    return Ok(());
+                }
+                return Err(anyhow::anyhow!(e));
             }
         };
 
@@ -107,21 +113,10 @@ async fn handle_connection(
             "received request"
         );
 
-        // 2. Read the payload.
-        let mut payload = vec![0u8; header.payload_len as usize];
-        if !payload.is_empty() {
-            stream.read_exact(&mut payload).await?;
-        }
-
-        // 3. Dispatch.
+        // 2. Dispatch.
         let (resp_header, resp_payload) = handle_request(&*backend, &header, &payload);
 
-        // 4. Write the response.
-        let resp_hdr_bytes = resp_header.to_bytes();
-        stream.write_all(&resp_hdr_bytes).await?;
-        if !resp_payload.is_empty() {
-            stream.write_all(&resp_payload).await?;
-        }
-        stream.flush().await?;
+        // 3. Write the response.
+        conn.send_message(&resp_header, &resp_payload).await?;
     }
 }
