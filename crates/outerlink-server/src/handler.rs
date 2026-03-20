@@ -181,6 +181,9 @@ pub fn handle_request(
             }
             let dst = u64::from_le_bytes(payload[..8].try_into().unwrap());
             let data = &payload[8..];
+            if data.is_empty() {
+                return error_response(rid, CuResult::InvalidValue);
+            }
             let r = backend.memcpy_htod(dst, data);
             result_only(rid, r)
         }

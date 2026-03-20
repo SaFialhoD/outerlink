@@ -63,6 +63,22 @@ const STUB_TOTAL_MEM: usize = 24 * 1024 * 1024 * 1024;
 /// Simulated GPU name.
 const STUB_GPU_NAME: &str = "OuterLink Virtual GPU";
 
+/// Combined state for the stub GPU backend, protected by a single `Mutex`
+/// to prevent deadlocks from multi-lock acquisition ordering.
+struct StubState {
+    /// Simulated VRAM: maps device-pointer -> byte buffer.
+    allocations: HashMap<u64, Vec<u8>>,
+    /// Monotonically increasing counter for fake device pointers.
+    next_ptr: u64,
+}
+
+impl StubState {
+    /// Return how many bytes are currently "allocated".
+    fn used_bytes(&self) -> usize {
+        self.allocations.values().map(|v| v.len()).sum()
+    }
+}
+
 /// A fake GPU backend that stores "device memory" in a `HashMap`.
 ///
 /// This is intentionally **not** async -- every method returns instantly.
@@ -70,19 +86,19 @@ const STUB_GPU_NAME: &str = "OuterLink Virtual GPU";
 /// * Unit/integration tests that run without hardware.
 /// * Validating the protocol and handler logic end-to-end.
 pub struct StubGpuBackend {
-    /// Simulated VRAM: maps device-pointer -> byte buffer.
-    allocations: Mutex<HashMap<u64, Vec<u8>>>,
-    /// Monotonically increasing counter for fake device pointers.
-    next_ptr: Mutex<u64>,
+    /// All mutable state under a single lock to prevent deadlocks.
+    state: Mutex<StubState>,
 }
 
 impl StubGpuBackend {
     /// Create a new stub backend with no allocations.
     pub fn new() -> Self {
         Self {
-            allocations: Mutex::new(HashMap::new()),
-            // Start at a recognisable fake base address.
-            next_ptr: Mutex::new(0x0000_DEAD_0000_0000),
+            state: Mutex::new(StubState {
+                allocations: HashMap::new(),
+                // Start at a recognisable fake base address.
+                next_ptr: 0x0000_DEAD_0000_0000,
+            }),
         }
     }
 
@@ -93,16 +109,6 @@ impl StubGpuBackend {
         } else {
             Err(CuResult::InvalidDevice)
         }
-    }
-
-    /// Return how many bytes are currently "allocated".
-    fn used_bytes(&self) -> usize {
-        self.allocations
-            .lock()
-            .unwrap()
-            .values()
-            .map(|v| v.len())
-            .sum()
     }
 }
 
@@ -171,31 +177,29 @@ impl GpuBackend for StubGpuBackend {
         if size == 0 {
             return Err(CuResult::InvalidValue);
         }
-        // Hold allocations lock for the entire check-and-insert to prevent a
-        // TOCTOU race where two concurrent callers both pass the capacity check
-        // and together exceed STUB_TOTAL_MEM.
-        let mut allocs = self.allocations.lock().unwrap();
-        let used: usize = allocs.values().map(|v| v.len()).sum();
+        // Single lock covers both capacity check and pointer bump, preventing
+        // TOCTOU races and eliminating AB/BA deadlock risk.
+        let mut state = self.state.lock().unwrap();
+        let used = state.used_bytes();
         if used + size > STUB_TOTAL_MEM {
             return Err(CuResult::OutOfMemory);
         }
-        let mut next = self.next_ptr.lock().unwrap();
-        let ptr = *next;
-        *next += size as u64;
-        allocs.insert(ptr, vec![0u8; size]);
+        let ptr = state.next_ptr;
+        state.next_ptr += size as u64;
+        state.allocations.insert(ptr, vec![0u8; size]);
         Ok(ptr)
     }
 
     fn mem_free(&self, ptr: u64) -> CuResult {
-        match self.allocations.lock().unwrap().remove(&ptr) {
+        match self.state.lock().unwrap().allocations.remove(&ptr) {
             Some(_) => CuResult::Success,
             None => CuResult::InvalidValue,
         }
     }
 
     fn memcpy_htod(&self, dst: u64, data: &[u8]) -> CuResult {
-        let mut allocs = self.allocations.lock().unwrap();
-        match allocs.get_mut(&dst) {
+        let mut state = self.state.lock().unwrap();
+        match state.allocations.get_mut(&dst) {
             Some(buf) => {
                 if data.len() > buf.len() {
                     return CuResult::InvalidValue;
@@ -208,8 +212,8 @@ impl GpuBackend for StubGpuBackend {
     }
 
     fn memcpy_dtoh(&self, src: u64, size: usize) -> Result<Vec<u8>, CuResult> {
-        let allocs = self.allocations.lock().unwrap();
-        match allocs.get(&src) {
+        let state = self.state.lock().unwrap();
+        match state.allocations.get(&src) {
             Some(buf) => {
                 if size > buf.len() {
                     return Err(CuResult::InvalidValue);
@@ -221,7 +225,7 @@ impl GpuBackend for StubGpuBackend {
     }
 
     fn mem_get_info(&self) -> Result<(usize, usize), CuResult> {
-        let used = self.used_bytes();
+        let used = self.state.lock().unwrap().used_bytes();
         Ok((STUB_TOTAL_MEM - used, STUB_TOTAL_MEM))
     }
 }

@@ -35,7 +35,7 @@ extern CUresult ol_cuDeviceGetCount(int *count);
 extern CUresult ol_cuDeviceGetName(char *name, int len, int dev);
 extern CUresult ol_cuDeviceGetAttribute(int *pi, int attrib, int dev);
 extern CUresult ol_cuDeviceTotalMem_v2(size_t *bytes, int dev);
-extern CUresult ol_cuDeviceGetUuid(unsigned char uuid[16], int dev);
+extern CUresult ol_cuDeviceGetUuid(unsigned char *uuid, int dev);
 
 /* Context management -- handles passed as u64 (unsigned long long) */
 extern CUresult ol_cuCtxCreate_v2(unsigned long long *pctx, unsigned int flags, int dev);

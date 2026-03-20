@@ -35,6 +35,10 @@ pub enum OuterLinkError {
     #[error("Server not ready: {0}")]
     NotReady(String),
 
+    /// The remote peer closed the connection (clean disconnect).
+    #[error("connection closed by peer")]
+    ConnectionClosed,
+
     /// IO error
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -49,7 +53,9 @@ impl OuterLinkError {
     pub fn to_cuda_result(&self) -> CuResult {
         match self {
             Self::Cuda(r) => *r,
-            Self::Transport(_) | Self::Connection(_) | Self::Io(_) => CuResult::TransportError,
+            Self::Transport(_) | Self::Connection(_) | Self::ConnectionClosed | Self::Io(_) => {
+                CuResult::TransportError
+            }
             Self::Protocol(_) => CuResult::RemoteError,
             Self::HandleNotFound(_) => CuResult::HandleNotFound,
             Self::Timeout(_) => CuResult::NotReady,

@@ -385,6 +385,11 @@ CUresult hook_cuGetProcAddress_v2(const char *symbol, void **pfn,
     void *hook = find_hook(symbol);
     if (hook) {
         *pfn = hook;
+        if (symbolStatus) {
+            /* TODO: Use CUdriverProcAddressQueryResult enum from real CUDA SDK
+             * instead of hardcoded 0. CU_GET_PROC_ADDRESS_SUCCESS = 0. */
+            *(int *)symbolStatus = 0; /* CU_GET_PROC_ADDRESS_SUCCESS */
+        }
         return CUDA_SUCCESS;
     }
 

@@ -35,12 +35,16 @@ pub enum CuResult {
     Deinitialized = 4,
     NoDevice = 100,
     InvalidDevice = 101,
+    InvalidImage = 200,
     InvalidContext = 201,
     ContextAlreadyCurrent = 202,
     MapFailed = 205,
     UnmapFailed = 206,
+    AlreadyMapped = 208,
+    NoBinaryForGpu = 209,
     NotFound = 500,
     NotReady = 600,
+    IllegalAddress = 700,
     LaunchFailed = 719,
     /// OuterLink-specific: network/transport error
     TransportError = 900,
@@ -52,7 +56,11 @@ pub enum CuResult {
 }
 
 impl CuResult {
-    /// Convert from raw u32 value
+    /// Convert from raw u32 value.
+    ///
+    /// Unrecognized CUDA error codes are mapped to `Unknown` and the raw
+    /// value is logged at `trace` level so it remains observable for
+    /// debugging.
     pub fn from_raw(value: u32) -> Self {
         match value {
             0 => Self::Success,
@@ -62,17 +70,24 @@ impl CuResult {
             4 => Self::Deinitialized,
             100 => Self::NoDevice,
             101 => Self::InvalidDevice,
+            200 => Self::InvalidImage,
             201 => Self::InvalidContext,
             202 => Self::ContextAlreadyCurrent,
             205 => Self::MapFailed,
             206 => Self::UnmapFailed,
+            208 => Self::AlreadyMapped,
+            209 => Self::NoBinaryForGpu,
             500 => Self::NotFound,
             600 => Self::NotReady,
+            700 => Self::IllegalAddress,
             719 => Self::LaunchFailed,
             900 => Self::TransportError,
             901 => Self::RemoteError,
             902 => Self::HandleNotFound,
-            _ => Self::Unknown,
+            other => {
+                tracing::trace!("unmapped CUDA error code {other}, returning CuResult::Unknown");
+                Self::Unknown
+            }
         }
     }
 

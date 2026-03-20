@@ -32,9 +32,14 @@ const CUDA_ERROR_NOT_FOUND: u32 = 500;
 /// OnceLock guarantees exactly-once, thread-safe initialization.
 static CLIENT: OnceLock<OuterLinkClient> = OnceLock::new();
 
-/// Monotonic counter for generating unique stub remote handle values.
+/// STUB ONLY -- Monotonic counter for generating unique stub remote handle values.
 /// Prevents handle collision when the same device is used for multiple contexts
 /// or when allocation sizes happen to collide.
+///
+/// TODO: Remove this counter once real server integration is wired. At that point,
+/// remote handle values will come from the server's responses, not from a local
+/// counter. Every usage site (ol_cuCtxCreate_v2, ol_cuMemAlloc_v2, etc.) must be
+/// updated to use server-provided handles instead.
 static STUB_HANDLE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0x1000);
 
@@ -71,8 +76,8 @@ pub extern "C" fn ol_cuDriverGetVersion(driver_version: *mut i32) -> u32 {
     if driver_version.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // Report CUDA 12.0 (12000)
-    unsafe { *driver_version = 12000 };
+    // Report CUDA 12.4 (12040) -- must match server stub version
+    unsafe { *driver_version = 12040 };
     CUDA_SUCCESS
 }
 
@@ -166,7 +171,7 @@ pub extern "C" fn ol_cuDeviceTotalMem_v2(bytes: *mut usize, dev: i32) -> u32 {
 }
 
 #[no_mangle]
-pub extern "C" fn ol_cuDeviceGetUuid(uuid: *mut [u8; 16], dev: i32) -> u32 {
+pub extern "C" fn ol_cuDeviceGetUuid(uuid: *mut u8, dev: i32) -> u32 {
     let _ = get_client();
     if uuid.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
@@ -176,12 +181,10 @@ pub extern "C" fn ol_cuDeviceGetUuid(uuid: *mut [u8; 16], dev: i32) -> u32 {
     }
     // Stub: deterministic UUID based on device ordinal
     unsafe {
-        let bytes = &mut *uuid;
-        bytes.fill(0);
-        // "OL" prefix + device ordinal
-        bytes[0] = b'O';
-        bytes[1] = b'L';
-        bytes[2] = dev as u8;
+        std::ptr::write_bytes(uuid, 0, 16);
+        *uuid.add(0) = b'O';
+        *uuid.add(1) = b'L';
+        *uuid.add(2) = dev as u8;
     }
     CUDA_SUCCESS
 }
@@ -200,8 +203,8 @@ pub extern "C" fn ol_cuCtxCreate_v2(pctx: *mut u64, flags: u32, dev: i32) -> u32
         return CUDA_ERROR_INVALID_DEVICE;
     }
     let _ = flags;
-    // Create a synthetic context handle using a monotonic counter so that
-    // multiple contexts on the same device get distinct remote values.
+    // TODO(stub): Replace STUB_HANDLE_COUNTER with real server-provided handle
+    // once server integration is wired.
     let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let synthetic = client.handles.contexts.insert(stub_remote);
     unsafe { *pctx = synthetic };
@@ -219,9 +222,14 @@ pub extern "C" fn ol_cuCtxDestroy_v2(ctx: u64) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn ol_cuCtxSetCurrent(ctx: u64) -> u32 {
-    let _ = get_client();
-    // Stub: accept any context (including null/0 to unset)
-    let _ = ctx;
+    let client = get_client();
+    // ctx == 0 means "unset current context", which is always valid.
+    if ctx != 0 {
+        if client.handles.contexts.to_remote(ctx).is_none() {
+            return CUDA_ERROR_INVALID_CONTEXT;
+        }
+    }
+    // Stub: accept valid context (real impl would set thread-local current context)
     CUDA_SUCCESS
 }
 
@@ -246,8 +254,8 @@ pub extern "C" fn ol_cuMemAlloc_v2(dptr: *mut u64, size: usize) -> u32 {
     if dptr.is_null() || size == 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // Create a synthetic device pointer using a monotonic counter so that
-    // allocations of the same size get distinct remote values.
+    // TODO(stub): Replace STUB_HANDLE_COUNTER with real server-provided handle
+    // once server integration is wired.
     let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let synthetic = client.handles.device_ptrs.insert(stub_remote);
     unsafe { *dptr = synthetic };
@@ -273,11 +281,14 @@ pub extern "C" fn ol_cuMemcpyHtoD_v2(
     src_host: *const u8,
     byte_count: usize,
 ) -> u32 {
-    let _ = get_client();
+    let client = get_client();
     if src_host.is_null() || byte_count == 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    let _ = dst_device;
+    // Validate that dst_device is a known allocation handle
+    if client.handles.device_ptrs.to_remote(dst_device).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
     // Stub: accept the copy (data would be sent to remote server)
     CUDA_SUCCESS
 }
@@ -288,11 +299,14 @@ pub extern "C" fn ol_cuMemcpyDtoH_v2(
     src_device: u64,
     byte_count: usize,
 ) -> u32 {
-    let _ = get_client();
+    let client = get_client();
     if dst_host.is_null() || byte_count == 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    let _ = src_device;
+    // Validate that src_device is a known allocation handle
+    if client.handles.device_ptrs.to_remote(src_device).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
     // Stub: zero-fill the destination (real impl fetches from remote)
     unsafe {
         ptr::write_bytes(dst_host, 0, byte_count);
@@ -388,7 +402,7 @@ mod tests {
         let mut version: i32 = 0;
         let result = ol_cuDriverGetVersion(&mut version as *mut i32);
         assert_eq!(result, CUDA_SUCCESS);
-        assert_eq!(version, 12000);
+        assert_eq!(version, 12040);
     }
 
     #[test]
@@ -509,7 +523,7 @@ mod tests {
     #[test]
     fn test_ol_cu_device_get_uuid() {
         let mut uuid = [0u8; 16];
-        let result = ol_cuDeviceGetUuid(&mut uuid, 0);
+        let result = ol_cuDeviceGetUuid(uuid.as_mut_ptr(), 0);
         assert_eq!(result, CUDA_SUCCESS);
         assert_eq!(uuid[0], b'O');
         assert_eq!(uuid[1], b'L');
@@ -537,8 +551,18 @@ mod tests {
 
     #[test]
     fn test_ol_cu_ctx_set_current() {
+        // ctx=0 (unset context) is always valid
         assert_eq!(ol_cuCtxSetCurrent(0), CUDA_SUCCESS);
-        assert_eq!(ol_cuCtxSetCurrent(12345), CUDA_SUCCESS);
+
+        // An invalid handle that was never created must be rejected
+        assert_eq!(ol_cuCtxSetCurrent(0xBAAD), CUDA_ERROR_INVALID_CONTEXT);
+
+        // A handle created by ol_cuCtxCreate_v2 must be accepted
+        let mut ctx: u64 = 0;
+        assert_eq!(ol_cuCtxCreate_v2(&mut ctx, 0, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuCtxSetCurrent(ctx), CUDA_SUCCESS);
+        // Clean up
+        let _ = ol_cuCtxDestroy_v2(ctx);
     }
 
     #[test]
@@ -583,9 +607,13 @@ mod tests {
 
     #[test]
     fn test_ol_cu_memcpy_htod() {
+        // Allocate a valid device pointer first
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 1024), CUDA_SUCCESS);
         let data = [1u8, 2, 3, 4];
-        let result = ol_cuMemcpyHtoD_v2(0x1000, data.as_ptr(), 4);
+        let result = ol_cuMemcpyHtoD_v2(dptr, data.as_ptr(), 4);
         assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuMemFree_v2(dptr);
     }
 
     #[test]
@@ -595,12 +623,32 @@ mod tests {
     }
 
     #[test]
+    fn test_ol_cu_memcpy_htod_invalid_dst() {
+        let data = [1u8, 2, 3, 4];
+        // 0xBAAD was never allocated, must be rejected
+        let result = ol_cuMemcpyHtoD_v2(0xBAAD, data.as_ptr(), 4);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
     fn test_ol_cu_memcpy_dtoh() {
+        // Allocate a valid device pointer first
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 1024), CUDA_SUCCESS);
         let mut buf = [0xFFu8; 8];
-        let result = ol_cuMemcpyDtoH_v2(buf.as_mut_ptr(), 0x1000, 8);
+        let result = ol_cuMemcpyDtoH_v2(buf.as_mut_ptr(), dptr, 8);
         assert_eq!(result, CUDA_SUCCESS);
         // Stub zero-fills the buffer
         assert_eq!(buf, [0u8; 8]);
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_memcpy_dtoh_invalid_src() {
+        let mut buf = [0xFFu8; 8];
+        // 0xBAAD was never allocated, must be rejected
+        let result = ol_cuMemcpyDtoH_v2(buf.as_mut_ptr(), 0xBAAD, 8);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
     }
 
     #[test]

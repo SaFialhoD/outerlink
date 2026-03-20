@@ -9,6 +9,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::net::TcpListener;
 
+use outerlink_common::error::OuterLinkError;
 use outerlink_common::tcp_transport::TcpTransportConnection;
 use outerlink_common::transport::TransportConnection;
 use outerlink_server::gpu_backend::{GpuBackend, StubGpuBackend};
@@ -22,9 +23,7 @@ struct Args {
     #[arg(short, long, default_value = "0.0.0.0:14833")]
     listen: String,
 
-    /// Path to the configuration file.
-    #[arg(short, long, default_value = "outerlink.toml")]
-    config: String,
+    // TODO: Add config file support (--config outerlink.toml) when needed.
 
     /// Enable verbose (debug-level) logging.
     #[arg(short, long)]
@@ -58,7 +57,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Accept loop.
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // Transient accept errors (fd exhaustion, connection aborted before
+                // accept completes, etc.) should not kill the daemon.
+                tracing::warn!(error = %e, "accept failed, retrying");
+                continue;
+            }
+        };
         tracing::info!(%peer, "new connection");
 
         let backend = Arc::clone(&backend);
@@ -92,16 +99,11 @@ async fn handle_connection(
         // 1. Receive the next framed message (header + payload).
         let (header, payload) = match conn.recv_message().await {
             Ok(msg) => msg,
+            Err(OuterLinkError::ConnectionClosed) => {
+                // Client closed the connection gracefully.
+                return Ok(());
+            }
             Err(e) => {
-                // Distinguish a clean client disconnect from a real error.
-                let msg = e.to_string();
-                if msg.contains("failed to read header")
-                    && (msg.contains("unexpected end of file")
-                        || msg.contains("connection reset"))
-                {
-                    // Client closed the connection gracefully.
-                    return Ok(());
-                }
                 return Err(anyhow::anyhow!(e));
             }
         };
