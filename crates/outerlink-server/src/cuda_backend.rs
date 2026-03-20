@@ -906,52 +906,40 @@ impl GpuBackend for CudaGpuBackend {
         // The client always sends at least the 4-byte num_params field.
         let param_values = deserialize_kernel_params(params)?;
 
-        if param_values.is_empty() {
-            // No kernel arguments — pass null to CUDA
-            unsafe {
-                map_cuda_result(launch_fn(
-                    func as usize,
-                    grid_dim[0],
-                    grid_dim[1],
-                    grid_dim[2],
-                    block_dim[0],
-                    block_dim[1],
-                    block_dim[2],
-                    shared_mem,
-                    stream as usize,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                ))?;
-            }
-        } else {
-            // Build the void** pointer array that CUDA expects.
-            // Each entry points to the start of the corresponding param's raw bytes.
-            //
-            // SAFETY: param_values is not moved, dropped, or mutated after this point.
-            // param_ptrs[i] aliases param_values[i]'s heap buffer, which is stable
-            // because we do not push/remove from param_values. Drop order (LIFO) ensures
-            // param_ptrs drops before param_values. CUDA driver functions are thread-safe
-            // when called with separate contexts.
-            let mut param_ptrs: Vec<*mut std::ffi::c_void> = param_values
-                .iter()
-                .map(|v| v.as_ptr() as *mut std::ffi::c_void)
-                .collect();
+        // Build the void** pointer array that CUDA expects.
+        // Each entry points to the start of the corresponding param's raw bytes.
+        //
+        // SAFETY: param_values is not moved, dropped, or mutated after this point.
+        // param_ptrs[i] aliases param_values[i]'s heap buffer, which is stable
+        // because we do not push/remove from param_values. Drop order (LIFO) ensures
+        // param_ptrs drops before param_values. CUDA driver functions are thread-safe
+        // when called with separate contexts.
+        let mut param_ptrs: Vec<*mut std::ffi::c_void> = param_values
+            .iter()
+            .map(|v| v.as_ptr() as *mut std::ffi::c_void)
+            .collect();
 
-            unsafe {
-                map_cuda_result(launch_fn(
-                    func as usize,
-                    grid_dim[0],
-                    grid_dim[1],
-                    grid_dim[2],
-                    block_dim[0],
-                    block_dim[1],
-                    block_dim[2],
-                    shared_mem,
-                    stream as usize,
-                    param_ptrs.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                ))?;
-            }
+        // Pass null when there are no kernel arguments; CUDA requires this.
+        let params_ptr = if param_ptrs.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            param_ptrs.as_mut_ptr()
+        };
+
+        unsafe {
+            map_cuda_result(launch_fn(
+                func as usize,
+                grid_dim[0],
+                grid_dim[1],
+                grid_dim[2],
+                block_dim[0],
+                block_dim[1],
+                block_dim[2],
+                shared_mem,
+                stream as usize,
+                params_ptr,
+                std::ptr::null_mut(),
+            ))?;
         }
 
         tracing::trace!(

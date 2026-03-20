@@ -77,7 +77,7 @@ async fn connect(addr: &str) -> Result<TcpTransportConnection> {
     Ok(conn)
 }
 
-/// Send a request and receive its response. Returns `(response_header, payload)`.
+/// Send a request and receive its response. Returns the response payload.
 /// Verifies the response type and request_id match.
 async fn roundtrip(
     conn: &TcpTransportConnection,
@@ -203,9 +203,8 @@ pub async fn cmd_status(addr: &str) -> Result<StatusInfo> {
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
     rid += 1;
 
-    // 2. Init
-    let init_payload = 0_u32.to_le_bytes();
-    let payload = roundtrip(&conn, MessageType::Init, &init_payload, rid).await?;
+    // 2. Init (empty payload per protocol spec)
+    let payload = roundtrip(&conn, MessageType::Init, &[], rid).await?;
     check_success(&payload)?;
     rid += 1;
 
@@ -275,8 +274,8 @@ pub async fn cmd_status(addr: &str) -> Result<StatusInfo> {
 // Command: bench
 // ---------------------------------------------------------------------------
 
-/// Run transfer benchmarks. If `size_mb` is Some, benchmark that single size.
-/// Otherwise, benchmark a standard set of sizes.
+/// Run transfer benchmarks. If `custom_size` is Some, benchmark that single
+/// size in bytes. Otherwise, benchmark a standard set of sizes.
 pub async fn cmd_bench(addr: &str, custom_size: Option<usize>) -> Result<BenchResult> {
     let conn = connect(addr).await?;
     let mut rid: u64 = 1;
@@ -423,9 +422,6 @@ pub fn print_list_table(server: &str, gpus: &[GpuInfo]) {
         .max(4);
     let vram_width = 12;
     let cc_width = 11;
-
-    let total_width = id_width + name_width + vram_width + cc_width + 5 * 3 + 2; // separators
-    let _ = total_width; // suppress unused warning; widths used below
 
     // Header
     println!(
@@ -574,7 +570,7 @@ fn cross() -> &'static str { "\u{253c}" }     // +
 fn vert() -> &'static str { "\u{2502}" }      // |
 fn horiz(n: usize) -> String { "\u{2500}".repeat(n) } // ---
 
-/// Compute throughput in MB/s.
+/// Compute throughput in MiB/s.
 fn throughput_mb_s(bytes: usize, duration: Duration) -> f64 {
     let secs = duration.as_secs_f64();
     if secs == 0.0 {

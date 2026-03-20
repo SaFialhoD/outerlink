@@ -466,7 +466,7 @@ done:\n\
     eprintln!("[REAL GPU] Uploaded {n} floats to input buffer");
 
     // ---------------------------------------------------------------
-    // 6. Launch kernel: grid=(N,1,1), block=(1,1,1), shared=0, stream=0
+    // 6. Launch kernel: grid=(1,1,1), block=(N,1,1), shared=0, stream=0
     // ---------------------------------------------------------------
     // Kernel params layout for cuLaunchKernel:
     //   param 0: u64 input_ptr  (CUdeviceptr, 8 bytes)

@@ -3,18 +3,16 @@
 //! Used by `integration.rs`, `bench_transport.rs`, and `real_gpu_test.rs`
 //! via `mod common;` + `use common::*;`.
 
+use std::sync::Arc;
+
 use tokio::net::TcpListener;
 
-// Re-export types that test files use via `use common::*`
-pub use std::sync::Arc;
-pub use outerlink_common::cuda_types::CuResult;
-pub use outerlink_common::protocol::MessageHeader;
-pub use outerlink_common::tcp_transport::TcpTransportConnection;
-pub use outerlink_server::gpu_backend::GpuBackend;
-
+use outerlink_common::cuda_types::CuResult;
 use outerlink_common::error::OuterLinkError;
-use outerlink_common::protocol::MessageType;
+use outerlink_common::protocol::{MessageHeader, MessageType};
+use outerlink_common::tcp_transport::TcpTransportConnection;
 use outerlink_common::transport::TransportConnection;
+use outerlink_server::gpu_backend::GpuBackend;
 use outerlink_server::handler::handle_request;
 use outerlink_server::session::ConnectionSession;
 
@@ -45,6 +43,9 @@ pub fn assert_success(payload: &[u8]) -> &[u8] {
 
 /// Spawn a server task that accepts ONE connection on `listener`, runs the
 /// recv-handle-send loop until the client disconnects, then exits.
+///
+/// Returns a `JoinHandle` so the test can await server completion and catch
+/// any panics.
 #[allow(dead_code)]
 pub fn spawn_server(
     listener: TcpListener,

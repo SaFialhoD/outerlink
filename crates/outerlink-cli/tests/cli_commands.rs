@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use outerlink_common::error::OuterLinkError;
+use outerlink_common::protocol::MessageType;
 use outerlink_common::tcp_transport::TcpTransportConnection;
 use outerlink_common::transport::TransportConnection;
 use outerlink_server::gpu_backend::{GpuBackend, StubGpuBackend};
@@ -15,7 +16,7 @@ use outerlink_server::handler::handle_request;
 use outerlink_server::session::ConnectionSession;
 
 use outerlink_cli::commands::{cmd_bench, cmd_list, cmd_status};
-use outerlink_cli::commands::GpuInfo;
+use outerlink_cli::commands::{BenchResult, GpuInfo, StatusInfo};
 
 // ---------------------------------------------------------------------------
 // Helpers (same pattern as outerlink-server integration tests)

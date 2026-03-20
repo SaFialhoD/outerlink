@@ -47,7 +47,7 @@ fn error_response(request_id: u64, err: CuResult) -> (MessageHeader, Vec<u8>) {
 ///
 /// | MessageType          | Request payload         | Response data (after 4-byte CuResult) |
 /// |----------------------|-------------------------|---------------------------------------|
-/// | Init                 | (empty)                 | (empty)                               |
+/// | Init                 | u32 flags               | (empty)                               |
 /// | DriverGetVersion     | (empty)                 | i32 version                           |
 /// | DeviceGet            | i32 ordinal             | i32 device                            |
 /// | DeviceGetCount       | (empty)                 | i32 count                             |
@@ -467,8 +467,8 @@ pub fn handle_request(
         // --- Kernel launch ---
 
         MessageType::LaunchKernel => {
-            // 8B func + 4*3B grid + 4*3B block + 4B shared_mem + 8B stream = 44 bytes minimum
-            if payload.len() < 44 {
+            // 8B func + 4*3B grid + 4*3B block + 4B shared_mem + 8B stream + 4B num_params = 48 bytes minimum
+            if payload.len() < 48 {
                 return error_response(rid, CuResult::InvalidValue);
             }
             let func = u64::from_le_bytes(payload[..8].try_into().unwrap());

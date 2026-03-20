@@ -18,3 +18,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 outerlink-server = { path = "../outerlink-server" }
+serde_json = { workspace = true }
