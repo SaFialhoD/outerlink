@@ -13,3 +13,7 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+outerlink-common = { path = "../outerlink-common" }
+tokio = { workspace = true }

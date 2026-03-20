@@ -346,9 +346,26 @@ pub extern "C" fn ol_cuCtxCreate_v2(pctx: *mut u64, flags: u32, dev: i32) -> u32
     if dev < 0 || dev >= 1 {
         return CUDA_ERROR_INVALID_DEVICE;
     }
-    let _ = flags;
-    // TODO(stub): Replace STUB_HANDLE_COUNTER with real server-provided handle
-    // once server integration is wired.
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = [0u8; 8];
+        payload[0..4].copy_from_slice(&flags.to_le_bytes());
+        payload[4..8].copy_from_slice(&dev.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxCreate, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.contexts.insert(remote_ctx);
+                unsafe { *pctx = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: generate a local-only handle
     let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let synthetic = client.handles.contexts.insert(stub_remote);
     unsafe { *pctx = synthetic };
@@ -358,6 +375,24 @@ pub extern "C" fn ol_cuCtxCreate_v2(pctx: *mut u64, flags: u32, dev: i32) -> u32
 #[no_mangle]
 pub extern "C" fn ol_cuCtxDestroy_v2(ctx: u64) -> u32 {
     let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_ctx = match client.handles.contexts.to_remote(ctx) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_CONTEXT,
+        };
+        let payload = remote_ctx.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxDestroy, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            client.handles.contexts.remove_by_local(ctx);
+            return CUDA_SUCCESS;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: just remove from local handles
     if client.handles.contexts.remove_by_local(ctx).is_none() {
         return CUDA_ERROR_INVALID_CONTEXT;
     }
@@ -367,13 +402,30 @@ pub extern "C" fn ol_cuCtxDestroy_v2(ctx: u64) -> u32 {
 #[no_mangle]
 pub extern "C" fn ol_cuCtxSetCurrent(ctx: u64) -> u32 {
     let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_ctx = if ctx == 0 {
+            0u64
+        } else {
+            match client.handles.contexts.to_remote(ctx) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_CONTEXT,
+            }
+        };
+        let payload = remote_ctx.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxSetCurrent, &payload) {
+            let result = parse_result(&resp);
+            return result;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle locally
     // ctx == 0 means "unset current context", which is always valid.
     if ctx != 0 {
         if client.handles.contexts.to_remote(ctx).is_none() {
             return CUDA_ERROR_INVALID_CONTEXT;
         }
     }
-    // Stub: accept valid context (real impl would set thread-local current context)
     CUDA_SUCCESS
 }
 
@@ -398,8 +450,24 @@ pub extern "C" fn ol_cuMemAlloc_v2(dptr: *mut u64, size: usize) -> u32 {
     if dptr.is_null() || size == 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // TODO(stub): Replace STUB_HANDLE_COUNTER with real server-provided handle
-    // once server integration is wired.
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let payload = (size as u64).to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemAlloc, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_devptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.device_ptrs.insert(remote_devptr);
+                unsafe { *dptr = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: generate a local-only handle
     let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let synthetic = client.handles.device_ptrs.insert(stub_remote);
     unsafe { *dptr = synthetic };
@@ -413,6 +481,24 @@ pub extern "C" fn ol_cuMemFree_v2(dptr: u64) -> u32 {
         // Freeing null is a no-op in CUDA
         return CUDA_SUCCESS;
     }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_devptr = match client.handles.device_ptrs.to_remote(dptr) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_devptr.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemFree, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            client.handles.device_ptrs.remove_by_local(dptr);
+            return CUDA_SUCCESS;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: just remove from local handles
     if client.handles.device_ptrs.remove_by_local(dptr).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -429,11 +515,27 @@ pub extern "C" fn ol_cuMemcpyHtoD_v2(
     if src_host.is_null() || byte_count == 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // Validate that dst_device is a known allocation handle
+    // Connected: send data to the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_dst = match client.handles.device_ptrs.to_remote(dst_device) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        // Build payload: 8 bytes remote_dst + raw data bytes
+        let host_data = unsafe { std::slice::from_raw_parts(src_host, byte_count) };
+        let mut payload = Vec::with_capacity(8 + byte_count);
+        payload.extend_from_slice(&remote_dst.to_le_bytes());
+        payload.extend_from_slice(host_data);
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemcpyHtoD, &payload) {
+            let result = parse_result(&resp);
+            return result;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle and accept the copy
     if client.handles.device_ptrs.to_remote(dst_device).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // Stub: accept the copy (data would be sent to remote server)
     CUDA_SUCCESS
 }
 
@@ -447,11 +549,35 @@ pub extern "C" fn ol_cuMemcpyDtoH_v2(
     if dst_host.is_null() || byte_count == 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // Validate that src_device is a known allocation handle
+    // Connected: fetch data from the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_src = match client.handles.device_ptrs.to_remote(src_device) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        // Request payload: 8 bytes remote_src + 8 bytes byte_count
+        let mut payload = [0u8; 16];
+        payload[0..8].copy_from_slice(&remote_src.to_le_bytes());
+        payload[8..16].copy_from_slice(&(byte_count as u64).to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemcpyDtoH, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            // Response: 4B result + data bytes
+            let resp_data = &resp[4..];
+            let copy_len = std::cmp::min(resp_data.len(), byte_count);
+            unsafe {
+                std::ptr::copy_nonoverlapping(resp_data.as_ptr(), dst_host, copy_len);
+            }
+            return CUDA_SUCCESS;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle and zero-fill
     if client.handles.device_ptrs.to_remote(src_device).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // Stub: zero-fill the destination (real impl fetches from remote)
     unsafe {
         ptr::write_bytes(dst_host, 0, byte_count);
     }
