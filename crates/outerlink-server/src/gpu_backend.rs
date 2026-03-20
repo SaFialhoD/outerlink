@@ -99,6 +99,7 @@ struct StubState {
     /// Counter for generating context handles (starts at a distinctive address).
     next_ctx_id: u64,
     /// The current context handle (0 = none).
+    // FIXME(multi-client): current_ctx is shared across all connections — must be moved to per-connection state
     current_ctx: u64,
 }
 

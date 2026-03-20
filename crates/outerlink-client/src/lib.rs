@@ -41,7 +41,8 @@ pub struct OuterLinkClient {
 impl OuterLinkClient {
     /// Create a new client (not yet connected).
     pub fn new(server_addr: String) -> Self {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .expect("failed to create tokio runtime for OuterLink client");
@@ -109,6 +110,11 @@ impl OuterLinkClient {
     /// Send a request followed by raw bulk data (e.g. MemcpyHtoD).
     ///
     /// The server reads the framed message first, then the bulk bytes.
+    ///
+    /// **Phase 2 scaffolding:** This method exists for chunked/streaming
+    /// transfers when payloads exceed `MAX_PAYLOAD_SIZE`. Phase 1 sends
+    /// data inline in the protocol payload; Phase 2 will use this path
+    /// for large transfers that must be split across multiple frames.
     pub fn send_request_with_bulk(
         &self,
         msg_type: MessageType,

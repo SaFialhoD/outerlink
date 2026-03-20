@@ -93,19 +93,33 @@ async fn connect_client(addr: &str) -> TcpTransportConnection {
     TcpTransportConnection::new(stream).expect("client conn init failed")
 }
 
-/// Send a request and receive the response, using a monotonic request ID.
+/// Send a request and receive the response. The caller provides the
+/// `request_id` so that multi-request tests can use incrementing IDs.
+///
+/// Asserts that the response header has `msg_type == Response` and that the
+/// `request_id` in the response matches what was sent.
 async fn roundtrip(
     conn: &TcpTransportConnection,
     msg_type: MessageType,
     payload: &[u8],
+    request_id: u64,
 ) -> (MessageHeader, Vec<u8>) {
-    // Use a fixed request_id of 1 -- each test runs in isolation so there
-    // is no conflict.
-    let header = MessageHeader::new_request(1, msg_type, payload.len() as u32);
+    let header = MessageHeader::new_request(request_id, msg_type, payload.len() as u32);
     conn.send_message(&header, payload)
         .await
         .expect("client send failed");
-    conn.recv_message().await.expect("client recv failed")
+    let (resp_hdr, resp_payload) = conn.recv_message().await.expect("client recv failed");
+    assert_eq!(
+        resp_hdr.msg_type,
+        MessageType::Response,
+        "expected Response msg_type, got {:?}",
+        resp_hdr.msg_type
+    );
+    assert_eq!(
+        resp_hdr.request_id, request_id,
+        "response request_id should match the sent request_id"
+    );
+    (resp_hdr, resp_payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +133,7 @@ async fn test_device_get_count_e2e() {
     let server = spawn_server(listener, backend);
 
     let client = connect_client(&addr).await;
-    let (_hdr, payload) = roundtrip(&client, MessageType::DeviceGetCount, &[]).await;
+    let (_hdr, payload) = roundtrip(&client, MessageType::DeviceGetCount, &[], 1).await;
 
     let data = assert_success(&payload);
     let count = i32::from_le_bytes(data[..4].try_into().unwrap());
@@ -136,7 +150,7 @@ async fn test_driver_get_version_e2e() {
     let server = spawn_server(listener, backend);
 
     let client = connect_client(&addr).await;
-    let (_hdr, payload) = roundtrip(&client, MessageType::DriverGetVersion, &[]).await;
+    let (_hdr, payload) = roundtrip(&client, MessageType::DriverGetVersion, &[], 1).await;
 
     let data = assert_success(&payload);
     let version = i32::from_le_bytes(data[..4].try_into().unwrap());
@@ -155,7 +169,7 @@ async fn test_device_get_name_e2e() {
     let client = connect_client(&addr).await;
     // Request payload: i32 device = 0
     let device_payload = 0_i32.to_le_bytes();
-    let (_hdr, payload) = roundtrip(&client, MessageType::DeviceGetName, &device_payload).await;
+    let (_hdr, payload) = roundtrip(&client, MessageType::DeviceGetName, &device_payload, 1).await;
 
     let data = assert_success(&payload);
     // Response: u32 name_len + UTF-8 bytes
@@ -181,7 +195,7 @@ async fn test_device_total_mem_e2e() {
 
     let client = connect_client(&addr).await;
     let device_payload = 0_i32.to_le_bytes();
-    let (_hdr, payload) = roundtrip(&client, MessageType::DeviceTotalMem, &device_payload).await;
+    let (_hdr, payload) = roundtrip(&client, MessageType::DeviceTotalMem, &device_payload, 1).await;
 
     let data = assert_success(&payload);
     let total_bytes = u64::from_le_bytes(data[..8].try_into().unwrap());
@@ -205,7 +219,7 @@ async fn test_mem_alloc_free_e2e() {
 
     // MemAlloc: request payload is u64 size = 1024
     let alloc_payload = 1024_u64.to_le_bytes();
-    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload).await;
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 1).await;
 
     let data = assert_success(&payload);
     let device_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
@@ -213,7 +227,7 @@ async fn test_mem_alloc_free_e2e() {
 
     // MemFree: request payload is u64 device_ptr
     let free_payload = device_ptr.to_le_bytes();
-    let (_hdr, payload) = roundtrip(&client, MessageType::MemFree, &free_payload).await;
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemFree, &free_payload, 2).await;
 
     let result = response_result(&payload);
     assert_eq!(result, CuResult::Success, "MemFree should succeed");
@@ -232,7 +246,7 @@ async fn test_memcpy_roundtrip_e2e() {
 
     // 1. Allocate 256 bytes
     let alloc_payload = 256_u64.to_le_bytes();
-    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload).await;
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 1).await;
     let data = assert_success(&payload);
     let device_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
 
@@ -240,14 +254,14 @@ async fn test_memcpy_roundtrip_e2e() {
     let test_data: Vec<u8> = (0..256).map(|i| (i & 0xFF) as u8).collect();
     let mut htod_payload = device_ptr.to_le_bytes().to_vec();
     htod_payload.extend_from_slice(&test_data);
-    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyHtoD, &htod_payload).await;
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyHtoD, &htod_payload, 2).await;
     let result = response_result(&payload);
     assert_eq!(result, CuResult::Success, "MemcpyHtoD should succeed");
 
     // 3. MemcpyDtoH: read back the data
     let mut dtoh_payload = device_ptr.to_le_bytes().to_vec();
     dtoh_payload.extend_from_slice(&256_u64.to_le_bytes());
-    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyDtoH, &dtoh_payload).await;
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyDtoH, &dtoh_payload, 3).await;
     let data = assert_success(&payload);
     assert_eq!(
         data, &test_data[..],
@@ -256,7 +270,7 @@ async fn test_memcpy_roundtrip_e2e() {
 
     // 4. Free
     let free_payload = device_ptr.to_le_bytes();
-    let (_hdr, payload) = roundtrip(&client, MessageType::MemFree, &free_payload).await;
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemFree, &free_payload, 4).await;
     assert_eq!(response_result(&payload), CuResult::Success);
 
     drop(client);
@@ -275,7 +289,7 @@ async fn test_ctx_create_destroy_e2e() {
     let mut ctx_create_payload = 0_u32.to_le_bytes().to_vec(); // flags
     ctx_create_payload.extend_from_slice(&0_i32.to_le_bytes()); // device
     let (_hdr, payload) =
-        roundtrip(&client, MessageType::CtxCreate, &ctx_create_payload).await;
+        roundtrip(&client, MessageType::CtxCreate, &ctx_create_payload, 1).await;
 
     let data = assert_success(&payload);
     let ctx_handle = u64::from_le_bytes(data[..8].try_into().unwrap());
@@ -284,9 +298,118 @@ async fn test_ctx_create_destroy_e2e() {
     // CtxDestroy
     let ctx_destroy_payload = ctx_handle.to_le_bytes();
     let (_hdr, payload) =
-        roundtrip(&client, MessageType::CtxDestroy, &ctx_destroy_payload).await;
+        roundtrip(&client, MessageType::CtxDestroy, &ctx_destroy_payload, 2).await;
     let result = response_result(&payload);
     assert_eq!(result, CuResult::Success, "CtxDestroy should succeed");
+
+    drop(client);
+    server.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Error path tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_double_free_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // Allocate
+    let alloc_payload = 512_u64.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 1).await;
+    let data = assert_success(&payload);
+    let device_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // First free -- should succeed
+    let free_payload = device_ptr.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemFree, &free_payload, 2).await;
+    assert_eq!(response_result(&payload), CuResult::Success, "first MemFree should succeed");
+
+    // Second free of the same pointer -- should return an error
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemFree, &free_payload, 3).await;
+    let result = response_result(&payload);
+    assert_ne!(
+        result,
+        CuResult::Success,
+        "double MemFree should fail, got {:?}",
+        result
+    );
+    assert_eq!(
+        result,
+        CuResult::InvalidValue,
+        "double free should return InvalidValue"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_ctx_create_invalid_device_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // CtxCreate with device=99 (invalid -- stub only has device 0)
+    let mut ctx_create_payload = 0_u32.to_le_bytes().to_vec(); // flags
+    ctx_create_payload.extend_from_slice(&99_i32.to_le_bytes()); // invalid device
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxCreate, &ctx_create_payload, 1).await;
+
+    let result = response_result(&payload);
+    assert_ne!(
+        result,
+        CuResult::Success,
+        "CtxCreate with invalid device should fail, got {:?}",
+        result
+    );
+    assert_eq!(
+        result,
+        CuResult::InvalidDevice,
+        "CtxCreate with invalid device should return InvalidDevice"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Handshake and Init tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_handshake_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+    let (_hdr, payload) = roundtrip(&client, MessageType::Handshake, &[], 1).await;
+
+    assert_success(&payload);
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_init_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+    // Init payload: 4-byte flags = 0
+    let init_payload = 0_u32.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::Init, &init_payload, 1).await;
+
+    assert_success(&payload);
 
     drop(client);
     server.await.unwrap();

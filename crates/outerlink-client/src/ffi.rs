@@ -152,10 +152,28 @@ pub extern "C" fn ol_cuDeviceGetCount(count: *mut i32) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn ol_cuDeviceGet(device: *mut i32, ordinal: i32) -> u32 {
-    let _ = get_client();
+    let client = get_client();
     if device.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let payload = ordinal.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DeviceGet, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe {
+                    *device = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub fallback
     if ordinal < 0 || ordinal >= 1 {
         return CUDA_ERROR_INVALID_DEVICE;
     }
@@ -384,11 +402,9 @@ pub extern "C" fn ol_cuCtxDestroy_v2(ctx: u64) -> u32 {
         let payload = remote_ctx.to_le_bytes();
         if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxDestroy, &payload) {
             let result = parse_result(&resp);
-            if result != CUDA_SUCCESS {
-                return result;
-            }
+            // CUDA contract: handle is invalidated on destroy regardless of server errors
             client.handles.contexts.remove_by_local(ctx);
-            return CUDA_SUCCESS;
+            return result;
         }
         // Transport error -- fall through to stub
     }
@@ -431,12 +447,78 @@ pub extern "C" fn ol_cuCtxSetCurrent(ctx: u64) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn ol_cuCtxGetCurrent(pctx: *mut u64) -> u32 {
-    let _ = get_client();
+    let client = get_client();
     if pctx.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxGetCurrent, &[]) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let local = if remote_ctx == 0 {
+                    0
+                } else {
+                    client.handles.contexts.to_local(remote_ctx).unwrap_or(0)
+                };
+                unsafe { *pctx = local };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
     // Stub: return null context (no context set)
     unsafe { *pctx = 0 };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxGetDevice(dev: *mut i32) -> u32 {
+    let client = get_client();
+    if dev.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: the server handler expects a u64 ctx in the payload.
+    // cuCtxGetDevice operates on the current context, so we send 0 to indicate
+    // "use whatever the server considers current". If that fails, fall through.
+    // TODO: Once per-connection context tracking lands, send the actual remote ctx.
+    if client.connected.load(Ordering::Acquire) {
+        // Send 0 as ctx -- the server may reject this if it strictly requires a
+        // valid context handle. That's fine; we fall through to the stub.
+        let payload = 0u64.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxGetDevice, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe {
+                    *dev = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: return device 0
+    unsafe { *dev = 0 };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxSynchronize() -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxSynchronize, &[]) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: nothing to synchronize
     CUDA_SUCCESS
 }
 
@@ -490,11 +572,9 @@ pub extern "C" fn ol_cuMemFree_v2(dptr: u64) -> u32 {
         let payload = remote_devptr.to_le_bytes();
         if let Ok((_hdr, resp)) = client.send_request(MessageType::MemFree, &payload) {
             let result = parse_result(&resp);
-            if result != CUDA_SUCCESS {
-                return result;
-            }
+            // CUDA contract: handle is invalidated on free regardless of server errors
             client.handles.device_ptrs.remove_by_local(dptr);
-            return CUDA_SUCCESS;
+            return result;
         }
         // Transport error -- fall through to stub
     }
@@ -513,6 +593,10 @@ pub extern "C" fn ol_cuMemcpyHtoD_v2(
 ) -> u32 {
     let client = get_client();
     if src_host.is_null() || byte_count == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Phase 1 limit: inline transfer must fit in protocol payload
+    if byte_count > (outerlink_common::protocol::MAX_PAYLOAD_SIZE as usize) - 8 {
         return CUDA_ERROR_INVALID_VALUE;
     }
     // Connected: send data to the server
@@ -566,6 +650,9 @@ pub extern "C" fn ol_cuMemcpyDtoH_v2(
             }
             // Response: 4B result + data bytes
             let resp_data = &resp[4..];
+            if resp_data.len() < byte_count {
+                return CUDA_ERROR_UNKNOWN;
+            }
             let copy_len = std::cmp::min(resp_data.len(), byte_count);
             unsafe {
                 std::ptr::copy_nonoverlapping(resp_data.as_ptr(), dst_host, copy_len);

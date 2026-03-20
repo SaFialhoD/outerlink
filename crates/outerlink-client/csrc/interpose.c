@@ -100,6 +100,8 @@ static const hook_entry_t hook_table[] = {
     { "cuCtxDestroy_v2",         (void *)hook_cuCtxDestroy_v2 },
     { "cuCtxSetCurrent",         (void *)hook_cuCtxSetCurrent },
     { "cuCtxGetCurrent",         (void *)hook_cuCtxGetCurrent },
+    { "cuCtxGetDevice",          (void *)hook_cuCtxGetDevice },
+    { "cuCtxSynchronize",        (void *)hook_cuCtxSynchronize },
 
     /* Memory */
     { "cuMemAlloc_v2",           (void *)hook_cuMemAlloc_v2 },
@@ -254,6 +256,16 @@ CUresult hook_cuCtxGetCurrent(CUcontext *pctx) {
         *pctx = (CUcontext)(uintptr_t)ctx_u64;
     }
     return r;
+}
+
+CUresult hook_cuCtxGetDevice(CUdevice *dev) {
+    ensure_init();
+    return ol_cuCtxGetDevice(dev);
+}
+
+CUresult hook_cuCtxSynchronize(void) {
+    ensure_init();
+    return ol_cuCtxSynchronize();
 }
 
 /* -- Memory -- */
