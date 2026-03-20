@@ -118,17 +118,23 @@ static const hook_entry_t hook_table[] = {
     { "cuModuleLoadData",        (void *)hook_cuModuleLoadData },
     { "cuModuleUnload",          (void *)hook_cuModuleUnload },
     { "cuModuleGetFunction",     (void *)hook_cuModuleGetFunction },
+    { "cuModuleGetGlobal_v2",    (void *)hook_cuModuleGetGlobal },
 
     /* Stream */
     { "cuStreamCreate",          (void *)hook_cuStreamCreate },
     { "cuStreamDestroy",         (void *)hook_cuStreamDestroy },
+    { "cuStreamDestroy_v2",      (void *)hook_cuStreamDestroy },
     { "cuStreamSynchronize",     (void *)hook_cuStreamSynchronize },
+    { "cuStreamQuery",           (void *)hook_cuStreamQuery },
 
     /* Event */
     { "cuEventCreate",           (void *)hook_cuEventCreate },
     { "cuEventDestroy",          (void *)hook_cuEventDestroy },
+    { "cuEventDestroy_v2",       (void *)hook_cuEventDestroy },
     { "cuEventRecord",           (void *)hook_cuEventRecord },
     { "cuEventSynchronize",      (void *)hook_cuEventSynchronize },
+    { "cuEventElapsedTime",      (void *)hook_cuEventElapsedTime },
+    { "cuEventQuery",            (void *)hook_cuEventQuery },
 
     /* Kernel launch */
     { "cuLaunchKernel",          (void *)hook_cuLaunchKernel },
@@ -358,6 +364,21 @@ CUresult hook_cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *
     return r;
 }
 
+CUresult hook_cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name) {
+    ensure_init();
+    unsigned long long dptr_u64 = 0;
+    size_t size_out = 0;
+    size_t name_len = name ? strlen(name) : 0;
+    CUresult r = ol_cuModuleGetGlobal(&dptr_u64, &size_out,
+                                       (unsigned long long)(uintptr_t)hmod,
+                                       (const unsigned char *)name, name_len);
+    if (r == CUDA_SUCCESS) {
+        if (dptr) *dptr = (CUdeviceptr)dptr_u64;
+        if (bytes) *bytes = size_out;
+    }
+    return r;
+}
+
 /* -- Stream -- */
 
 CUresult hook_cuStreamCreate(CUstream *phStream, unsigned int Flags) {
@@ -378,6 +399,11 @@ CUresult hook_cuStreamDestroy(CUstream hStream) {
 CUresult hook_cuStreamSynchronize(CUstream hStream) {
     ensure_init();
     return ol_cuStreamSynchronize((unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuStreamQuery(CUstream hStream) {
+    ensure_init();
+    return ol_cuStreamQuery((unsigned long long)(uintptr_t)hStream);
 }
 
 /* -- Event -- */
@@ -406,6 +432,18 @@ CUresult hook_cuEventRecord(CUevent hEvent, CUstream hStream) {
 CUresult hook_cuEventSynchronize(CUevent hEvent) {
     ensure_init();
     return ol_cuEventSynchronize((unsigned long long)(uintptr_t)hEvent);
+}
+
+CUresult hook_cuEventElapsedTime(float *pMilliseconds, CUevent hStart, CUevent hEnd) {
+    ensure_init();
+    return ol_cuEventElapsedTime(pMilliseconds,
+                                  (unsigned long long)(uintptr_t)hStart,
+                                  (unsigned long long)(uintptr_t)hEnd);
+}
+
+CUresult hook_cuEventQuery(CUevent hEvent) {
+    ensure_init();
+    return ol_cuEventQuery((unsigned long long)(uintptr_t)hEvent);
 }
 
 /* -- Kernel launch -- */

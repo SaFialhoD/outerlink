@@ -305,12 +305,16 @@ pub fn handle_request(
         }
 
         MessageType::ModuleGetFunction => {
-            if payload.len() < 9 {
-                // Need at least 8B module + 1B name
+            if payload.len() < 13 {
+                // Need at least 8B module + 4B name_len + 1B name
                 return error_response(rid, CuResult::InvalidValue);
             }
             let module = u64::from_le_bytes(payload[..8].try_into().unwrap());
-            let name = match std::str::from_utf8(&payload[8..]) {
+            let name_len = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
+            if payload.len() < 12 + name_len {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let name = match std::str::from_utf8(&payload[12..12 + name_len]) {
                 Ok(s) => s,
                 Err(_) => return error_response(rid, CuResult::InvalidValue),
             };
@@ -321,11 +325,16 @@ pub fn handle_request(
         }
 
         MessageType::ModuleGetGlobal => {
-            if payload.len() < 9 {
+            if payload.len() < 13 {
+                // Need at least 8B module + 4B name_len + 1B name
                 return error_response(rid, CuResult::InvalidValue);
             }
             let module = u64::from_le_bytes(payload[..8].try_into().unwrap());
-            let name = match std::str::from_utf8(&payload[8..]) {
+            let name_len = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
+            if payload.len() < 12 + name_len {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let name = match std::str::from_utf8(&payload[12..12 + name_len]) {
                 Ok(s) => s,
                 Err(_) => return error_response(rid, CuResult::InvalidValue),
             };
@@ -906,8 +915,10 @@ mod tests {
         let module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
 
         // Get function.
+        let name = b"my_kernel";
         let mut payload = module.to_le_bytes().to_vec();
-        payload.extend_from_slice(b"my_kernel");
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name);
         let hdr = req(MessageType::ModuleGetFunction, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr,&payload);
         assert_eq!(response_result(&resp), CuResult::Success);
@@ -918,8 +929,10 @@ mod tests {
     #[test]
     fn test_module_get_function_invalid_module() {
         let gpu = StubGpuBackend::new();
+        let name = b"kern";
         let mut payload = 0xBADu64.to_le_bytes().to_vec();
-        payload.extend_from_slice(b"kern");
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name);
         let hdr = req(MessageType::ModuleGetFunction, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr,&payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
@@ -936,8 +949,10 @@ mod tests {
         let module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
 
         // Get global.
+        let name = b"my_global";
         let mut payload = module.to_le_bytes().to_vec();
-        payload.extend_from_slice(b"my_global");
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name);
         let hdr = req(MessageType::ModuleGetGlobal, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr,&payload);
         assert_eq!(response_result(&resp), CuResult::Success);
@@ -950,8 +965,10 @@ mod tests {
     #[test]
     fn test_module_get_global_invalid_module() {
         let gpu = StubGpuBackend::new();
+        let name = b"g";
         let mut payload = 0xBADu64.to_le_bytes().to_vec();
-        payload.extend_from_slice(b"g");
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name);
         let hdr = req(MessageType::ModuleGetGlobal, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr,&payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
@@ -1218,8 +1235,10 @@ mod tests {
         let module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
 
         // Get function.
+        let kern_name = b"kern";
         let mut func_payload = module.to_le_bytes().to_vec();
-        func_payload.extend_from_slice(b"kern");
+        func_payload.extend_from_slice(&(kern_name.len() as u32).to_le_bytes());
+        func_payload.extend_from_slice(kern_name);
         let hdr = req(MessageType::ModuleGetFunction, func_payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr,&func_payload);
         let func = u64::from_le_bytes(resp[4..12].try_into().unwrap());

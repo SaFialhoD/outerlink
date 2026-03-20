@@ -454,6 +454,7 @@ impl GpuBackend for StubGpuBackend {
         let _ = name; // name is accepted but not tracked for globals in the stub
         let ptr = state.next_ptr;
         state.next_ptr += 256;
+        state.allocations.insert(ptr, vec![0u8; 256]);
         Ok((ptr, 256))
     }
 
@@ -546,6 +547,9 @@ impl GpuBackend for StubGpuBackend {
         let start_ev = state.events.get(&start).ok_or(CuResult::InvalidValue)?;
         let end_ev = state.events.get(&end).ok_or(CuResult::InvalidValue)?;
         if !start_ev.recorded || !end_ev.recorded {
+            return Err(CuResult::InvalidValue);
+        }
+        if end_ev.timestamp_ns < start_ev.timestamp_ns {
             return Err(CuResult::InvalidValue);
         }
         // Convert nanosecond difference to milliseconds.
@@ -793,6 +797,19 @@ mod tests {
     }
 
     #[test]
+    fn test_module_get_global_tracks_allocation() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"fake ptx").unwrap();
+        let (dptr, size) = gpu.module_get_global(module, "my_global").unwrap();
+        assert_eq!(size, 256);
+        // The returned pointer must be usable with memcpy operations.
+        let data = vec![42u8; 256];
+        assert_eq!(gpu.memcpy_htod(dptr, &data), CuResult::Success);
+        let out = gpu.memcpy_dtoh(dptr, 256).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
     fn test_module_get_global_invalid_module() {
         let gpu = StubGpuBackend::new();
         assert_eq!(gpu.module_get_global(0xBAD, "g"), Err(CuResult::InvalidValue));
@@ -914,6 +931,19 @@ mod tests {
         gpu.event_record(e2, 0).unwrap();
         let ms = gpu.event_elapsed_time(e1, e2).unwrap();
         assert!(ms > 0.0, "elapsed time should be positive");
+    }
+
+    #[test]
+    fn test_event_elapsed_time_negative() {
+        let gpu = StubGpuBackend::new();
+        let e1 = gpu.event_create(0).unwrap();
+        let e2 = gpu.event_create(0).unwrap();
+        // Record e1 first, then e2 (e2 has a later timestamp).
+        gpu.event_record(e1, 0).unwrap();
+        gpu.event_record(e2, 0).unwrap();
+        // Passing them in reverse order (start=e2, end=e1) produces negative time.
+        // Real CUDA returns an error for this.
+        assert_eq!(gpu.event_elapsed_time(e2, e1), Err(CuResult::InvalidValue));
     }
 
     #[test]

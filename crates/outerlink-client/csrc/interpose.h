@@ -60,17 +60,21 @@ extern CUresult ol_cuGetErrorString(unsigned int error, const char **pStr);
 extern CUresult ol_cuModuleLoadData(unsigned long long *module, const void *data, size_t data_len);
 extern CUresult ol_cuModuleUnload(unsigned long long module);
 extern CUresult ol_cuModuleGetFunction(unsigned long long *func, unsigned long long module, const char *name);
+extern CUresult ol_cuModuleGetGlobal(unsigned long long *dptr, size_t *size, unsigned long long module, const unsigned char *name, size_t name_len);
 
 /* Stream management */
 extern CUresult ol_cuStreamCreate(unsigned long long *stream, unsigned int flags);
 extern CUresult ol_cuStreamDestroy(unsigned long long stream);
 extern CUresult ol_cuStreamSynchronize(unsigned long long stream);
+extern CUresult ol_cuStreamQuery(unsigned long long stream);
 
 /* Event management */
 extern CUresult ol_cuEventCreate(unsigned long long *event, unsigned int flags);
 extern CUresult ol_cuEventDestroy(unsigned long long event);
 extern CUresult ol_cuEventRecord(unsigned long long event, unsigned long long stream);
 extern CUresult ol_cuEventSynchronize(unsigned long long event);
+extern CUresult ol_cuEventElapsedTime(float *ms, unsigned long long start, unsigned long long end);
+extern CUresult ol_cuEventQuery(unsigned long long event);
 
 /* Kernel launch */
 extern CUresult ol_cuLaunchKernel(unsigned long long func,
@@ -122,17 +126,21 @@ CUresult hook_cuGetErrorString(CUresult error, const char **pStr);
 CUresult hook_cuModuleLoadData(CUmodule *module, const void *image);
 CUresult hook_cuModuleUnload(CUmodule hmod);
 CUresult hook_cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name);
+CUresult hook_cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name);
 
 /* Stream */
 CUresult hook_cuStreamCreate(CUstream *phStream, unsigned int Flags);
 CUresult hook_cuStreamDestroy(CUstream hStream);
 CUresult hook_cuStreamSynchronize(CUstream hStream);
+CUresult hook_cuStreamQuery(CUstream hStream);
 
 /* Event */
 CUresult hook_cuEventCreate(CUevent *phEvent, unsigned int Flags);
 CUresult hook_cuEventDestroy(CUevent hEvent);
 CUresult hook_cuEventRecord(CUevent hEvent, CUstream hStream);
 CUresult hook_cuEventSynchronize(CUevent hEvent);
+CUresult hook_cuEventElapsedTime(float *pMilliseconds, CUevent hStart, CUevent hEnd);
+CUresult hook_cuEventQuery(CUevent hEvent);
 
 /* Kernel launch */
 CUresult hook_cuLaunchKernel(CUfunction f,

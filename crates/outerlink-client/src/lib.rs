@@ -36,6 +36,10 @@ pub struct OuterLinkClient {
     connection: std::sync::Mutex<Option<Arc<TcpTransportConnection>>>,
     /// Monotonically increasing request ID for the wire protocol.
     next_request_id: AtomicU64,
+    /// The remote context handle that is currently active on this connection.
+    /// Updated by cuCtxCreate_v2, cuCtxSetCurrent, and cuCtxDestroy_v2.
+    /// Used by cuCtxGetDevice to send the correct context to the server.
+    pub current_remote_ctx: AtomicU64,
 }
 
 impl OuterLinkClient {
@@ -54,6 +58,7 @@ impl OuterLinkClient {
             runtime,
             connection: std::sync::Mutex::new(None),
             next_request_id: AtomicU64::new(1),
+            current_remote_ctx: AtomicU64::new(0),
         }
     }
 
@@ -73,8 +78,29 @@ impl OuterLinkClient {
                 OuterLinkError::Connection(format!("failed to initialize connection: {}", e))
             })?);
             let mut guard = self.connection.lock().unwrap();
-            *guard = Some(conn);
+            *guard = Some(Arc::clone(&conn));
+            drop(guard);
             self.connected.store(true, Ordering::Release);
+
+            // Send the one-time per-connection Handshake.
+            let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+            let header = MessageHeader::new_request(req_id, MessageType::Handshake, 0);
+            conn.send_message(&header, &[]).await.map_err(|e| {
+                OuterLinkError::Connection(format!("handshake send failed: {}", e))
+            })?;
+            let (_resp_header, resp_payload) = conn.recv_message().await.map_err(|e| {
+                OuterLinkError::Connection(format!("handshake recv failed: {}", e))
+            })?;
+            // Verify the server accepted the handshake (first 4 LE bytes = CuResult).
+            if resp_payload.len() >= 4 {
+                let result = u32::from_le_bytes(resp_payload[0..4].try_into().unwrap());
+                if result != 0 {
+                    return Err(OuterLinkError::Connection(
+                        format!("handshake rejected by server (code {})", result),
+                    ));
+                }
+            }
+
             Ok(())
         })
     }
