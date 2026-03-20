@@ -8,7 +8,6 @@
 //! over TCP. When disconnected (no server available), stub values are returned
 //! so tests and local development continue to work.
 
-use std::ffi::CStr;
 use std::ptr;
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
@@ -23,9 +22,13 @@ use crate::OuterLinkClient;
 
 const CUDA_SUCCESS: u32 = 0;
 const CUDA_ERROR_INVALID_VALUE: u32 = 1;
+// Used by context/module/stream/event validation in upcoming wired operations
+#[allow(dead_code)]
 const CUDA_ERROR_NOT_INITIALIZED: u32 = 3;
 const CUDA_ERROR_INVALID_DEVICE: u32 = 101;
 const CUDA_ERROR_INVALID_CONTEXT: u32 = 201;
+// Used by cuModuleGetFunction and cuGetProcAddress when symbols are not found
+#[allow(dead_code)]
 const CUDA_ERROR_NOT_FOUND: u32 = 500;
 const CUDA_ERROR_UNKNOWN: u32 = 999;
 
@@ -88,8 +91,24 @@ pub extern "C" fn ol_client_init() {
 
 #[no_mangle]
 pub extern "C" fn ol_cuInit(flags: u32) -> u32 {
-    let _ = get_client();
-    let _ = flags;
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        // Send Handshake
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::Handshake, &[]) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+        } else {
+            return CUDA_ERROR_UNKNOWN;
+        }
+        // Send Init with flags payload
+        let payload = flags.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::Init, &payload) {
+            return parse_result(&resp);
+        }
+        return CUDA_ERROR_UNKNOWN;
+    }
     CUDA_SUCCESS
 }
 
@@ -758,6 +777,154 @@ pub extern "C" fn ol_cuGetErrorString(
     CUDA_SUCCESS
 }
 
+// ---------------------------------------------------------------------------
+// Module management
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuModuleLoadData(module: *mut u64, _data: *const u8, _data_len: usize) -> u32 {
+    let client = get_client();
+    if module.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Stub: generate a local-only handle
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.modules.insert(stub_remote);
+    unsafe { *module = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuModuleUnload(module: u64) -> u32 {
+    let client = get_client();
+    if client.handles.modules.remove_by_local(module).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuModuleGetFunction(func: *mut u64, module: u64, _name: *const i8) -> u32 {
+    let client = get_client();
+    if func.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Validate that the module handle exists
+    if client.handles.modules.to_remote(module).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Stub: generate a local-only handle
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.functions.insert(stub_remote);
+    unsafe { *func = synthetic };
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Stream management
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuStreamCreate(stream: *mut u64, _flags: u32) -> u32 {
+    let client = get_client();
+    if stream.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.streams.insert(stub_remote);
+    unsafe { *stream = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuStreamDestroy(stream: u64) -> u32 {
+    let client = get_client();
+    if client.handles.streams.remove_by_local(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuStreamSynchronize(stream: u64) -> u32 {
+    let client = get_client();
+    // Validate handle (stream 0 = default stream, always valid)
+    if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Event management
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuEventCreate(event: *mut u64, _flags: u32) -> u32 {
+    let client = get_client();
+    if event.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.events.insert(stub_remote);
+    unsafe { *event = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuEventDestroy(event: u64) -> u32 {
+    let client = get_client();
+    if client.handles.events.remove_by_local(event).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuEventRecord(event: u64, stream: u64) -> u32 {
+    let client = get_client();
+    // Validate event handle
+    if client.handles.events.to_remote(event).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Validate stream handle (0 = default stream, always valid)
+    if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuEventSynchronize(event: u64) -> u32 {
+    let client = get_client();
+    if client.handles.events.to_remote(event).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Kernel launch
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuLaunchKernel(
+    _func: u64,
+    _grid_x: u32,
+    _grid_y: u32,
+    _grid_z: u32,
+    _block_x: u32,
+    _block_y: u32,
+    _block_z: u32,
+    _shared_mem: u32,
+    _stream: u64,
+    _params: *mut *mut std::ffi::c_void,
+    _extra: *mut *mut std::ffi::c_void,
+) -> u32 {
+    // Stub: accept the launch without executing
+    CUDA_SUCCESS
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -765,6 +932,7 @@ pub extern "C" fn ol_cuGetErrorString(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CStr;
 
     // -- Init tests --
 
@@ -946,8 +1114,16 @@ mod tests {
         let mut ctx: u64 = 0xFFFF;
         let result = ol_cuCtxGetCurrent(&mut ctx);
         assert_eq!(result, CUDA_SUCCESS);
-        // Stub returns null context
+        // In disconnected (stub) mode, no context is set so it returns 0.
+        // The connected path (which reverse-translates remote handles via
+        // handles.contexts.to_local) is tested in integration tests.
         assert_eq!(ctx, 0);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_get_current_null_ptr() {
+        let result = ol_cuCtxGetCurrent(ptr::null_mut());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
     }
 
     // -- Memory tests --
@@ -1083,5 +1259,172 @@ mod tests {
         let c1 = get_client() as *const OuterLinkClient;
         let c2 = get_client() as *const OuterLinkClient;
         assert_eq!(c1, c2);
+    }
+
+    // -- Module tests --
+
+    #[test]
+    fn test_ol_cu_module_load_data() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        let result = ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len());
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(module, 0);
+        // Clean up
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_ol_cu_module_load_data_null_ptr() {
+        let data = [0u8; 16];
+        let result = ol_cuModuleLoadData(ptr::null_mut(), data.as_ptr(), data.len());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_module_unload() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        assert_eq!(ol_cuModuleUnload(module), CUDA_SUCCESS);
+        // Double unload should fail
+        assert_eq!(ol_cuModuleUnload(module), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_module_get_function() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+
+        let mut func: u64 = 0;
+        let name = b"my_kernel\0";
+        let result = ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(func, 0);
+
+        // Clean up
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_ol_cu_module_get_function_invalid_module() {
+        let mut func: u64 = 0;
+        let name = b"my_kernel\0";
+        let result = ol_cuModuleGetFunction(&mut func, 0xDEAD, name.as_ptr() as *const i8);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- Stream tests --
+
+    #[test]
+    fn test_ol_cu_stream_create_and_destroy() {
+        let mut stream: u64 = 0;
+        let result = ol_cuStreamCreate(&mut stream, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(stream, 0);
+
+        let result = ol_cuStreamDestroy(stream);
+        assert_eq!(result, CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_create_null_ptr() {
+        let result = ol_cuStreamCreate(ptr::null_mut(), 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_destroy_invalid() {
+        assert_eq!(ol_cuStreamDestroy(0xDEAD), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_synchronize() {
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuStreamSynchronize(stream), CUDA_SUCCESS);
+        // Default stream (0) is always valid
+        assert_eq!(ol_cuStreamSynchronize(0), CUDA_SUCCESS);
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_synchronize_invalid() {
+        assert_eq!(ol_cuStreamSynchronize(0xDEAD), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- Event tests --
+
+    #[test]
+    fn test_ol_cu_event_create_and_destroy() {
+        let mut event: u64 = 0;
+        let result = ol_cuEventCreate(&mut event, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(event, 0);
+
+        let result = ol_cuEventDestroy(event);
+        assert_eq!(result, CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_event_create_null_ptr() {
+        let result = ol_cuEventCreate(ptr::null_mut(), 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_event_destroy_invalid() {
+        assert_eq!(ol_cuEventDestroy(0xDEAD), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_event_record() {
+        let mut event: u64 = 0;
+        assert_eq!(ol_cuEventCreate(&mut event, 0), CUDA_SUCCESS);
+        // Record on default stream (0)
+        assert_eq!(ol_cuEventRecord(event, 0), CUDA_SUCCESS);
+
+        // Record on a created stream
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuEventRecord(event, stream), CUDA_SUCCESS);
+
+        let _ = ol_cuStreamDestroy(stream);
+        let _ = ol_cuEventDestroy(event);
+    }
+
+    #[test]
+    fn test_ol_cu_event_record_invalid_event() {
+        assert_eq!(ol_cuEventRecord(0xDEAD, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_event_synchronize() {
+        let mut event: u64 = 0;
+        assert_eq!(ol_cuEventCreate(&mut event, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuEventSynchronize(event), CUDA_SUCCESS);
+        let _ = ol_cuEventDestroy(event);
+    }
+
+    #[test]
+    fn test_ol_cu_event_synchronize_invalid() {
+        assert_eq!(ol_cuEventSynchronize(0xDEAD), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- Kernel launch tests --
+
+    #[test]
+    fn test_ol_cu_launch_kernel() {
+        let result = ol_cuLaunchKernel(
+            0x1000, // func
+            1, 1, 1, // grid
+            32, 1, 1, // block
+            0,       // shared mem
+            0,       // stream
+            ptr::null_mut(), // params
+            ptr::null_mut(), // extra
+        );
+        assert_eq!(result, CUDA_SUCCESS);
     }
 }

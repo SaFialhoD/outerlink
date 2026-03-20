@@ -19,6 +19,7 @@ use outerlink_common::tcp_transport::TcpTransportConnection;
 use outerlink_common::transport::TransportConnection;
 use outerlink_server::gpu_backend::{GpuBackend, StubGpuBackend};
 use outerlink_server::handler::handle_request;
+use outerlink_server::session::ConnectionSession;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -60,6 +61,7 @@ fn spawn_server(
         let (stream, _peer) = listener.accept().await.expect("accept failed");
         let conn = TcpTransportConnection::new(stream).expect("server conn init failed");
 
+        let mut session = ConnectionSession::new();
         loop {
             let (header, payload) = match conn.recv_message().await {
                 Ok(msg) => msg,
@@ -67,7 +69,7 @@ fn spawn_server(
                 Err(e) => panic!("server recv error: {e:?}"),
             };
 
-            let (resp_header, resp_payload) = handle_request(&*backend, &header, &payload);
+            let (resp_header, resp_payload) = handle_request(&*backend, &header, &payload, &mut session);
             conn.send_message(&resp_header, &resp_payload)
                 .await
                 .expect("server send failed");

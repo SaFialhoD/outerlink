@@ -14,6 +14,7 @@ use outerlink_common::tcp_transport::TcpTransportConnection;
 use outerlink_common::transport::TransportConnection;
 use outerlink_server::gpu_backend::{GpuBackend, StubGpuBackend};
 use outerlink_server::handler::handle_request;
+use outerlink_server::session::ConnectionSession;
 
 /// Command-line arguments for the server.
 #[derive(Parser, Debug)]
@@ -95,6 +96,10 @@ async fn handle_connection(
     conn: TcpTransportConnection,
     backend: Arc<dyn GpuBackend>,
 ) -> anyhow::Result<()> {
+    // Each connection gets its own session so per-thread state (like the
+    // current CUDA context) is isolated between clients.
+    let mut session = ConnectionSession::new();
+
     loop {
         // 1. Receive the next framed message (header + payload).
         let (header, payload) = match conn.recv_message().await {
@@ -116,7 +121,8 @@ async fn handle_connection(
         );
 
         // 2. Dispatch.
-        let (resp_header, resp_payload) = handle_request(&*backend, &header, &payload);
+        let (resp_header, resp_payload) =
+            handle_request(&*backend, &header, &payload, &mut session);
 
         // 3. Write the response.
         conn.send_message(&resp_header, &resp_payload).await?;

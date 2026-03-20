@@ -56,6 +56,29 @@ extern CUresult ol_cuMemGetInfo_v2(size_t *free, size_t *total);
 extern CUresult ol_cuGetErrorName(unsigned int error, const char **pStr);
 extern CUresult ol_cuGetErrorString(unsigned int error, const char **pStr);
 
+/* Module management -- handles passed as u64 (unsigned long long) */
+extern CUresult ol_cuModuleLoadData(unsigned long long *module, const void *data, size_t data_len);
+extern CUresult ol_cuModuleUnload(unsigned long long module);
+extern CUresult ol_cuModuleGetFunction(unsigned long long *func, unsigned long long module, const char *name);
+
+/* Stream management */
+extern CUresult ol_cuStreamCreate(unsigned long long *stream, unsigned int flags);
+extern CUresult ol_cuStreamDestroy(unsigned long long stream);
+extern CUresult ol_cuStreamSynchronize(unsigned long long stream);
+
+/* Event management */
+extern CUresult ol_cuEventCreate(unsigned long long *event, unsigned int flags);
+extern CUresult ol_cuEventDestroy(unsigned long long event);
+extern CUresult ol_cuEventRecord(unsigned long long event, unsigned long long stream);
+extern CUresult ol_cuEventSynchronize(unsigned long long event);
+
+/* Kernel launch */
+extern CUresult ol_cuLaunchKernel(unsigned long long func,
+                                   unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                                   unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+                                   unsigned int sharedMemBytes, unsigned long long hStream,
+                                   void **kernelParams, void **extra);
+
 /* -----------------------------------------------------------------------
  * Hook function declarations
  *
@@ -94,6 +117,29 @@ CUresult hook_cuMemGetInfo_v2(size_t *free, size_t *total);
 /* Error */
 CUresult hook_cuGetErrorName(CUresult error, const char **pStr);
 CUresult hook_cuGetErrorString(CUresult error, const char **pStr);
+
+/* Module */
+CUresult hook_cuModuleLoadData(CUmodule *module, const void *image);
+CUresult hook_cuModuleUnload(CUmodule hmod);
+CUresult hook_cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name);
+
+/* Stream */
+CUresult hook_cuStreamCreate(CUstream *phStream, unsigned int Flags);
+CUresult hook_cuStreamDestroy(CUstream hStream);
+CUresult hook_cuStreamSynchronize(CUstream hStream);
+
+/* Event */
+CUresult hook_cuEventCreate(CUevent *phEvent, unsigned int Flags);
+CUresult hook_cuEventDestroy(CUevent hEvent);
+CUresult hook_cuEventRecord(CUevent hEvent, CUstream hStream);
+CUresult hook_cuEventSynchronize(CUevent hEvent);
+
+/* Kernel launch */
+CUresult hook_cuLaunchKernel(CUfunction f,
+                              unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                              unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+                              unsigned int sharedMemBytes, CUstream hStream,
+                              void **kernelParams, void **extra);
 
 /* cuGetProcAddress hooks */
 CUresult hook_cuGetProcAddress(const char *symbol, void **pfn,

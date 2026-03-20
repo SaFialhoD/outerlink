@@ -58,17 +58,81 @@ pub trait GpuBackend: Send + Sync {
     /// Destroy a CUDA context.
     fn ctx_destroy(&self, ctx: u64) -> Result<(), CuResult>;
 
-    /// Set the current CUDA context for the calling thread.
-    fn ctx_set_current(&self, ctx: u64) -> Result<(), CuResult>;
-
-    /// Get the current CUDA context.
-    fn ctx_get_current(&self) -> Result<u64, CuResult>;
+    /// Check whether a context handle exists (is valid).
+    ///
+    /// Used by the session layer to validate `cuCtxSetCurrent` calls
+    /// without the backend needing to track per-connection state.
+    fn ctx_exists(&self, ctx: u64) -> bool;
 
     /// Get the device ordinal for a context.
     fn ctx_get_device(&self, ctx: u64) -> Result<i32, CuResult>;
 
     /// Synchronize the current context (block until all work completes).
     fn ctx_synchronize(&self) -> Result<(), CuResult>;
+
+    // --- Module operations ---
+
+    /// Load a module from raw data (e.g. PTX or cubin).
+    fn module_load_data(&self, data: &[u8]) -> Result<u64, CuResult>;
+
+    /// Unload a previously loaded module.
+    fn module_unload(&self, module: u64) -> Result<(), CuResult>;
+
+    /// Get a function handle from a loaded module by name.
+    fn module_get_function(&self, module: u64, name: &str) -> Result<u64, CuResult>;
+
+    /// Get a global variable from a loaded module by name.
+    /// Returns `(device_pointer, size_in_bytes)`.
+    fn module_get_global(&self, module: u64, name: &str) -> Result<(u64, usize), CuResult>;
+
+    // --- Stream operations ---
+
+    /// Create a new CUDA stream with the given flags.
+    fn stream_create(&self, flags: u32) -> Result<u64, CuResult>;
+
+    /// Destroy a CUDA stream.
+    fn stream_destroy(&self, stream: u64) -> Result<(), CuResult>;
+
+    /// Block until all work on the stream completes.
+    fn stream_synchronize(&self, stream: u64) -> Result<(), CuResult>;
+
+    /// Query whether all work on the stream has completed.
+    /// `Ok(())` = complete, `Err(NotReady)` = still busy.
+    fn stream_query(&self, stream: u64) -> Result<(), CuResult>;
+
+    // --- Event operations ---
+
+    /// Create a new CUDA event with the given flags.
+    fn event_create(&self, flags: u32) -> Result<u64, CuResult>;
+
+    /// Destroy a CUDA event.
+    fn event_destroy(&self, event: u64) -> Result<(), CuResult>;
+
+    /// Record an event on a stream.
+    fn event_record(&self, event: u64, stream: u64) -> Result<(), CuResult>;
+
+    /// Block until an event has been recorded (completed).
+    fn event_synchronize(&self, event: u64) -> Result<(), CuResult>;
+
+    /// Compute elapsed time in milliseconds between two recorded events.
+    fn event_elapsed_time(&self, start: u64, end: u64) -> Result<f32, CuResult>;
+
+    /// Query whether an event has been recorded.
+    /// `Ok(())` = recorded, `Err(NotReady)` = not yet.
+    fn event_query(&self, event: u64) -> Result<(), CuResult>;
+
+    // --- Kernel launch ---
+
+    /// Launch a kernel on a stream.
+    fn launch_kernel(
+        &self,
+        func: u64,
+        grid_dim: [u32; 3],
+        block_dim: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        params: &[u8],
+    ) -> Result<(), CuResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +151,29 @@ struct StubContext {
     flags: u32,
 }
 
+/// Metadata for a stub loaded module.
+struct StubModule {
+    data_len: usize,
+}
+
+/// Metadata for a stub kernel function.
+struct StubFunction {
+    module_id: u64,
+    name: String,
+}
+
+/// Metadata for a stub CUDA stream.
+struct StubStream {
+    flags: u32,
+}
+
+/// Metadata for a stub CUDA event.
+struct StubEvent {
+    flags: u32,
+    recorded: bool,
+    timestamp_ns: u64,
+}
+
 /// Combined state for the stub GPU backend, protected by a single `Mutex`
 /// to prevent deadlocks from multi-lock acquisition ordering.
 struct StubState {
@@ -98,9 +185,24 @@ struct StubState {
     contexts: HashMap<u64, StubContext>,
     /// Counter for generating context handles (starts at a distinctive address).
     next_ctx_id: u64,
-    /// The current context handle (0 = none).
-    // FIXME(multi-client): current_ctx is shared across all connections — must be moved to per-connection state
-    current_ctx: u64,
+    /// Loaded modules: handle -> module info.
+    modules: HashMap<u64, StubModule>,
+    /// Kernel functions: handle -> function info.
+    functions: HashMap<u64, StubFunction>,
+    /// Counter for generating module handles.
+    next_module_id: u64,
+    /// Counter for generating function handles.
+    next_function_id: u64,
+    /// CUDA streams: handle -> stream info.
+    streams: HashMap<u64, StubStream>,
+    /// Counter for generating stream handles.
+    next_stream_id: u64,
+    /// CUDA events: handle -> event info.
+    events: HashMap<u64, StubEvent>,
+    /// Counter for generating event handles.
+    next_event_id: u64,
+    /// Monotonically increasing fake timestamp for events.
+    event_timestamp_counter: u64,
 }
 
 impl StubState {
@@ -132,7 +234,15 @@ impl StubGpuBackend {
                 contexts: HashMap::new(),
                 // Start at a distinctive base so context handles are debuggable.
                 next_ctx_id: 0xC000_0000_0000_0001,
-                current_ctx: 0,
+                modules: HashMap::new(),
+                functions: HashMap::new(),
+                next_module_id: 0xA000_0000_0000_0001,
+                next_function_id: 0xF000_0000_0000_0001,
+                streams: HashMap::new(),
+                next_stream_id: 0x5000_0000_0000_0001,
+                events: HashMap::new(),
+                next_event_id: 0xE000_0000_0000_0001,
+                event_timestamp_counter: 1000,
             }),
         }
     }
@@ -270,7 +380,6 @@ impl GpuBackend for StubGpuBackend {
         let id = state.next_ctx_id;
         state.next_ctx_id += 1;
         state.contexts.insert(id, StubContext { device, flags });
-        state.current_ctx = id;
         Ok(id)
     }
 
@@ -279,28 +388,12 @@ impl GpuBackend for StubGpuBackend {
         if state.contexts.remove(&ctx).is_none() {
             return Err(CuResult::InvalidContext);
         }
-        if state.current_ctx == ctx {
-            state.current_ctx = 0;
-        }
         Ok(())
     }
 
-    fn ctx_set_current(&self, ctx: u64) -> Result<(), CuResult> {
-        let mut state = self.state.lock().unwrap();
-        if ctx == 0 {
-            state.current_ctx = 0;
-            return Ok(());
-        }
-        if !state.contexts.contains_key(&ctx) {
-            return Err(CuResult::InvalidContext);
-        }
-        state.current_ctx = ctx;
-        Ok(())
-    }
-
-    fn ctx_get_current(&self) -> Result<u64, CuResult> {
+    fn ctx_exists(&self, ctx: u64) -> bool {
         let state = self.state.lock().unwrap();
-        Ok(state.current_ctx)
+        state.contexts.contains_key(&ctx)
     }
 
     fn ctx_get_device(&self, ctx: u64) -> Result<i32, CuResult> {
@@ -313,6 +406,183 @@ impl GpuBackend for StubGpuBackend {
 
     fn ctx_synchronize(&self) -> Result<(), CuResult> {
         // Stub has no asynchronous work to synchronize.
+        Ok(())
+    }
+
+    // --- Module operations ---
+
+    fn module_load_data(&self, data: &[u8]) -> Result<u64, CuResult> {
+        if data.is_empty() {
+            return Err(CuResult::InvalidValue);
+        }
+        let mut state = self.state.lock().unwrap();
+        let id = state.next_module_id;
+        state.next_module_id += 1;
+        state.modules.insert(id, StubModule { data_len: data.len() });
+        Ok(id)
+    }
+
+    fn module_unload(&self, module: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if state.modules.remove(&module).is_none() {
+            return Err(CuResult::InvalidValue);
+        }
+        // Remove all functions that belonged to this module.
+        state.functions.retain(|_, f| f.module_id != module);
+        Ok(())
+    }
+
+    fn module_get_function(&self, module: u64, name: &str) -> Result<u64, CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if !state.modules.contains_key(&module) {
+            return Err(CuResult::InvalidValue);
+        }
+        let id = state.next_function_id;
+        state.next_function_id += 1;
+        state.functions.insert(id, StubFunction {
+            module_id: module,
+            name: name.to_string(),
+        });
+        Ok(id)
+    }
+
+    fn module_get_global(&self, module: u64, name: &str) -> Result<(u64, usize), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if !state.modules.contains_key(&module) {
+            return Err(CuResult::InvalidValue);
+        }
+        let _ = name; // name is accepted but not tracked for globals in the stub
+        let ptr = state.next_ptr;
+        state.next_ptr += 256;
+        Ok((ptr, 256))
+    }
+
+    // --- Stream operations ---
+
+    fn stream_create(&self, flags: u32) -> Result<u64, CuResult> {
+        let mut state = self.state.lock().unwrap();
+        let id = state.next_stream_id;
+        state.next_stream_id += 1;
+        state.streams.insert(id, StubStream { flags });
+        Ok(id)
+    }
+
+    fn stream_destroy(&self, stream: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if state.streams.remove(&stream).is_none() {
+            return Err(CuResult::InvalidValue);
+        }
+        Ok(())
+    }
+
+    fn stream_synchronize(&self, stream: u64) -> Result<(), CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.streams.contains_key(&stream) {
+            return Err(CuResult::InvalidValue);
+        }
+        Ok(())
+    }
+
+    fn stream_query(&self, stream: u64) -> Result<(), CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.streams.contains_key(&stream) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Stub: all work is always complete.
+        Ok(())
+    }
+
+    // --- Event operations ---
+
+    fn event_create(&self, flags: u32) -> Result<u64, CuResult> {
+        let mut state = self.state.lock().unwrap();
+        let id = state.next_event_id;
+        state.next_event_id += 1;
+        state.events.insert(id, StubEvent {
+            flags,
+            recorded: false,
+            timestamp_ns: 0,
+        });
+        Ok(id)
+    }
+
+    fn event_destroy(&self, event: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if state.events.remove(&event).is_none() {
+            return Err(CuResult::InvalidValue);
+        }
+        Ok(())
+    }
+
+    fn event_record(&self, event: u64, stream: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        // Validate stream exists (0 = default/null stream is always valid).
+        if stream != 0 && !state.streams.contains_key(&stream) {
+            return Err(CuResult::InvalidValue);
+        }
+        let ts = state.event_timestamp_counter;
+        state.event_timestamp_counter += 100_000; // 0.1ms in nanoseconds
+        match state.events.get_mut(&event) {
+            Some(ev) => {
+                ev.recorded = true;
+                ev.timestamp_ns = ts;
+                Ok(())
+            }
+            None => Err(CuResult::InvalidValue),
+        }
+    }
+
+    fn event_synchronize(&self, event: u64) -> Result<(), CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.events.contains_key(&event) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Stub: always complete immediately.
+        Ok(())
+    }
+
+    fn event_elapsed_time(&self, start: u64, end: u64) -> Result<f32, CuResult> {
+        let state = self.state.lock().unwrap();
+        let start_ev = state.events.get(&start).ok_or(CuResult::InvalidValue)?;
+        let end_ev = state.events.get(&end).ok_or(CuResult::InvalidValue)?;
+        if !start_ev.recorded || !end_ev.recorded {
+            return Err(CuResult::InvalidValue);
+        }
+        // Convert nanosecond difference to milliseconds.
+        let diff_ns = end_ev.timestamp_ns as f64 - start_ev.timestamp_ns as f64;
+        Ok((diff_ns / 1_000_000.0) as f32)
+    }
+
+    fn event_query(&self, event: u64) -> Result<(), CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.events.contains_key(&event) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Stub: events are always "complete".
+        Ok(())
+    }
+
+    // --- Kernel launch ---
+
+    fn launch_kernel(
+        &self,
+        func: u64,
+        _grid_dim: [u32; 3],
+        _block_dim: [u32; 3],
+        _shared_mem: u32,
+        stream: u64,
+        _params: &[u8],
+    ) -> Result<(), CuResult> {
+        let state = self.state.lock().unwrap();
+        // Validate function exists.
+        if !state.functions.contains_key(&func) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Validate stream (0 = default stream is always valid).
+        if stream != 0 && !state.streams.contains_key(&stream) {
+            return Err(CuResult::InvalidValue);
+        }
+        tracing::trace!(func, stream, "stub: launch_kernel (no-op)");
         Ok(())
     }
 }
@@ -443,29 +713,24 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let ctx = gpu.ctx_create(0, 0).unwrap();
         assert_ne!(ctx, 0);
-        // Should be set as current.
-        assert_eq!(gpu.ctx_get_current().unwrap(), ctx);
+        // Context should exist in the backend.
+        assert!(gpu.ctx_exists(ctx));
         // Destroy it.
         assert!(gpu.ctx_destroy(ctx).is_ok());
-        // Current should now be cleared.
-        assert_eq!(gpu.ctx_get_current().unwrap(), 0);
+        // Context should no longer exist.
+        assert!(!gpu.ctx_exists(ctx));
     }
 
     #[test]
-    fn test_ctx_set_current() {
+    fn test_ctx_exists() {
         let gpu = StubGpuBackend::new();
-        let ctx1 = gpu.ctx_create(0, 0).unwrap();
-        let ctx2 = gpu.ctx_create(0, 0).unwrap();
-        // ctx2 should be current (most recently created).
-        assert_eq!(gpu.ctx_get_current().unwrap(), ctx2);
-        // Switch to ctx1.
-        assert!(gpu.ctx_set_current(ctx1).is_ok());
-        assert_eq!(gpu.ctx_get_current().unwrap(), ctx1);
-        // Unset current (ctx=0).
-        assert!(gpu.ctx_set_current(0).is_ok());
-        assert_eq!(gpu.ctx_get_current().unwrap(), 0);
-        // Invalid context should error.
-        assert_eq!(gpu.ctx_set_current(0xBAAD), Err(CuResult::InvalidContext));
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        assert!(gpu.ctx_exists(ctx));
+        // Non-existent handle should return false.
+        assert!(!gpu.ctx_exists(0xBAAD));
+        // After destroy, should return false.
+        gpu.ctx_destroy(ctx).unwrap();
+        assert!(!gpu.ctx_exists(ctx));
     }
 
     #[test]
@@ -484,5 +749,231 @@ mod tests {
         assert!(gpu.ctx_destroy(ctx).is_ok());
         // Second destroy should fail.
         assert_eq!(gpu.ctx_destroy(ctx), Err(CuResult::InvalidContext));
+    }
+
+    // ----- Module operation tests -----
+
+    #[test]
+    fn test_module_load_and_unload() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"fake ptx data").unwrap();
+        assert_ne!(module, 0);
+        assert!(gpu.module_unload(module).is_ok());
+        // Double unload should fail.
+        assert_eq!(gpu.module_unload(module), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_module_load_empty_data() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.module_load_data(b""), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_module_get_function() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"fake ptx").unwrap();
+        let func = gpu.module_get_function(module, "my_kernel").unwrap();
+        assert_ne!(func, 0);
+    }
+
+    #[test]
+    fn test_module_get_function_invalid_module() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.module_get_function(0xBAD, "kern"), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_module_get_global() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"fake ptx").unwrap();
+        let (dptr, size) = gpu.module_get_global(module, "my_global").unwrap();
+        assert_ne!(dptr, 0);
+        assert_eq!(size, 256);
+    }
+
+    #[test]
+    fn test_module_get_global_invalid_module() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.module_get_global(0xBAD, "g"), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_module_unload_removes_functions() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"fake ptx").unwrap();
+        let func = gpu.module_get_function(module, "kern").unwrap();
+        // Function should be usable for launch_kernel validation.
+        // After unloading the module, the function should be gone.
+        gpu.module_unload(module).unwrap();
+        // launch_kernel with the old function handle should fail.
+        assert_eq!(
+            gpu.launch_kernel(func, [1,1,1], [1,1,1], 0, 0, &[]),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    // ----- Stream operation tests -----
+
+    #[test]
+    fn test_stream_create_and_destroy() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        assert_ne!(stream, 0);
+        assert!(gpu.stream_destroy(stream).is_ok());
+        // Double destroy should fail.
+        assert_eq!(gpu.stream_destroy(stream), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_stream_synchronize() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        assert!(gpu.stream_synchronize(stream).is_ok());
+    }
+
+    #[test]
+    fn test_stream_synchronize_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.stream_synchronize(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_stream_query() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        assert!(gpu.stream_query(stream).is_ok());
+    }
+
+    #[test]
+    fn test_stream_query_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.stream_query(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    // ----- Event operation tests -----
+
+    #[test]
+    fn test_event_create_and_destroy() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        assert_ne!(event, 0);
+        assert!(gpu.event_destroy(event).is_ok());
+        // Double destroy should fail.
+        assert_eq!(gpu.event_destroy(event), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_event_record() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        let stream = gpu.stream_create(0).unwrap();
+        assert!(gpu.event_record(event, stream).is_ok());
+    }
+
+    #[test]
+    fn test_event_record_default_stream() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        // stream=0 is the default stream, always valid.
+        assert!(gpu.event_record(event, 0).is_ok());
+    }
+
+    #[test]
+    fn test_event_record_invalid_event() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.event_record(0xBAD, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_event_record_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        assert_eq!(gpu.event_record(event, 0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_event_synchronize() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        assert!(gpu.event_synchronize(event).is_ok());
+    }
+
+    #[test]
+    fn test_event_synchronize_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.event_synchronize(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_event_elapsed_time() {
+        let gpu = StubGpuBackend::new();
+        let e1 = gpu.event_create(0).unwrap();
+        let e2 = gpu.event_create(0).unwrap();
+        gpu.event_record(e1, 0).unwrap();
+        gpu.event_record(e2, 0).unwrap();
+        let ms = gpu.event_elapsed_time(e1, e2).unwrap();
+        assert!(ms > 0.0, "elapsed time should be positive");
+    }
+
+    #[test]
+    fn test_event_elapsed_time_not_recorded() {
+        let gpu = StubGpuBackend::new();
+        let e1 = gpu.event_create(0).unwrap();
+        let e2 = gpu.event_create(0).unwrap();
+        // Neither recorded yet.
+        assert_eq!(gpu.event_elapsed_time(e1, e2), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_event_query() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        assert!(gpu.event_query(event).is_ok());
+    }
+
+    #[test]
+    fn test_event_query_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.event_query(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    // ----- LaunchKernel tests -----
+
+    #[test]
+    fn test_launch_kernel() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "kern").unwrap();
+        assert!(gpu.launch_kernel(func, [1,1,1], [256,1,1], 0, 0, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_launch_kernel_with_stream() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "kern").unwrap();
+        let stream = gpu.stream_create(0).unwrap();
+        assert!(gpu.launch_kernel(func, [1,1,1], [256,1,1], 0, stream, &[]).is_ok());
+    }
+
+    #[test]
+    fn test_launch_kernel_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.launch_kernel(0xBAD, [1,1,1], [1,1,1], 0, 0, &[]),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_launch_kernel_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "kern").unwrap();
+        assert_eq!(
+            gpu.launch_kernel(func, [1,1,1], [1,1,1], 0, 0xBAD, &[]),
+            Err(CuResult::InvalidValue)
+        );
     }
 }

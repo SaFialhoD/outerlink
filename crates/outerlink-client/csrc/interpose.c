@@ -114,6 +114,25 @@ static const hook_entry_t hook_table[] = {
     { "cuGetErrorName",          (void *)hook_cuGetErrorName },
     { "cuGetErrorString",        (void *)hook_cuGetErrorString },
 
+    /* Module */
+    { "cuModuleLoadData",        (void *)hook_cuModuleLoadData },
+    { "cuModuleUnload",          (void *)hook_cuModuleUnload },
+    { "cuModuleGetFunction",     (void *)hook_cuModuleGetFunction },
+
+    /* Stream */
+    { "cuStreamCreate",          (void *)hook_cuStreamCreate },
+    { "cuStreamDestroy",         (void *)hook_cuStreamDestroy },
+    { "cuStreamSynchronize",     (void *)hook_cuStreamSynchronize },
+
+    /* Event */
+    { "cuEventCreate",           (void *)hook_cuEventCreate },
+    { "cuEventDestroy",          (void *)hook_cuEventDestroy },
+    { "cuEventRecord",           (void *)hook_cuEventRecord },
+    { "cuEventSynchronize",      (void *)hook_cuEventSynchronize },
+
+    /* Kernel launch */
+    { "cuLaunchKernel",          (void *)hook_cuLaunchKernel },
+
     /* cuGetProcAddress itself -- we hook the hooking mechanism */
     { "cuGetProcAddress",        (void *)hook_cuGetProcAddress },
     { "cuGetProcAddress_v2",     (void *)hook_cuGetProcAddress_v2 },
@@ -305,6 +324,104 @@ CUresult hook_cuGetErrorName(CUresult error, const char **pStr) {
 CUresult hook_cuGetErrorString(CUresult error, const char **pStr) {
     ensure_init();
     return ol_cuGetErrorString((unsigned int)error, pStr);
+}
+
+/* -- Module -- */
+
+CUresult hook_cuModuleLoadData(CUmodule *module, const void *image) {
+    ensure_init();
+    unsigned long long mod_u64 = 0;
+    /* Note: we pass image pointer and a size of 0 (size is not available from
+     * the CUDA API signature -- the server will need to parse the binary to
+     * determine its size, or we calculate it from the PTX/cubin header). */
+    CUresult r = ol_cuModuleLoadData(&mod_u64, image, 0);
+    if (r == CUDA_SUCCESS && module) {
+        *module = (CUmodule)(uintptr_t)mod_u64;
+    }
+    return r;
+}
+
+CUresult hook_cuModuleUnload(CUmodule hmod) {
+    ensure_init();
+    return ol_cuModuleUnload((unsigned long long)(uintptr_t)hmod);
+}
+
+CUresult hook_cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name) {
+    ensure_init();
+    unsigned long long func_u64 = 0;
+    CUresult r = ol_cuModuleGetFunction(&func_u64,
+                                         (unsigned long long)(uintptr_t)hmod,
+                                         name);
+    if (r == CUDA_SUCCESS && hfunc) {
+        *hfunc = (CUfunction)(uintptr_t)func_u64;
+    }
+    return r;
+}
+
+/* -- Stream -- */
+
+CUresult hook_cuStreamCreate(CUstream *phStream, unsigned int Flags) {
+    ensure_init();
+    unsigned long long stream_u64 = 0;
+    CUresult r = ol_cuStreamCreate(&stream_u64, Flags);
+    if (r == CUDA_SUCCESS && phStream) {
+        *phStream = (CUstream)(uintptr_t)stream_u64;
+    }
+    return r;
+}
+
+CUresult hook_cuStreamDestroy(CUstream hStream) {
+    ensure_init();
+    return ol_cuStreamDestroy((unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuStreamSynchronize(CUstream hStream) {
+    ensure_init();
+    return ol_cuStreamSynchronize((unsigned long long)(uintptr_t)hStream);
+}
+
+/* -- Event -- */
+
+CUresult hook_cuEventCreate(CUevent *phEvent, unsigned int Flags) {
+    ensure_init();
+    unsigned long long event_u64 = 0;
+    CUresult r = ol_cuEventCreate(&event_u64, Flags);
+    if (r == CUDA_SUCCESS && phEvent) {
+        *phEvent = (CUevent)(uintptr_t)event_u64;
+    }
+    return r;
+}
+
+CUresult hook_cuEventDestroy(CUevent hEvent) {
+    ensure_init();
+    return ol_cuEventDestroy((unsigned long long)(uintptr_t)hEvent);
+}
+
+CUresult hook_cuEventRecord(CUevent hEvent, CUstream hStream) {
+    ensure_init();
+    return ol_cuEventRecord((unsigned long long)(uintptr_t)hEvent,
+                            (unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuEventSynchronize(CUevent hEvent) {
+    ensure_init();
+    return ol_cuEventSynchronize((unsigned long long)(uintptr_t)hEvent);
+}
+
+/* -- Kernel launch -- */
+
+CUresult hook_cuLaunchKernel(CUfunction f,
+                              unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                              unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+                              unsigned int sharedMemBytes, CUstream hStream,
+                              void **kernelParams, void **extra) {
+    ensure_init();
+    return ol_cuLaunchKernel((unsigned long long)(uintptr_t)f,
+                              gridDimX, gridDimY, gridDimZ,
+                              blockDimX, blockDimY, blockDimZ,
+                              sharedMemBytes,
+                              (unsigned long long)(uintptr_t)hStream,
+                              kernelParams, extra);
 }
 
 /* -----------------------------------------------------------------------
