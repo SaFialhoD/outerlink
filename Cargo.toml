@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/outerlink-common",
+    "crates/outerlink-server",
+    "crates/outerlink-client",
+    "crates/outerlink-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/SaFialhoD/outerlink"
+description = "Unified GPU pool across networked PCs"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+bincode = "2.0.0-rc.3"
+dashmap = "6"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+bytes = "1"
+async-trait = "0.1"
+anyhow = "1"

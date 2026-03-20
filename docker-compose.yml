@@ -1,0 +1,66 @@
+# OuterLink Development Environment
+version: "3.8"
+
+services:
+  dev:
+    build: .
+    container_name: outerlink-dev
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/workspace/target
+    working_dir: /workspace
+    command: cargo build --all
+    environment:
+      - RUST_BACKTRACE=1
+      - CUDA_PATH=/usr/local/cuda
+
+  # Run tests
+  test:
+    build: .
+    container_name: outerlink-test
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/workspace/target
+    working_dir: /workspace
+    command: cargo test --all
+    environment:
+      - RUST_BACKTRACE=1
+      - CUDA_PATH=/usr/local/cuda
+
+  # Run clippy
+  lint:
+    build: .
+    container_name: outerlink-lint
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/workspace/target
+    working_dir: /workspace
+    command: sh -c "cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings"
+    environment:
+      - CUDA_PATH=/usr/local/cuda
+
+  # Watch mode - rebuild on file changes
+  watch:
+    build: .
+    container_name: outerlink-watch
+    volumes:
+      - .:/workspace
+      - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target-cache:/workspace/target
+    working_dir: /workspace
+    command: cargo watch -x "build --all" -x "test --all"
+    environment:
+      - RUST_BACKTRACE=1
+      - CUDA_PATH=/usr/local/cuda
+
+volumes:
+  cargo-cache:
+  cargo-git:
+  target-cache:

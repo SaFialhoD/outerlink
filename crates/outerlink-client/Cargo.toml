@@ -1,0 +1,15 @@
+[package]
+name = "outerlink-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OuterLink client library - CUDA interception and remote GPU access"
+
+[dependencies]
+outerlink-common = { path = "../outerlink-common" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+
+[build-dependencies]
+cc = "1"
