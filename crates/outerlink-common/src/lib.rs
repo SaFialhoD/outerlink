@@ -7,6 +7,7 @@ pub mod cuda_types;
 pub mod error;
 pub mod handle;
 pub mod protocol;
+pub mod tcp_transport;
 pub mod transport;
 
 pub use error::{OuterLinkError, Result};

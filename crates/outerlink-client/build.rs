@@ -1,0 +1,40 @@
+//! Build script for outerlink-client.
+//!
+//! Compiles the C interposition library (csrc/interpose.c) and links it into
+//! the final cdylib. The resulting shared library can be loaded via LD_PRELOAD
+//! to intercept CUDA Driver API calls.
+//!
+//! Only compiles the C code on Linux -- the interposition mechanism
+//! (__libc_dlsym, LD_PRELOAD) is Linux/glibc-specific.
+
+fn main() {
+    // Only compile the C interposition layer on Linux
+    if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "linux" {
+        let cuda_stubs_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("cuda-stubs");
+
+        cc::Build::new()
+            .file("csrc/interpose.c")
+            .include("csrc")
+            .include(&cuda_stubs_dir)
+            .flag("-fvisibility=hidden") // Only export what we explicitly mark
+            .flag("-Wall")
+            .flag("-Wextra")
+            .flag("-Wno-unused-parameter")
+            .flag("-O2")
+            .compile("outerlink_interpose");
+
+        // Link system libraries needed by the interposition layer
+        println!("cargo:rustc-link-lib=dl");
+        println!("cargo:rustc-link-lib=pthread");
+
+        // Rebuild if the C source changes
+        println!("cargo:rerun-if-changed=csrc/interpose.c");
+        println!("cargo:rerun-if-changed=csrc/interpose.h");
+    }
+
+    // Always rebuild if build.rs changes
+    println!("cargo:rerun-if-changed=build.rs");
+}

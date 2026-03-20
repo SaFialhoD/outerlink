@@ -33,5 +33,4 @@ impl OuterLinkClient {
     }
 }
 
-// FFI exports will be added here for the C interposition library to call.
-// See P5 plan for detailed function signatures.
+pub mod ffi;

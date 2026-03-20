@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "OuterLink client library - CUDA interception and remote GPU access"
 
+[lib]
+# cdylib: produces libouterlink_client.so for LD_PRELOAD usage
+# rlib: allows other Rust crates and tests to depend on this crate
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 outerlink-common = { path = "../outerlink-common" }
 tokio = { workspace = true }
