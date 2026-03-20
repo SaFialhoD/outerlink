@@ -476,18 +476,34 @@ CUresult hook_cuEventQuery(CUevent hEvent) {
 
 /* -- Kernel launch -- */
 
+/*
+ * The real CUDA cuLaunchKernel uses void** kernelParams where each pointer
+ * points to a kernel argument's storage. However, the sizes of those arguments
+ * are NOT part of the API -- they are determined by the kernel's signature.
+ *
+ * At LD_PRELOAD interception time, we don't have access to the kernel's
+ * parameter metadata. So we pass NULL/0 for params here. Applications that
+ * need kernel params over the network must use the extended OuterLink API
+ * (with explicit num_params and param_sizes).
+ *
+ * Phase 2: Introspect cubin/PTX module metadata to infer param sizes.
+ */
 CUresult hook_cuLaunchKernel(CUfunction f,
                               unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                               unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
                               unsigned int sharedMemBytes, CUstream hStream,
                               void **kernelParams, void **extra) {
     ensure_init();
+    (void)kernelParams;  /* Cannot serialize without param sizes -- see comment above */
+    (void)extra;         /* 'extra' parameter style not yet supported */
     return ol_cuLaunchKernel((unsigned long long)(uintptr_t)f,
                               gridDimX, gridDimY, gridDimZ,
                               blockDimX, blockDimY, blockDimZ,
                               sharedMemBytes,
                               (unsigned long long)(uintptr_t)hStream,
-                              kernelParams, extra);
+                              NULL,  /* kernelParams -- requires extended API */
+                              0,     /* numParams */
+                              NULL); /* paramSizes */
 }
 
 /* -----------------------------------------------------------------------

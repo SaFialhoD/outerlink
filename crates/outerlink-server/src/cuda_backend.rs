@@ -297,6 +297,65 @@ fn require_fn<T: Copy>(opt: &Option<T>) -> Result<T, CuResult> {
 }
 
 // ---------------------------------------------------------------------------
+// Kernel parameter deserialization
+// ---------------------------------------------------------------------------
+
+/// Deserialize kernel parameters from the wire format into individual param
+/// byte buffers.
+///
+/// Wire format:
+/// ```text
+/// [4B num_params: u32 LE]
+/// [4B param_sizes[0]: u32 LE][param_bytes[0]...]
+/// [4B param_sizes[1]: u32 LE][param_bytes[1]...]
+/// ...
+/// ```
+///
+/// Returns a `Vec<Vec<u8>>` where each inner `Vec` holds the raw bytes of
+/// one kernel parameter.  The caller builds a `void**` array by taking
+/// pointers to each `Vec`'s data.
+pub(crate) fn deserialize_kernel_params(data: &[u8]) -> Result<Vec<Vec<u8>>, CuResult> {
+    if data.len() < 4 {
+        return Err(CuResult::InvalidValue);
+    }
+    let num_params = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+    if num_params == 0 {
+        return Ok(Vec::new());
+    }
+    // CUDA limits total kernel param bytes to 4096; cap count to prevent OOM from malformed input
+    const MAX_KERNEL_PARAMS: usize = 1024;
+    if num_params > MAX_KERNEL_PARAMS {
+        return Err(CuResult::InvalidValue);
+    }
+
+    let mut offset = 4usize;
+    let mut params = Vec::with_capacity(num_params);
+
+    for _ in 0..num_params {
+        // Need at least 4 bytes for the size prefix
+        if offset + 4 > data.len() {
+            return Err(CuResult::InvalidValue);
+        }
+        let size = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+
+        // Zero-size kernel parameters are not valid in CUDA
+        if size == 0 {
+            return Err(CuResult::InvalidValue);
+        }
+
+        // Need `size` bytes of param data
+        if offset + size > data.len() {
+            return Err(CuResult::InvalidValue);
+        }
+        params.push(data[offset..offset + size].to_vec());
+        offset += size;
+    }
+
+    Ok(params)
+}
+
+// ---------------------------------------------------------------------------
 // CudaGpuBackend
 // ---------------------------------------------------------------------------
 
@@ -758,13 +817,18 @@ impl GpuBackend for CudaGpuBackend {
     ) -> Result<(), CuResult> {
         let launch_fn = require_fn(&self.api.cu_launch_kernel)?;
 
-        // The `params` byte slice contains a packed array of device pointers
-        // (u64 values) that are the kernel arguments.  cuLaunchKernel expects
-        // `void** kernelParams` where each element points to the argument's
-        // storage.  We unpack the u64s and build the pointer array.
+        // Unpack the serialized kernel parameters.
         //
-        // If params is empty, pass null (kernel takes no arguments).
-        if params.is_empty() {
+        // Wire format (from the client):
+        //   [4B num_params: u32 LE]
+        //   For each param:
+        //     [4B size: u32 LE][size bytes of raw param data]
+        //
+        // The client always sends at least the 4-byte num_params field.
+        let param_values = deserialize_kernel_params(params)?;
+
+        if param_values.is_empty() {
+            // No kernel arguments — pass null to CUDA
             unsafe {
                 map_cuda_result(launch_fn(
                     func as usize,
@@ -781,31 +845,17 @@ impl GpuBackend for CudaGpuBackend {
                 ))?;
             }
         } else {
-            // Each kernel parameter is a u64 packed in little-endian.
-            if params.len() % 8 != 0 {
-                return Err(CuResult::InvalidValue);
-            }
-            let n_params = params.len() / 8;
-            // Unpack parameter values.
-            let mut param_values: Vec<u64> = Vec::with_capacity(n_params);
-            for i in 0..n_params {
-                let offset = i * 8;
-                let val = u64::from_le_bytes([
-                    params[offset],
-                    params[offset + 1],
-                    params[offset + 2],
-                    params[offset + 3],
-                    params[offset + 4],
-                    params[offset + 5],
-                    params[offset + 6],
-                    params[offset + 7],
-                ]);
-                param_values.push(val);
-            }
-            // Build the pointer array: each entry points to the corresponding value.
+            // Build the void** pointer array that CUDA expects.
+            // Each entry points to the start of the corresponding param's raw bytes.
+            //
+            // SAFETY: param_values is not moved, dropped, or mutated after this point.
+            // param_ptrs[i] aliases param_values[i]'s heap buffer, which is stable
+            // because we do not push/remove from param_values. Drop order (LIFO) ensures
+            // param_ptrs drops before param_values. CUDA driver functions are thread-safe
+            // when called with separate contexts.
             let mut param_ptrs: Vec<*mut std::ffi::c_void> = param_values
                 .iter()
-                .map(|v| v as *const u64 as *mut std::ffi::c_void)
+                .map(|v| v.as_ptr() as *mut std::ffi::c_void)
                 .collect();
 
             unsafe {
@@ -890,5 +940,100 @@ mod tests {
     // Dummy for require_fn test.
     unsafe extern "C" fn dummy_cu_init(_flags: u32) -> i32 {
         0
+    }
+
+    // --- deserialize_kernel_params tests ---
+
+    #[test]
+    fn deserialize_kernel_params_empty() {
+        // num_params = 0
+        let data = 0u32.to_le_bytes();
+        let result = deserialize_kernel_params(&data).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn deserialize_kernel_params_single_u64() {
+        // One param: a u64 value
+        let val: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let val_bytes = val.to_le_bytes();
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // num_params = 1
+        data.extend_from_slice(&8u32.to_le_bytes()); // param_sizes[0] = 8
+        data.extend_from_slice(&val_bytes);           // param_bytes[0]
+        let result = deserialize_kernel_params(&data).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], val_bytes);
+    }
+
+    #[test]
+    fn deserialize_kernel_params_two_params() {
+        // Two params: a u64 (device pointer) and a u32 (count)
+        let ptr_val: u64 = 0x1234_5678_ABCD_0000;
+        let count_val: u32 = 1024;
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u32.to_le_bytes()); // num_params = 2
+        data.extend_from_slice(&8u32.to_le_bytes()); // param_sizes[0] = 8
+        data.extend_from_slice(&ptr_val.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes()); // param_sizes[1] = 4
+        data.extend_from_slice(&count_val.to_le_bytes());
+        let result = deserialize_kernel_params(&data).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ptr_val.to_le_bytes());
+        assert_eq!(result[1], count_val.to_le_bytes());
+    }
+
+    #[test]
+    fn deserialize_kernel_params_three_mixed_sizes() {
+        // Three params: u64, f32, u32
+        let a: u64 = 0xFF00_FF00_FF00_FF00;
+        let b: f32 = 3.14;
+        let c: u32 = 42;
+        let mut data = Vec::new();
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&a.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.extend_from_slice(&b.to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.extend_from_slice(&c.to_le_bytes());
+        let result = deserialize_kernel_params(&data).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(u64::from_le_bytes(result[0].clone().try_into().unwrap()), a);
+        assert_eq!(f32::from_le_bytes(result[1].clone().try_into().unwrap()), b);
+        assert_eq!(u32::from_le_bytes(result[2].clone().try_into().unwrap()), c);
+    }
+
+    #[test]
+    fn deserialize_kernel_params_too_short() {
+        // Less than 4 bytes -- can't even read num_params
+        let data = [0u8; 2];
+        assert_eq!(
+            deserialize_kernel_params(&data).unwrap_err(),
+            CuResult::InvalidValue
+        );
+    }
+
+    #[test]
+    fn deserialize_kernel_params_truncated_size() {
+        // Says 1 param but no size prefix
+        let data = 1u32.to_le_bytes();
+        assert_eq!(
+            deserialize_kernel_params(&data).unwrap_err(),
+            CuResult::InvalidValue
+        );
+    }
+
+    #[test]
+    fn deserialize_kernel_params_truncated_data() {
+        // Says 1 param, size = 8, but only 4 bytes of data
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 4]); // only 4 of 8 bytes
+        assert_eq!(
+            deserialize_kernel_params(&data).unwrap_err(),
+            CuResult::InvalidValue
+        );
     }
 }

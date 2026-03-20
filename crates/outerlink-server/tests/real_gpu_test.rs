@@ -454,3 +454,228 @@ async fn test_real_mem_get_info() {
     drop(client);
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_real_kernel_launch() {
+    let backend = require_gpu!();
+    let (listener, addr) = bind_server().await;
+    let server = spawn_real_server(listener, backend);
+    let client = connect_client(&addr).await;
+
+    // ---------------------------------------------------------------
+    // 1. Create a CUDA context on device 0
+    // ---------------------------------------------------------------
+    let mut ctx_payload = 0_u32.to_le_bytes().to_vec(); // flags
+    ctx_payload.extend_from_slice(&0_i32.to_le_bytes()); // device 0
+    let (_hdr, payload) = roundtrip(&client, MessageType::CtxCreate, &ctx_payload, 1).await;
+    let data = assert_success(&payload);
+    let ctx_handle = u64::from_le_bytes(data[..8].try_into().unwrap());
+    eprintln!("[REAL GPU] Created context: 0x{ctx_handle:016X}");
+
+    // ---------------------------------------------------------------
+    // 2. Load PTX module
+    // ---------------------------------------------------------------
+    // A simple kernel that doubles every element: output[tid] = input[tid] * 2
+    // Launched with grid=(1,1,1), block=(N,1,1) — N threads in one block using %tid.x.
+    let ptx = b"\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry double_elements(\n\
+    .param .u64 input,\n\
+    .param .u64 output,\n\
+    .param .u32 n\n\
+)\n\
+{\n\
+    .reg .pred %p0;\n\
+    .reg .u32 %idx, %n;\n\
+    .reg .u64 %in_ptr, %out_ptr, %offset;\n\
+    .reg .f32 %val, %result;\n\
+\n\
+    ld.param.u64 %in_ptr, [input];\n\
+    ld.param.u64 %out_ptr, [output];\n\
+    ld.param.u32 %n, [n];\n\
+\n\
+    mov.u32 %idx, %tid.x;\n\
+    setp.ge.u32 %p0, %idx, %n;\n\
+    @%p0 bra done;\n\
+\n\
+    mul.wide.u32 %offset, %idx, 4;\n\
+    add.u64 %in_ptr, %in_ptr, %offset;\n\
+    add.u64 %out_ptr, %out_ptr, %offset;\n\
+\n\
+    ld.global.f32 %val, [%in_ptr];\n\
+    add.f32 %result, %val, %val;\n\
+    st.global.f32 [%out_ptr], %result;\n\
+\n\
+done:\n\
+    ret;\n\
+}\n\0";
+
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleLoadData, ptx, 2).await;
+    let data = assert_success(&payload);
+    let module = u64::from_le_bytes(data[..8].try_into().unwrap());
+    eprintln!("[REAL GPU] Loaded PTX module: 0x{module:016X}");
+
+    // ---------------------------------------------------------------
+    // 3. Get function handle for "double_elements"
+    // ---------------------------------------------------------------
+    let func_name = b"double_elements";
+    let mut gf_payload = module.to_le_bytes().to_vec();
+    gf_payload.extend_from_slice(&(func_name.len() as u32).to_le_bytes());
+    gf_payload.extend_from_slice(func_name);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleGetFunction, &gf_payload, 3).await;
+    let data = assert_success(&payload);
+    let kernel_func = u64::from_le_bytes(data[..8].try_into().unwrap());
+    eprintln!("[REAL GPU] Got kernel function: 0x{kernel_func:016X}");
+
+    // ---------------------------------------------------------------
+    // 4. Allocate input and output GPU buffers
+    // ---------------------------------------------------------------
+    let n: u32 = 256;
+    let buf_size: u64 = (n as u64) * 4; // N * sizeof(f32)
+
+    // Allocate input buffer
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemAlloc, &buf_size.to_le_bytes(), 4).await;
+    let data = assert_success(&payload);
+    let input_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+    eprintln!("[REAL GPU] Input buffer at: 0x{input_ptr:016X} ({buf_size} bytes)");
+
+    // Allocate output buffer
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemAlloc, &buf_size.to_le_bytes(), 5).await;
+    let data = assert_success(&payload);
+    let output_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+    eprintln!("[REAL GPU] Output buffer at: 0x{output_ptr:016X} ({buf_size} bytes)");
+
+    // ---------------------------------------------------------------
+    // 5. Create input data [1.0, 2.0, 3.0, ..., 256.0] and upload
+    // ---------------------------------------------------------------
+    let input_data: Vec<f32> = (1..=n).map(|i| i as f32).collect();
+    let input_bytes: Vec<u8> = input_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let mut htod_payload = input_ptr.to_le_bytes().to_vec();
+    htod_payload.extend_from_slice(&input_bytes);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemcpyHtoD, &htod_payload, 6).await;
+    assert_success(&payload);
+    eprintln!("[REAL GPU] Uploaded {n} floats to input buffer");
+
+    // ---------------------------------------------------------------
+    // 6. Launch kernel: grid=(N,1,1), block=(1,1,1), shared=0, stream=0
+    // ---------------------------------------------------------------
+    // Kernel params layout for cuLaunchKernel:
+    //   param 0: u64 input_ptr  (CUdeviceptr, 8 bytes)
+    //   param 1: u64 output_ptr (CUdeviceptr, 8 bytes)
+    //   param 2: u32 n          (int, 4 bytes)
+    //
+    // Wire format after the 44-byte fixed header:
+    //   [4B num_params: u32 LE]
+    //   [4B size][size bytes]  -- repeated for each param
+    //
+    // The server's launch_kernel deserializes this into a Vec<Vec<u8>>,
+    // then builds the void** array that cuLaunchKernel expects (each
+    // pointer targets the raw bytes of one parameter).
+    let mut launch_payload = kernel_func.to_le_bytes().to_vec(); // 8B func
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes());      // gridX = 1
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes());      // gridY
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes());      // gridZ
+    launch_payload.extend_from_slice(&n.to_le_bytes());          // blockX = N (256 threads)
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes());      // blockY
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes());      // blockZ
+    launch_payload.extend_from_slice(&0_u32.to_le_bytes());      // shared_mem
+    launch_payload.extend_from_slice(&0_u64.to_le_bytes());      // stream (default)
+    // Kernel params (serialized with size-prefix format):
+    launch_payload.extend_from_slice(&3_u32.to_le_bytes());      // num_params = 3
+    launch_payload.extend_from_slice(&8_u32.to_le_bytes());      // param 0 size = 8
+    launch_payload.extend_from_slice(&input_ptr.to_le_bytes());  // param 0: input ptr
+    launch_payload.extend_from_slice(&8_u32.to_le_bytes());      // param 1 size = 8
+    launch_payload.extend_from_slice(&output_ptr.to_le_bytes()); // param 1: output ptr
+    launch_payload.extend_from_slice(&4_u32.to_le_bytes());      // param 2 size = 4
+    launch_payload.extend_from_slice(&n.to_le_bytes());          // param 2: n (u32)
+
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::LaunchKernel, &launch_payload, 7).await;
+    let result = response_result(&payload);
+    assert_eq!(
+        result,
+        CuResult::Success,
+        "LaunchKernel failed with: {result:?}"
+    );
+    eprintln!("[REAL GPU] Kernel launched successfully!");
+
+    // Synchronize to ensure kernel completes before reading back
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxSynchronize, &[], 70).await;
+    assert_eq!(response_result(&payload), CuResult::Success);
+    eprintln!("[REAL GPU] Context synchronized");
+
+    // ---------------------------------------------------------------
+    // 7. Read back the output buffer
+    // ---------------------------------------------------------------
+    let mut dtoh_payload = output_ptr.to_le_bytes().to_vec();
+    dtoh_payload.extend_from_slice(&buf_size.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemcpyDtoH, &dtoh_payload, 8).await;
+    let data = assert_success(&payload);
+
+    assert_eq!(
+        data.len(),
+        buf_size as usize,
+        "expected {buf_size} bytes back from GPU, got {}",
+        data.len()
+    );
+
+    // ---------------------------------------------------------------
+    // 8. Verify: output[i] == input[i] * 2.0
+    // ---------------------------------------------------------------
+    let output_floats: Vec<f32> = data
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    eprintln!("[REAL GPU] First 8 results: {:?}", &output_floats[..8]);
+    eprintln!(
+        "[REAL GPU] Last 8 results:  {:?}",
+        &output_floats[output_floats.len() - 8..]
+    );
+
+    for (i, (&out, &inp)) in output_floats.iter().zip(input_data.iter()).enumerate() {
+        let expected = inp * 2.0;
+        assert!(
+            (out - expected).abs() < f32::EPSILON,
+            "MISMATCH at index {i}: expected {expected}, got {out}"
+        );
+    }
+    eprintln!(
+        "[REAL GPU] ALL {n} elements verified: output[i] == input[i] * 2.0  COMPUTE WORKS!"
+    );
+
+    // ---------------------------------------------------------------
+    // 9. Cleanup: free buffers, unload module, destroy context
+    // ---------------------------------------------------------------
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemFree, &input_ptr.to_le_bytes(), 9).await;
+    assert_eq!(response_result(&payload), CuResult::Success);
+
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemFree, &output_ptr.to_le_bytes(), 10).await;
+    assert_eq!(response_result(&payload), CuResult::Success);
+
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleUnload, &module.to_le_bytes(), 11).await;
+    assert_eq!(response_result(&payload), CuResult::Success);
+
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxDestroy, &ctx_handle.to_le_bytes(), 12).await;
+    assert_eq!(response_result(&payload), CuResult::Success);
+
+    eprintln!("[REAL GPU] Cleanup complete: buffers freed, module unloaded, context destroyed");
+
+    drop(client);
+    server.await.unwrap();
+}

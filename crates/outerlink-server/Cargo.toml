@@ -17,6 +17,7 @@ libloading = { workspace = true }
 
 [features]
 real-gpu-test = []
+bench = []
 
 [dev-dependencies]
 outerlink-common = { path = "../outerlink-common" }

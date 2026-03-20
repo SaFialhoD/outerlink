@@ -1288,8 +1288,9 @@ pub extern "C" fn ol_cuLaunchKernel(
     block_z: u32,
     shared_mem: u32,
     stream: u64,
-    _params: *mut *mut std::ffi::c_void,
-    _extra: *mut *mut std::ffi::c_void,
+    kernel_params: *const *const u8,
+    num_params: u32,
+    param_sizes: *const u32,
 ) -> u32 {
     let client = get_client();
     // Connected: ask the server
@@ -1307,8 +1308,14 @@ pub extern "C" fn ol_cuLaunchKernel(
             }
         };
         // Payload: [8B func][4B gridX][4B gridY][4B gridZ][4B blockX][4B blockY][4B blockZ][4B sharedMem][8B stream]
-        // = 44 bytes header, then params bytes (empty for now, Phase 1 does not serialize kernel params)
-        let mut payload = Vec::with_capacity(44);
+        // = 44 bytes fixed header, then serialized kernel params.
+        //
+        // Params format after the 44-byte header:
+        //   [4B num_params: u32 LE]
+        //   [4B param_sizes[0]: u32 LE][param_bytes[0]...]
+        //   [4B param_sizes[1]: u32 LE][param_bytes[1]...]
+        //   ...
+        let mut payload = Vec::with_capacity(44 + 4);
         payload.extend_from_slice(&remote_func.to_le_bytes());
         payload.extend_from_slice(&grid_x.to_le_bytes());
         payload.extend_from_slice(&grid_y.to_le_bytes());
@@ -1318,7 +1325,38 @@ pub extern "C" fn ol_cuLaunchKernel(
         payload.extend_from_slice(&block_z.to_le_bytes());
         payload.extend_from_slice(&shared_mem.to_le_bytes());
         payload.extend_from_slice(&remote_stream.to_le_bytes());
-        // TODO(Phase 2): serialize kernel params from _params/_extra
+
+        // Serialize kernel parameters.
+        //
+        // SAFETY: When num_params > 0, the caller must guarantee:
+        //   - kernel_params points to at least num_params valid *const u8 pointers
+        //   - param_sizes points to at least num_params valid u32 values (4-byte aligned)
+        //   - Each kernel_params[i] points to param_sizes[i] readable bytes
+        // These are the same guarantees CUDA imposes on cuLaunchKernel callers.
+        const MAX_KERNEL_PARAMS: u32 = 1024; // CUDA limits total param bytes to 4096
+        let n = num_params;
+        if n > MAX_KERNEL_PARAMS {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        payload.extend_from_slice(&n.to_le_bytes());
+        if n > 0 && !kernel_params.is_null() && !param_sizes.is_null() {
+            for i in 0..n as usize {
+                unsafe {
+                    let size = *param_sizes.add(i);
+                    let ptr = *kernel_params.add(i);
+                    if size > 0 && ptr.is_null() {
+                        // Non-zero size with null data pointer is a caller bug
+                        return CUDA_ERROR_INVALID_VALUE;
+                    }
+                    payload.extend_from_slice(&size.to_le_bytes());
+                    if size > 0 {
+                        let bytes = std::slice::from_raw_parts(ptr, size as usize);
+                        payload.extend_from_slice(bytes);
+                    }
+                }
+            }
+        }
+
         if let Ok((_hdr, resp)) = client.send_request(MessageType::LaunchKernel, &payload) {
             return parse_result(&resp);
         }
@@ -2016,8 +2054,9 @@ mod tests {
             32, 1, 1, // block
             0,       // shared mem
             0,       // default stream
-            ptr::null_mut(), // params
-            ptr::null_mut(), // extra
+            ptr::null(), // no params
+            0,           // num_params
+            ptr::null(), // no param sizes
         );
         assert_eq!(result, CUDA_SUCCESS);
 
@@ -2032,8 +2071,9 @@ mod tests {
             1, 1, 1,
             32, 1, 1,
             0, 0,
-            ptr::null_mut(),
-            ptr::null_mut(),
+            ptr::null(),
+            0,
+            ptr::null(),
         );
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
     }
@@ -2057,8 +2097,9 @@ mod tests {
             32, 1, 1,
             0,
             0xDEAD, // invalid stream handle
-            ptr::null_mut(),
-            ptr::null_mut(),
+            ptr::null(),
+            0,
+            ptr::null(),
         );
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
 
@@ -2086,12 +2127,57 @@ mod tests {
             32, 1, 1,
             0,
             stream,  // valid stream
-            ptr::null_mut(),
-            ptr::null_mut(),
+            ptr::null(),
+            0,
+            ptr::null(),
         );
         assert_eq!(result, CUDA_SUCCESS);
 
         let _ = ol_cuStreamDestroy(stream);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_ol_cu_launch_kernel_with_params() {
+        // Create valid module and function handles
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"doubling\0";
+        assert_eq!(
+            ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8),
+            CUDA_SUCCESS,
+        );
+
+        // Simulate kernel params: a device pointer (u64) and an int (u32)
+        let dev_ptr: u64 = 0x1234_5678_ABCD_0000;
+        let count: u32 = 1024;
+
+        let param0 = dev_ptr.to_le_bytes();
+        let param1 = count.to_le_bytes();
+
+        let param_ptrs: [*const u8; 2] = [
+            param0.as_ptr(),
+            param1.as_ptr(),
+        ];
+        let param_sizes: [u32; 2] = [
+            std::mem::size_of::<u64>() as u32,
+            std::mem::size_of::<u32>() as u32,
+        ];
+
+        let result = ol_cuLaunchKernel(
+            func,
+            1, 1, 1,
+            256, 1, 1,
+            0,
+            0,
+            param_ptrs.as_ptr(),
+            2,
+            param_sizes.as_ptr(),
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+
         let _ = ol_cuModuleUnload(module);
     }
 

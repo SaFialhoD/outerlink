@@ -1510,6 +1510,7 @@ mod tests {
         payload.extend_from_slice(&1u32.to_le_bytes()); // blockZ
         payload.extend_from_slice(&0u32.to_le_bytes()); // shared_mem
         payload.extend_from_slice(&0u64.to_le_bytes()); // stream (default)
+        payload.extend_from_slice(&0u32.to_le_bytes()); // num_params = 0 (matches real client wire format)
         let hdr = req(MessageType::LaunchKernel, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr,&payload);
         assert_eq!(response_result(&resp), CuResult::Success);
@@ -1540,5 +1541,44 @@ mod tests {
         let hdr = req(MessageType::LaunchKernel, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr,&payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_launch_kernel_with_serialized_params() {
+        let gpu = StubGpuBackend::new();
+
+        // Load module + get function (same setup as test_launch_kernel_handler)
+        let mod_payload = b"ptx";
+        let hdr = req(MessageType::ModuleLoadData, mod_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, mod_payload);
+        let module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        let kern_name = b"kern";
+        let mut func_payload = module.to_le_bytes().to_vec();
+        func_payload.extend_from_slice(&(kern_name.len() as u32).to_le_bytes());
+        func_payload.extend_from_slice(kern_name);
+        let hdr = req(MessageType::ModuleGetFunction, func_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &func_payload);
+        let func = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Build launch payload with kernel params in the new serialized format
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // gridX
+        payload.extend_from_slice(&1u32.to_le_bytes()); // gridY
+        payload.extend_from_slice(&1u32.to_le_bytes()); // gridZ
+        payload.extend_from_slice(&256u32.to_le_bytes()); // blockX
+        payload.extend_from_slice(&1u32.to_le_bytes()); // blockY
+        payload.extend_from_slice(&1u32.to_le_bytes()); // blockZ
+        payload.extend_from_slice(&0u32.to_le_bytes()); // shared_mem
+        payload.extend_from_slice(&0u64.to_le_bytes()); // stream (default)
+        // Serialized params: 2 params (u64 ptr + u32 count)
+        payload.extend_from_slice(&2u32.to_le_bytes()); // num_params = 2
+        payload.extend_from_slice(&8u32.to_le_bytes()); // param 0 size
+        payload.extend_from_slice(&0x1234u64.to_le_bytes()); // param 0 data
+        payload.extend_from_slice(&4u32.to_le_bytes()); // param 1 size
+        payload.extend_from_slice(&1024u32.to_le_bytes()); // param 1 data
+        let hdr = req(MessageType::LaunchKernel, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
     }
 }

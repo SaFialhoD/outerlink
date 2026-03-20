@@ -734,12 +734,65 @@ async fn test_launch_kernel_e2e() {
     launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // blockZ
     launch_payload.extend_from_slice(&0_u32.to_le_bytes()); // sharedMem
     launch_payload.extend_from_slice(&stream.to_le_bytes()); // stream
+    launch_payload.extend_from_slice(&0_u32.to_le_bytes()); // num_params = 0 (matches real client wire format)
     let (_hdr, payload) =
         roundtrip(&client, MessageType::LaunchKernel, &launch_payload, 4).await;
     assert_eq!(
         response_result(&payload),
         CuResult::Success,
         "LaunchKernel should succeed"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_launch_kernel_with_params_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Load module.
+    let ptx = b"fake ptx";
+    let (_hdr, payload) = roundtrip(&client, MessageType::ModuleLoadData, ptx, 1).await;
+    let data = assert_success(&payload);
+    let module = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Get function.
+    let name = b"doubling";
+    let mut func_payload = module.to_le_bytes().to_vec();
+    func_payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    func_payload.extend_from_slice(name);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleGetFunction, &func_payload, 2).await;
+    let data = assert_success(&payload);
+    let func = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 3. Launch kernel with serialized params (2 params: u64 ptr + u32 count)
+    let mut launch_payload = func.to_le_bytes().to_vec();
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // gridX
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // gridY
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // gridZ
+    launch_payload.extend_from_slice(&32_u32.to_le_bytes()); // blockX
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // blockY
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // blockZ
+    launch_payload.extend_from_slice(&0_u32.to_le_bytes()); // sharedMem
+    launch_payload.extend_from_slice(&0_u64.to_le_bytes()); // stream (default)
+    // Serialized kernel params:
+    launch_payload.extend_from_slice(&2_u32.to_le_bytes()); // num_params = 2
+    launch_payload.extend_from_slice(&8_u32.to_le_bytes()); // param 0 size = 8
+    launch_payload.extend_from_slice(&0xABCD_0000_u64.to_le_bytes()); // param 0: device ptr
+    launch_payload.extend_from_slice(&4_u32.to_le_bytes()); // param 1 size = 4
+    launch_payload.extend_from_slice(&512_u32.to_le_bytes()); // param 1: count
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::LaunchKernel, &launch_payload, 3).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "LaunchKernel with params should succeed"
     );
 
     drop(client);
@@ -771,6 +824,235 @@ async fn test_ctx_session_persistence_e2e() {
     assert_eq!(
         current_ctx, ctx_handle,
         "CtxGetCurrent should return the handle from CtxCreate (session persistence)"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// MemcpyDtoD / MemAllocHost / MemFreeHost / StreamWaitEvent E2E tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_memcpy_dtod_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Allocate buffer A (256 bytes).
+    let alloc_payload = 256_u64.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 1).await;
+    let data = assert_success(&payload);
+    let buf_a = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Allocate buffer B (256 bytes).
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 2).await;
+    let data = assert_success(&payload);
+    let buf_b = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 3. Write known data to buffer A via MemcpyHtoD.
+    let test_data: Vec<u8> = (0..256).map(|i| (i & 0xFF) as u8).collect();
+    let mut htod_payload = buf_a.to_le_bytes().to_vec();
+    htod_payload.extend_from_slice(&test_data);
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyHtoD, &htod_payload, 3).await;
+    assert_eq!(response_result(&payload), CuResult::Success, "MemcpyHtoD should succeed");
+
+    // 4. Copy A -> B via MemcpyDtoD: [8B dst][8B src][8B size].
+    let mut dtod_payload = buf_b.to_le_bytes().to_vec();
+    dtod_payload.extend_from_slice(&buf_a.to_le_bytes());
+    dtod_payload.extend_from_slice(&256_u64.to_le_bytes());
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyDtoD, &dtod_payload, 4).await;
+    assert_eq!(response_result(&payload), CuResult::Success, "MemcpyDtoD should succeed");
+
+    // 5. Read B back via MemcpyDtoH.
+    let mut dtoh_payload = buf_b.to_le_bytes().to_vec();
+    dtoh_payload.extend_from_slice(&256_u64.to_le_bytes());
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyDtoH, &dtoh_payload, 5).await;
+    let data = assert_success(&payload);
+    assert_eq!(
+        data, &test_data[..],
+        "data read from buffer B should match what was written to buffer A"
+    );
+
+    // 6. Free both buffers.
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemFree, &buf_a.to_le_bytes(), 6).await;
+    assert_eq!(response_result(&payload), CuResult::Success);
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemFree, &buf_b.to_le_bytes(), 7).await;
+    assert_eq!(response_result(&payload), CuResult::Success);
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_mem_alloc_host_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. MemAllocHost: [8B size=1024].
+    let alloc_payload = 1024_u64.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAllocHost, &alloc_payload, 1).await;
+    let data = assert_success(&payload);
+    let host_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_ne!(host_ptr, 0, "host pointer should be non-zero");
+
+    // 2. MemFreeHost: [8B ptr].
+    let free_payload = host_ptr.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemFreeHost, &free_payload, 2).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "MemFreeHost should succeed"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_mem_free_host_double_free_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. AllocHost.
+    let alloc_payload = 512_u64.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAllocHost, &alloc_payload, 1).await;
+    let data = assert_success(&payload);
+    let host_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. First FreeHost -- should succeed.
+    let free_payload = host_ptr.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemFreeHost, &free_payload, 2).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "first MemFreeHost should succeed"
+    );
+
+    // 3. Second FreeHost of the same pointer -- should return InvalidValue.
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemFreeHost, &free_payload, 3).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::InvalidValue,
+        "double MemFreeHost should return InvalidValue"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_stream_wait_event_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Create a stream (flags=0).
+    let create_stream_payload = 0_u32.to_le_bytes();
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::StreamCreate, &create_stream_payload, 1).await;
+    let data = assert_success(&payload);
+    let stream = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Create an event (flags=0).
+    let create_event_payload = 0_u32.to_le_bytes();
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::EventCreate, &create_event_payload, 2).await;
+    let data = assert_success(&payload);
+    let event = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 3. Record the event on stream 0 (default stream).
+    let mut record_payload = event.to_le_bytes().to_vec();
+    record_payload.extend_from_slice(&0_u64.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::EventRecord, &record_payload, 3).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "EventRecord should succeed"
+    );
+
+    // 4. StreamWaitEvent: [8B stream][8B event][4B flags=0].
+    let mut wait_payload = stream.to_le_bytes().to_vec();
+    wait_payload.extend_from_slice(&event.to_le_bytes());
+    wait_payload.extend_from_slice(&0_u32.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::StreamWaitEvent, &wait_payload, 4).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "StreamWaitEvent should succeed"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_stream_wait_event_invalid_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Create a stream (flags=0).
+    let create_stream_payload = 0_u32.to_le_bytes();
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::StreamCreate, &create_stream_payload, 1).await;
+    let data = assert_success(&payload);
+    let stream = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. StreamWaitEvent with an invalid event handle.
+    let mut wait_payload = stream.to_le_bytes().to_vec();
+    wait_payload.extend_from_slice(&0xBAD_u64.to_le_bytes());
+    wait_payload.extend_from_slice(&0_u32.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::StreamWaitEvent, &wait_payload, 2).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::InvalidValue,
+        "StreamWaitEvent with invalid event should return InvalidValue"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_memcpy_dtod_invalid_src_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Allocate a valid destination buffer.
+    let alloc_payload = 64_u64.to_le_bytes();
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemAlloc, &alloc_payload, 1).await;
+    let data = assert_success(&payload);
+    let dst_ptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. MemcpyDtoD with invalid source pointer: [8B dst][8B src=0xBAD][8B size].
+    let mut dtod_payload = dst_ptr.to_le_bytes().to_vec();
+    dtod_payload.extend_from_slice(&0xBAD_u64.to_le_bytes());
+    dtod_payload.extend_from_slice(&64_u64.to_le_bytes());
+    let (_hdr, payload) = roundtrip(&client, MessageType::MemcpyDtoD, &dtod_payload, 2).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::InvalidValue,
+        "MemcpyDtoD with invalid source should return InvalidValue"
     );
 
     drop(client);

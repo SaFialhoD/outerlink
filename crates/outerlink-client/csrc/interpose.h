@@ -80,12 +80,23 @@ extern CUresult ol_cuEventSynchronize(unsigned long long event);
 extern CUresult ol_cuEventElapsedTime(float *ms, unsigned long long start, unsigned long long end);
 extern CUresult ol_cuEventQuery(unsigned long long event);
 
-/* Kernel launch */
+/* Kernel launch
+ *
+ * Uses the extended OuterLink signature with explicit param count and sizes.
+ * The real CUDA API uses void** kernelParams with implicit sizes, but at
+ * interception time we cannot infer parameter sizes without kernel metadata.
+ * The C hook passes NULL/0 for params; real param passing requires the
+ * extended API (num_params + param_sizes).
+ *
+ * Phase 2 will add kernel signature introspection from module metadata.
+ */
 extern CUresult ol_cuLaunchKernel(unsigned long long func,
                                    unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                                    unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
                                    unsigned int sharedMemBytes, unsigned long long hStream,
-                                   void **kernelParams, void **extra);
+                                   const unsigned char *const *kernelParams,
+                                   unsigned int numParams,
+                                   const unsigned int *paramSizes);
 
 /* -----------------------------------------------------------------------
  * Hook function declarations
