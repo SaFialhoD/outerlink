@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 use outerlink_common::error::OuterLinkError;
 use outerlink_common::tcp_transport::TcpTransportConnection;
 use outerlink_common::transport::TransportConnection;
+use outerlink_server::cuda_backend::CudaGpuBackend;
 use outerlink_server::gpu_backend::{GpuBackend, StubGpuBackend};
 use outerlink_server::handler::handle_request;
 use outerlink_server::session::ConnectionSession;
@@ -29,6 +30,11 @@ struct Args {
     /// Enable verbose (debug-level) logging.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Use the real CUDA GPU backend (requires NVIDIA driver).
+    /// When not set, the stub backend is used (no GPU required).
+    #[arg(long)]
+    real_gpu: bool,
 }
 
 #[tokio::main]
@@ -44,13 +50,20 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("OuterLink Server starting on {}", args.listen);
     tracing::info!("OpenDMA: non-proprietary GPU direct access");
 
-    // Create the GPU backend.  For the PoC we always use the stub.
-    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    // Create the GPU backend.
+    let backend: Arc<dyn GpuBackend> = if args.real_gpu {
+        tracing::info!("Loading real CUDA GPU backend...");
+        let cuda = CudaGpuBackend::new()?;
+        Arc::new(cuda)
+    } else {
+        Arc::new(StubGpuBackend::new())
+    };
     let init_result = backend.init();
     if !init_result.is_success() {
         anyhow::bail!("GPU backend init failed: {:?}", init_result);
     }
-    tracing::info!("GPU backend initialised (stub mode)");
+    let mode = if args.real_gpu { "real GPU" } else { "stub" };
+    tracing::info!("GPU backend initialised ({mode} mode)");
 
     // Bind the TCP listener.
     let listener = TcpListener::bind(&args.listen).await?;

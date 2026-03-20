@@ -790,10 +790,32 @@ pub extern "C" fn ol_cuGetErrorString(
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub extern "C" fn ol_cuModuleLoadData(module: *mut u64, _data: *const u8, _data_len: usize) -> u32 {
+pub extern "C" fn ol_cuModuleLoadData(module: *mut u64, data: *const u8, data_len: usize) -> u32 {
     let client = get_client();
     if module.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: send the raw binary data to the server
+    if client.connected.load(Ordering::Acquire) {
+        if !data.is_null() && data_len > 0 {
+            let payload = unsafe { std::slice::from_raw_parts(data, data_len) };
+            if let Ok((_hdr, resp)) =
+                client.send_request(MessageType::ModuleLoadData, payload)
+            {
+                let result = parse_result(&resp);
+                if result != CUDA_SUCCESS {
+                    return result;
+                }
+                if resp.len() >= 12 {
+                    let remote_module =
+                        u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                    let synthetic = client.handles.modules.insert(remote_module);
+                    unsafe { *module = synthetic };
+                    return CUDA_SUCCESS;
+                }
+            }
+        }
+        // Transport error or null data -- fall through to stub
     }
     // Stub: generate a local-only handle
     let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -805,6 +827,21 @@ pub extern "C" fn ol_cuModuleLoadData(module: *mut u64, _data: *const u8, _data_
 #[no_mangle]
 pub extern "C" fn ol_cuModuleUnload(module: u64) -> u32 {
     let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_module = match client.handles.modules.to_remote(module) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_module.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::ModuleUnload, &payload) {
+            let result = parse_result(&resp);
+            client.handles.modules.remove_by_local(module);
+            return result;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: just remove from local handles
     if client.handles.modules.remove_by_local(module).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -812,10 +849,42 @@ pub extern "C" fn ol_cuModuleUnload(module: u64) -> u32 {
 }
 
 #[no_mangle]
-pub extern "C" fn ol_cuModuleGetFunction(func: *mut u64, module: u64, _name: *const i8) -> u32 {
+pub extern "C" fn ol_cuModuleGetFunction(func: *mut u64, module: u64, name: *const i8) -> u32 {
     let client = get_client();
     if func.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_module = match client.handles.modules.to_remote(module) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        if !name.is_null() {
+            let name_cstr = unsafe { std::ffi::CStr::from_ptr(name) };
+            let name_bytes = name_cstr.to_bytes();
+            // Payload: [8B remote_module][4B name_len u32 LE][name bytes]
+            let mut payload = Vec::with_capacity(12 + name_bytes.len());
+            payload.extend_from_slice(&remote_module.to_le_bytes());
+            payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name_bytes);
+            if let Ok((_hdr, resp)) =
+                client.send_request(MessageType::ModuleGetFunction, &payload)
+            {
+                let result = parse_result(&resp);
+                if result != CUDA_SUCCESS {
+                    return result;
+                }
+                if resp.len() >= 12 {
+                    let remote_func =
+                        u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                    let synthetic = client.handles.functions.insert(remote_func);
+                    unsafe { *func = synthetic };
+                    return CUDA_SUCCESS;
+                }
+            }
+        }
+        // Transport error or null name -- fall through to stub
     }
     // Validate that the module handle exists
     if client.handles.modules.to_remote(module).is_none() {
@@ -833,11 +902,29 @@ pub extern "C" fn ol_cuModuleGetFunction(func: *mut u64, module: u64, _name: *co
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub extern "C" fn ol_cuStreamCreate(stream: *mut u64, _flags: u32) -> u32 {
+pub extern "C" fn ol_cuStreamCreate(stream: *mut u64, flags: u32) -> u32 {
     let client = get_client();
     if stream.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let payload = flags.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::StreamCreate, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.streams.insert(remote_stream);
+                unsafe { *stream = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: generate a local-only handle
     let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let synthetic = client.handles.streams.insert(stub_remote);
     unsafe { *stream = synthetic };
@@ -847,6 +934,21 @@ pub extern "C" fn ol_cuStreamCreate(stream: *mut u64, _flags: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn ol_cuStreamDestroy(stream: u64) -> u32 {
     let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_stream = match client.handles.streams.to_remote(stream) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_stream.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::StreamDestroy, &payload) {
+            let result = parse_result(&resp);
+            client.handles.streams.remove_by_local(stream);
+            return result;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: just remove from local handles
     if client.handles.streams.remove_by_local(stream).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -856,7 +958,25 @@ pub extern "C" fn ol_cuStreamDestroy(stream: u64) -> u32 {
 #[no_mangle]
 pub extern "C" fn ol_cuStreamSynchronize(stream: u64) -> u32 {
     let client = get_client();
-    // Validate handle (stream 0 = default stream, always valid)
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        let payload = remote_stream.to_le_bytes();
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::StreamSynchronize, &payload)
+        {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle (stream 0 = default stream, always valid)
     if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -868,11 +988,29 @@ pub extern "C" fn ol_cuStreamSynchronize(stream: u64) -> u32 {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub extern "C" fn ol_cuEventCreate(event: *mut u64, _flags: u32) -> u32 {
+pub extern "C" fn ol_cuEventCreate(event: *mut u64, flags: u32) -> u32 {
     let client = get_client();
     if event.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let payload = flags.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::EventCreate, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_event = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.events.insert(remote_event);
+                unsafe { *event = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: generate a local-only handle
     let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let synthetic = client.handles.events.insert(stub_remote);
     unsafe { *event = synthetic };
@@ -882,6 +1020,21 @@ pub extern "C" fn ol_cuEventCreate(event: *mut u64, _flags: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn ol_cuEventDestroy(event: u64) -> u32 {
     let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_event = match client.handles.events.to_remote(event) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_event.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::EventDestroy, &payload) {
+            let result = parse_result(&resp);
+            client.handles.events.remove_by_local(event);
+            return result;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: just remove from local handles
     if client.handles.events.remove_by_local(event).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -891,7 +1044,30 @@ pub extern "C" fn ol_cuEventDestroy(event: u64) -> u32 {
 #[no_mangle]
 pub extern "C" fn ol_cuEventRecord(event: u64, stream: u64) -> u32 {
     let client = get_client();
-    // Validate event handle
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_event = match client.handles.events.to_remote(event) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        // Payload: [8B remote_event][8B remote_stream]
+        let mut payload = [0u8; 16];
+        payload[0..8].copy_from_slice(&remote_event.to_le_bytes());
+        payload[8..16].copy_from_slice(&remote_stream.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::EventRecord, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate event handle
     if client.handles.events.to_remote(event).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -905,6 +1081,21 @@ pub extern "C" fn ol_cuEventRecord(event: u64, stream: u64) -> u32 {
 #[no_mangle]
 pub extern "C" fn ol_cuEventSynchronize(event: u64) -> u32 {
     let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_event = match client.handles.events.to_remote(event) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_event.to_le_bytes();
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::EventSynchronize, &payload)
+        {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle
     if client.handles.events.to_remote(event).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -920,12 +1111,49 @@ pub extern "C" fn ol_cuModuleGetGlobal(
     dptr: *mut u64,
     size: *mut usize,
     module: u64,
-    _name: *const u8,
-    _name_len: usize,
+    name: *const u8,
+    name_len: usize,
 ) -> u32 {
     let client = get_client();
     if dptr.is_null() || size.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_module = match client.handles.modules.to_remote(module) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        if !name.is_null() && name_len > 0 {
+            let name_bytes = unsafe { std::slice::from_raw_parts(name, name_len) };
+            // Payload: [8B remote_module][4B name_len u32 LE][name bytes]
+            let mut payload = Vec::with_capacity(12 + name_len);
+            payload.extend_from_slice(&remote_module.to_le_bytes());
+            payload.extend_from_slice(&(name_len as u32).to_le_bytes());
+            payload.extend_from_slice(name_bytes);
+            if let Ok((_hdr, resp)) =
+                client.send_request(MessageType::ModuleGetGlobal, &payload)
+            {
+                let result = parse_result(&resp);
+                if result != CUDA_SUCCESS {
+                    return result;
+                }
+                // Response: 4B result + 8B devptr + 8B size
+                if resp.len() >= 20 {
+                    let remote_dptr =
+                        u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                    let global_size =
+                        u64::from_le_bytes(resp[12..20].try_into().unwrap()) as usize;
+                    let synthetic = client.handles.device_ptrs.insert(remote_dptr);
+                    unsafe {
+                        *dptr = synthetic;
+                        *size = global_size;
+                    }
+                    return CUDA_SUCCESS;
+                }
+            }
+        }
+        // Transport error or null name -- fall through to stub
     }
     // Validate that the module handle exists
     if client.handles.modules.to_remote(module).is_none() {
@@ -948,7 +1176,23 @@ pub extern "C" fn ol_cuModuleGetGlobal(
 #[no_mangle]
 pub extern "C" fn ol_cuStreamQuery(stream: u64) -> u32 {
     let client = get_client();
-    // Validate handle (stream 0 = default stream, always valid)
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        let payload = remote_stream.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::StreamQuery, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle (stream 0 = default stream, always valid)
     if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -965,6 +1209,36 @@ pub extern "C" fn ol_cuEventElapsedTime(ms: *mut f32, start: u64, end: u64) -> u
     if ms.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_start = match client.handles.events.to_remote(start) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_end = match client.handles.events.to_remote(end) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        // Payload: [8B remote_start][8B remote_end]
+        let mut payload = [0u8; 16];
+        payload[0..8].copy_from_slice(&remote_start.to_le_bytes());
+        payload[8..16].copy_from_slice(&remote_end.to_le_bytes());
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::EventElapsedTime, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            // Response: 4B result + 4B f32 ms
+            if resp.len() >= 8 {
+                let elapsed = f32::from_le_bytes(resp[4..8].try_into().unwrap());
+                unsafe { *ms = elapsed };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
     // Validate both event handles
     if client.handles.events.to_remote(start).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
@@ -980,6 +1254,19 @@ pub extern "C" fn ol_cuEventElapsedTime(ms: *mut f32, start: u64, end: u64) -> u
 #[no_mangle]
 pub extern "C" fn ol_cuEventQuery(event: u64) -> u32 {
     let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_event = match client.handles.events.to_remote(event) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_event.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::EventQuery, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle
     if client.handles.events.to_remote(event).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -993,19 +1280,51 @@ pub extern "C" fn ol_cuEventQuery(event: u64) -> u32 {
 #[no_mangle]
 pub extern "C" fn ol_cuLaunchKernel(
     func: u64,
-    _grid_x: u32,
-    _grid_y: u32,
-    _grid_z: u32,
-    _block_x: u32,
-    _block_y: u32,
-    _block_z: u32,
-    _shared_mem: u32,
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
+    shared_mem: u32,
     stream: u64,
     _params: *mut *mut std::ffi::c_void,
     _extra: *mut *mut std::ffi::c_void,
 ) -> u32 {
     let client = get_client();
-    // Validate function handle
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        // Payload: [8B func][4B gridX][4B gridY][4B gridZ][4B blockX][4B blockY][4B blockZ][4B sharedMem][8B stream]
+        // = 44 bytes header, then params bytes (empty for now, Phase 1 does not serialize kernel params)
+        let mut payload = Vec::with_capacity(44);
+        payload.extend_from_slice(&remote_func.to_le_bytes());
+        payload.extend_from_slice(&grid_x.to_le_bytes());
+        payload.extend_from_slice(&grid_y.to_le_bytes());
+        payload.extend_from_slice(&grid_z.to_le_bytes());
+        payload.extend_from_slice(&block_x.to_le_bytes());
+        payload.extend_from_slice(&block_y.to_le_bytes());
+        payload.extend_from_slice(&block_z.to_le_bytes());
+        payload.extend_from_slice(&shared_mem.to_le_bytes());
+        payload.extend_from_slice(&remote_stream.to_le_bytes());
+        // TODO(Phase 2): serialize kernel params from _params/_extra
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::LaunchKernel, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate function handle
     if client.handles.functions.to_remote(func).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }

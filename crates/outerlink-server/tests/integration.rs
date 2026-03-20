@@ -416,3 +416,363 @@ async fn test_init_e2e() {
     drop(client);
     server.await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Module / Stream / Event / Kernel E2E tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_module_load_data_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // Send ModuleLoadData with dummy PTX bytes.
+    let ptx = b"fake ptx data for e2e test";
+    let (_hdr, payload) = roundtrip(&client, MessageType::ModuleLoadData, ptx, 1).await;
+
+    let data = assert_success(&payload);
+    let module_handle = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_ne!(module_handle, 0, "module handle should be non-zero");
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_module_get_function_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Load a module.
+    let ptx = b"fake ptx";
+    let (_hdr, payload) = roundtrip(&client, MessageType::ModuleLoadData, ptx, 1).await;
+    let data = assert_success(&payload);
+    let module_handle = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Get function: [8B module_handle][4B name_len][name bytes]
+    let name = b"my_kernel";
+    let mut get_func_payload = module_handle.to_le_bytes().to_vec();
+    get_func_payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    get_func_payload.extend_from_slice(name);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleGetFunction, &get_func_payload, 2).await;
+
+    let data = assert_success(&payload);
+    let func_handle = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_ne!(func_handle, 0, "function handle should be non-zero");
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_module_unload_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Load a module.
+    let ptx = b"fake ptx";
+    let (_hdr, payload) = roundtrip(&client, MessageType::ModuleLoadData, ptx, 1).await;
+    let data = assert_success(&payload);
+    let module_handle = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Unload the module.
+    let unload_payload = module_handle.to_le_bytes();
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleUnload, &unload_payload, 2).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "ModuleUnload should succeed"
+    );
+
+    // 3. Try to get a function from the unloaded module -- should fail.
+    let name = b"my_kernel";
+    let mut get_func_payload = module_handle.to_le_bytes().to_vec();
+    get_func_payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    get_func_payload.extend_from_slice(name);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleGetFunction, &get_func_payload, 3).await;
+    let result = response_result(&payload);
+    assert_eq!(
+        result,
+        CuResult::InvalidValue,
+        "ModuleGetFunction on unloaded module should return InvalidValue"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_module_get_global_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Load a module.
+    let ptx = b"fake ptx";
+    let (_hdr, payload) = roundtrip(&client, MessageType::ModuleLoadData, ptx, 1).await;
+    let data = assert_success(&payload);
+    let module_handle = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Get global: [8B module][4B name_len][name bytes]
+    let name = b"my_global";
+    let mut get_global_payload = module_handle.to_le_bytes().to_vec();
+    get_global_payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    get_global_payload.extend_from_slice(name);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleGetGlobal, &get_global_payload, 2).await;
+
+    let data = assert_success(&payload);
+    let devptr = u64::from_le_bytes(data[..8].try_into().unwrap());
+    let size = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+    assert_ne!(devptr, 0, "global devptr should be non-zero");
+    assert!(size > 0, "global size should be > 0");
+
+    // 3. Verify the allocation is usable: MemcpyHtoD then MemcpyDtoH.
+    let test_data = vec![0xABu8; size];
+    let mut htod_payload = devptr.to_le_bytes().to_vec();
+    htod_payload.extend_from_slice(&test_data);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemcpyHtoD, &htod_payload, 3).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "MemcpyHtoD to global pointer should succeed"
+    );
+
+    let mut dtoh_payload = devptr.to_le_bytes().to_vec();
+    dtoh_payload.extend_from_slice(&(size as u64).to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemcpyDtoH, &dtoh_payload, 4).await;
+    let data = assert_success(&payload);
+    assert_eq!(
+        data, &test_data[..],
+        "data read back from global should match what was written"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_stream_lifecycle_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Create a stream (flags=0).
+    let create_payload = 0_u32.to_le_bytes();
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::StreamCreate, &create_payload, 1).await;
+    let data = assert_success(&payload);
+    let stream = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_ne!(stream, 0, "stream handle should be non-zero");
+
+    // 2. Synchronize the stream.
+    let stream_payload = stream.to_le_bytes();
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::StreamSynchronize, &stream_payload, 2).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "StreamSynchronize should succeed"
+    );
+
+    // 3. Query the stream.
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::StreamQuery, &stream_payload, 3).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "StreamQuery should succeed"
+    );
+
+    // 4. Destroy the stream.
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::StreamDestroy, &stream_payload, 4).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "StreamDestroy should succeed"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_event_lifecycle_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Create two events (flags=0).
+    let flags_payload = 0_u32.to_le_bytes();
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::EventCreate, &flags_payload, 1).await;
+    let data = assert_success(&payload);
+    let event1 = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_ne!(event1, 0, "event1 handle should be non-zero");
+
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::EventCreate, &flags_payload, 2).await;
+    let data = assert_success(&payload);
+    let event2 = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_ne!(event2, 0, "event2 handle should be non-zero");
+
+    // 2. Record event1 on default stream (stream=0).
+    let mut record_payload = event1.to_le_bytes().to_vec();
+    record_payload.extend_from_slice(&0_u64.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::EventRecord, &record_payload, 3).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "EventRecord for event1 should succeed"
+    );
+
+    // 3. Record event2 on default stream (stream=0).
+    let mut record_payload = event2.to_le_bytes().to_vec();
+    record_payload.extend_from_slice(&0_u64.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::EventRecord, &record_payload, 4).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "EventRecord for event2 should succeed"
+    );
+
+    // 4. Get elapsed time between event1 and event2.
+    let mut elapsed_payload = event1.to_le_bytes().to_vec();
+    elapsed_payload.extend_from_slice(&event2.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::EventElapsedTime, &elapsed_payload, 5).await;
+    let data = assert_success(&payload);
+    let ms = f32::from_le_bytes(data[..4].try_into().unwrap());
+    assert!(
+        ms >= 0.0,
+        "elapsed time should be non-negative, got {ms}"
+    );
+
+    // 5. Destroy both events.
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::EventDestroy, &event1.to_le_bytes(), 6).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "EventDestroy for event1 should succeed"
+    );
+
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::EventDestroy, &event2.to_le_bytes(), 7).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "EventDestroy for event2 should succeed"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_launch_kernel_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Load module.
+    let ptx = b"fake ptx";
+    let (_hdr, payload) = roundtrip(&client, MessageType::ModuleLoadData, ptx, 1).await;
+    let data = assert_success(&payload);
+    let module = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Get function.
+    let name = b"my_kernel";
+    let mut func_payload = module.to_le_bytes().to_vec();
+    func_payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    func_payload.extend_from_slice(name);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleGetFunction, &func_payload, 2).await;
+    let data = assert_success(&payload);
+    let func = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 3. Create a stream.
+    let create_stream_payload = 0_u32.to_le_bytes();
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::StreamCreate, &create_stream_payload, 3).await;
+    let data = assert_success(&payload);
+    let stream = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 4. Launch kernel:
+    // [8B func][4B gx=1][4B gy=1][4B gz=1][4B bx=32][4B by=1][4B bz=1][4B smem=0][8B stream]
+    let mut launch_payload = func.to_le_bytes().to_vec();
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // gridX
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // gridY
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // gridZ
+    launch_payload.extend_from_slice(&32_u32.to_le_bytes()); // blockX
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // blockY
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // blockZ
+    launch_payload.extend_from_slice(&0_u32.to_le_bytes()); // sharedMem
+    launch_payload.extend_from_slice(&stream.to_le_bytes()); // stream
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::LaunchKernel, &launch_payload, 4).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "LaunchKernel should succeed"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_ctx_session_persistence_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Create a context (flags=0, device=0).
+    let mut ctx_create_payload = 0_u32.to_le_bytes().to_vec();
+    ctx_create_payload.extend_from_slice(&0_i32.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxCreate, &ctx_create_payload, 1).await;
+    let data = assert_success(&payload);
+    let ctx_handle = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_ne!(ctx_handle, 0, "context handle should be non-zero");
+
+    // 2. CtxGetCurrent should return the same handle (session persistence).
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::CtxGetCurrent, &[], 2).await;
+    let data = assert_success(&payload);
+    let current_ctx = u64::from_le_bytes(data[..8].try_into().unwrap());
+    assert_eq!(
+        current_ctx, ctx_handle,
+        "CtxGetCurrent should return the handle from CtxCreate (session persistence)"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}
