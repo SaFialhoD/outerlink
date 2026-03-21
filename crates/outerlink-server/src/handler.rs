@@ -495,8 +495,9 @@ pub fn handle_request(
         // --- Kernel launch ---
 
         MessageType::LaunchKernel => {
-            // 8B func + 4*3B grid + 4*3B block + 4B shared_mem + 8B stream + 4B num_params = 48 bytes minimum
-            if payload.len() < 48 {
+            // 8B func + 3x4B grid + 3x4B block + 4B shared_mem + 8B stream = 44 bytes minimum
+            // The params slice starts at byte 44 and may be empty (zero-parameter kernel).
+            if payload.len() < 44 {
                 return error_response(rid, CuResult::InvalidValue);
             }
             let func = u64::from_le_bytes(payload[..8].try_into().unwrap());
@@ -1368,7 +1369,7 @@ mod tests {
         payload.extend_from_slice(&e2.to_le_bytes());
         let hdr = req(MessageType::EventElapsedTime, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr,&payload);
-        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+        assert_eq!(response_result(&resp), CuResult::NotReady);
     }
 
     #[test]

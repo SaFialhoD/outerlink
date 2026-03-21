@@ -307,7 +307,7 @@ impl ConnectionSession {
 
         self.current_ctx = 0;
 
-        tracing::info!(
+        tracing::debug!(
             succeeded = report.succeeded,
             failed = report.failed,
             "session cleanup complete"

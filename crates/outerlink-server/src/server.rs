@@ -90,6 +90,8 @@ impl Server {
                 // a new connection when shutdown is already pending.
                 biased;
 
+                // Either shutdown was signalled (Ok), or the server dropped
+                // the sender (Err(RecvError)).  Either way, stop accepting.
                 _ = shutdown_rx.changed() => {
                     tracing::info!("shutdown signal received, stopping accept loop");
                     break;
@@ -209,6 +211,8 @@ async fn handle_connection_loop(
     loop {
         // Wait for either a new message or a shutdown signal.
         let msg = tokio::select! {
+            // Either shutdown was signalled, or the server dropped the sender.
+            // Either way, stop serving this connection.
             _ = shutdown_rx.changed() => {
                 tracing::debug!("connection received shutdown signal, finishing");
                 return Ok(());

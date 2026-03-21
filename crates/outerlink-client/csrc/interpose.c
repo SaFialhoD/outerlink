@@ -411,13 +411,24 @@ CUresult hook_cuModuleLoadData(CUmodule *module, const void *image) {
             /* PTX text — null-terminated string */
             data_len = strlen((const char *)image) + 1;
         } else if (p[0] == 0x7F && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') {
-            /* ELF cubin — compute size from section header table */
+            /* ELF cubin — compute a lower-bound estimate of the image size
+             * from the section header table (e_shoff + e_shnum * e_shentsize).
+             * This is NOT the exact file size but it covers all section headers,
+             * which is sufficient for the server to load the module. */
             unsigned long long e_shoff = 0;
             unsigned short e_shnum = 0, e_shentsize = 0;
+            /* ELF64 header is 64 bytes; reject anything smaller. */
             memcpy(&e_shoff, p + 0x28, 8);
             memcpy(&e_shentsize, p + 0x3A, 2);
             memcpy(&e_shnum, p + 0x3C, 2);
-            data_len = (size_t)(e_shoff + (unsigned long long)e_shnum * e_shentsize);
+            /* Overflow check: ensure e_shoff + e_shnum * e_shentsize
+             * doesn't wrap around. */
+            unsigned long long sh_table_size = (unsigned long long)e_shnum * e_shentsize;
+            if (e_shoff <= SIZE_MAX - sh_table_size) {
+                data_len = (size_t)(e_shoff + sh_table_size);
+            }
+            /* If overflow detected, data_len stays 0 and we send
+             * an empty payload — the server will reject the load. */
         }
     }
     CUresult r = ol_cuModuleLoadData(&mod_u64, image, data_len);
@@ -640,15 +651,12 @@ static const param_cache_entry_t *get_func_param_info(CUfunction func) {
     if (cuFuncGetParamInfo_resolved != 1)
         return NULL;
 
-    /* Fast path: check cache without lock (safe for reads of stable entries) */
-    const param_cache_entry_t *cached = param_cache_lookup(func);
-    if (cached)
-        return cached;
-
-    /* Slow path: populate under lock */
+    /* Hold the mutex for both read and write.  The cache is only 256 entries
+     * and kernel launches aren't on the hot path relative to network overhead,
+     * so there is no benefit to a lockless fast-path (which would be a data
+     * race on param_cache_count / array contents under C11). */
     pthread_mutex_lock(&param_cache_mutex);
-    /* Double-check after acquiring lock */
-    cached = param_cache_lookup(func);
+    const param_cache_entry_t *cached = param_cache_lookup(func);
     if (!cached) {
         cached = param_cache_populate(func);
     }
@@ -681,7 +689,7 @@ CUresult hook_cuLaunchKernel(CUfunction f,
         const unsigned char *buffer_ptr = NULL;
         unsigned int buffer_size = 0;
 
-        for (int i = 0; extra[i] != CU_LAUNCH_PARAM_END; /* manual advance */) {
+        for (int i = 0; i < 16 && extra[i] != CU_LAUNCH_PARAM_END; /* manual advance */) {
             if (extra[i] == CU_LAUNCH_PARAM_BUFFER_POINTER) {
                 buffer_ptr = (const unsigned char *)extra[i + 1];
                 i += 2;

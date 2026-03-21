@@ -606,7 +606,7 @@ impl GpuBackend for StubGpuBackend {
         let start_ev = state.events.get(&start).ok_or(CuResult::InvalidValue)?;
         let end_ev = state.events.get(&end).ok_or(CuResult::InvalidValue)?;
         if !start_ev.recorded || !end_ev.recorded {
-            return Err(CuResult::InvalidValue);
+            return Err(CuResult::NotReady);
         }
         if end_ev.timestamp_ns < start_ev.timestamp_ns {
             return Err(CuResult::InvalidValue);
@@ -1183,8 +1183,8 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let e1 = gpu.event_create(0).unwrap();
         let e2 = gpu.event_create(0).unwrap();
-        // Neither recorded yet.
-        assert_eq!(gpu.event_elapsed_time(e1, e2), Err(CuResult::InvalidValue));
+        // Neither recorded yet — CUDA spec says NotReady.
+        assert_eq!(gpu.event_elapsed_time(e1, e2), Err(CuResult::NotReady));
     }
 
     #[test]

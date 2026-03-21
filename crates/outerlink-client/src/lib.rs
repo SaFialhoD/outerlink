@@ -192,7 +192,7 @@ impl OuterLinkClient {
 
             match self.connect() {
                 Ok(()) => {
-                    self.connected.store(true, Ordering::SeqCst);
+                    // Note: connect() already sets connected=true with Release ordering.
                     tracing::info!(
                         addr = %self.server_addr,
                         attempt = attempt + 1,
