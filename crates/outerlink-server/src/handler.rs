@@ -318,7 +318,12 @@ pub fn handle_request(
             }
             let device = i32::from_le_bytes(payload[..4].try_into().unwrap());
             match backend.primary_ctx_release(device) {
-                Ok(()) => result_only(rid, CuResult::Success),
+                Ok(()) => {
+                    // Untrack: this session no longer claims this device's primary context.
+                    // If another session also retained it, the backend refcount handles that.
+                    session.untrack_primary_ctx(device);
+                    result_only(rid, CuResult::Success)
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -357,10 +362,10 @@ pub fn handle_request(
             }
             let device = i32::from_le_bytes(payload[..4].try_into().unwrap());
             match backend.primary_ctx_reset(device) {
-                Ok(old_ctx) => {
-                    if old_ctx.is_some() {
-                        session.untrack_primary_ctx(device);
-                    }
+                Ok(_old_ctx) => {
+                    // Always untrack regardless of old_ctx — real CudaGpuBackend
+                    // returns None since CUDA doesn't expose the old handle.
+                    session.untrack_primary_ctx(device);
                     result_only(rid, CuResult::Success)
                 }
                 Err(e) => error_response(rid, e),

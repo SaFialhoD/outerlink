@@ -730,7 +730,7 @@ CUresult hook_cuLaunchKernel(CUfunction f,
         const unsigned char *buffer_ptr = NULL;
         unsigned int buffer_size = 0;
 
-        for (int i = 0; i < 16 && extra[i] != CU_LAUNCH_PARAM_END; /* manual advance */) {
+        for (int i = 0; i < 14 && extra[i] != CU_LAUNCH_PARAM_END; /* manual advance */) {
             if (extra[i] == CU_LAUNCH_PARAM_BUFFER_POINTER) {
                 buffer_ptr = (const unsigned char *)extra[i + 1];
                 i += 2;

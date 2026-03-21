@@ -243,7 +243,7 @@ impl ConnectionSession {
         for event in self.events.drain() {
             match backend.event_destroy(event) {
                 Ok(()) => {
-                    tracing::info!(handle = event, "session cleanup: destroyed event");
+                    tracing::debug!(handle = event, "session cleanup: destroyed event");
                     report.succeeded += 1;
                 }
                 Err(e) => {
@@ -257,7 +257,7 @@ impl ConnectionSession {
         for stream in self.streams.drain() {
             match backend.stream_destroy(stream) {
                 Ok(()) => {
-                    tracing::info!(handle = stream, "session cleanup: destroyed stream");
+                    tracing::debug!(handle = stream, "session cleanup: destroyed stream");
                     report.succeeded += 1;
                 }
                 Err(e) => {
@@ -271,7 +271,7 @@ impl ConnectionSession {
         for module in self.modules.drain() {
             match backend.module_unload(module) {
                 Ok(()) => {
-                    tracing::info!(handle = module, "session cleanup: unloaded module");
+                    tracing::debug!(handle = module, "session cleanup: unloaded module");
                     report.succeeded += 1;
                 }
                 Err(e) => {
@@ -285,7 +285,7 @@ impl ConnectionSession {
         for ptr in self.mem_allocations.drain() {
             match backend.mem_free(ptr) {
                 Ok(()) => {
-                    tracing::info!(ptr = ptr, "session cleanup: freed device memory");
+                    tracing::debug!(ptr = ptr, "session cleanup: freed device memory");
                     report.succeeded += 1;
                 }
                 Err(e) => {
@@ -299,7 +299,7 @@ impl ConnectionSession {
         for ptr in self.host_allocations.drain() {
             match backend.mem_free_host(ptr) {
                 Ok(()) => {
-                    tracing::info!(ptr = ptr, "session cleanup: freed host memory");
+                    tracing::debug!(ptr = ptr, "session cleanup: freed host memory");
                     report.succeeded += 1;
                 }
                 Err(e) => {
@@ -314,7 +314,7 @@ impl ConnectionSession {
             self.contexts.remove(&ctx_handle);
             match backend.primary_ctx_release(device) {
                 Ok(()) => {
-                    tracing::info!(device, handle = ctx_handle, "session cleanup: released primary ctx");
+                    tracing::debug!(device, handle = ctx_handle, "session cleanup: released primary ctx");
                     report.succeeded += 1;
                 }
                 Err(e) => {
@@ -328,7 +328,7 @@ impl ConnectionSession {
         for ctx in self.contexts.drain() {
             match backend.ctx_destroy(ctx) {
                 Ok(()) => {
-                    tracing::info!(handle = ctx, "session cleanup: destroyed context");
+                    tracing::debug!(handle = ctx, "session cleanup: destroyed context");
                     report.succeeded += 1;
                 }
                 Err(e) => {
