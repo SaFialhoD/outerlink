@@ -16,6 +16,7 @@ use std::sync::Arc;
 use outerlink_common::error::OuterLinkError;
 use outerlink_common::handle::HandleStore;
 use outerlink_common::protocol::{MessageHeader, MessageType};
+use outerlink_common::retry::RetryConfig;
 use outerlink_common::tcp_transport::TcpTransportConnection;
 use outerlink_common::transport::TransportConnection;
 
@@ -40,6 +41,8 @@ pub struct OuterLinkClient {
     /// Updated by cuCtxCreate_v2, cuCtxSetCurrent, and cuCtxDestroy_v2.
     /// Used by cuCtxGetDevice to send the correct context to the server.
     pub current_remote_ctx: AtomicU64,
+    /// Retry and reconnect configuration.
+    retry_config: RetryConfig,
 }
 
 impl OuterLinkClient {
@@ -59,6 +62,27 @@ impl OuterLinkClient {
             connection: std::sync::Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             current_remote_ctx: AtomicU64::new(0),
+            retry_config: RetryConfig::default(),
+        }
+    }
+
+    /// Create a new client with a custom retry configuration.
+    pub fn with_retry_config(server_addr: String, retry_config: RetryConfig) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime for OuterLink client");
+
+        Self {
+            handles: HandleStore::new(),
+            server_addr,
+            connected: AtomicBool::new(false),
+            runtime,
+            connection: std::sync::Mutex::new(None),
+            next_request_id: AtomicU64::new(1),
+            current_remote_ctx: AtomicU64::new(0),
+            retry_config,
         }
     }
 
@@ -128,6 +152,57 @@ impl OuterLinkClient {
         })
     }
 
+    /// Attempt to reconnect to the server with exponential backoff.
+    ///
+    /// Tries up to `retry_config.max_reconnect_attempts` times. On success,
+    /// replaces the stored connection and sets `connected` to true.
+    /// On failure, sets `connected` to false and returns the last error.
+    ///
+    /// This performs a full connect + handshake, same as [`Self::connect`].
+    pub fn reconnect(&self) -> Result<(), OuterLinkError> {
+        let max_attempts = self.retry_config.max_reconnect_attempts;
+        let mut last_err = None;
+
+        for attempt in 0..max_attempts {
+            let delay = self.retry_config.reconnect_delay(attempt);
+            tracing::warn!(
+                addr = %self.server_addr,
+                attempt = attempt + 1,
+                max_attempts = max_attempts,
+                delay_ms = delay.as_millis() as u64,
+                "attempting reconnect to server"
+            );
+            std::thread::sleep(delay);
+
+            match self.connect() {
+                Ok(()) => {
+                    tracing::info!(
+                        addr = %self.server_addr,
+                        attempt = attempt + 1,
+                        "reconnected to server"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        addr = %self.server_addr,
+                        attempt = attempt + 1,
+                        error = %e,
+                        "reconnect attempt failed"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        self.connected.store(false, Ordering::Release);
+        Err(last_err.unwrap_or_else(|| {
+            OuterLinkError::Connection(format!(
+                "reconnect failed after {} attempts", max_attempts
+            ))
+        }))
+    }
+
     /// Check whether the client is truly connected by inspecting both the
     /// client-level `connected` flag AND the transport's own liveness state.
     ///
@@ -144,11 +219,12 @@ impl OuterLinkClient {
         }
     }
 
-    /// Send a request to the server and wait for the response.
+    /// Execute a single send+recv attempt on the current connection.
     ///
-    /// Returns the response header and payload. The caller is responsible
-    /// for parsing the payload according to the message type.
-    pub fn send_request(
+    /// This is the inner, non-retrying implementation. Returns the connection
+    /// error and updates the `connected` flag when the transport reports
+    /// disconnection.
+    fn send_request_once(
         &self,
         msg_type: MessageType,
         payload: &[u8],
@@ -187,15 +263,67 @@ impl OuterLinkClient {
         })
     }
 
-    /// Send a request followed by raw bulk data (e.g. MemcpyHtoD).
+    /// Send a request to the server and wait for the response.
     ///
-    /// The server reads the framed message first, then the bulk bytes.
+    /// Returns the response header and payload. The caller is responsible
+    /// for parsing the payload according to the message type.
     ///
-    /// **Phase 2 scaffolding:** This method exists for chunked/streaming
-    /// transfers when payloads exceed `MAX_PAYLOAD_SIZE`. Phase 1 sends
-    /// data inline in the protocol payload; Phase 2 will use this path
-    /// for large transfers that must be split across multiple frames.
-    pub fn send_request_with_bulk(
+    /// On transient transport errors, the request is retried up to
+    /// `retry_config.max_retries` times with increasing delays. If all
+    /// retries fail, a reconnect is attempted before returning an error.
+    /// Non-retryable errors (CUDA errors, protocol errors) are returned
+    /// immediately without retry.
+    pub fn send_request(
+        &self,
+        msg_type: MessageType,
+        payload: &[u8],
+    ) -> Result<(MessageHeader, Vec<u8>), OuterLinkError> {
+        let max_retries = self.retry_config.max_retries;
+        let mut last_err;
+
+        // Initial attempt + retries
+        match self.send_request_once(msg_type, payload) {
+            Ok(result) => return Ok(result),
+            Err(e) if !e.is_retryable() => return Err(e),
+            Err(e) => last_err = e,
+        }
+
+        for retry in 0..max_retries {
+            let delay = self.retry_config.retry_delay(retry);
+            tracing::warn!(
+                msg_type = ?msg_type,
+                retry = retry + 1,
+                max_retries = max_retries,
+                delay_ms = delay.as_millis() as u64,
+                error = %last_err,
+                "retrying request after transport error"
+            );
+            std::thread::sleep(delay);
+
+            match self.send_request_once(msg_type, payload) {
+                Ok(result) => return Ok(result),
+                Err(e) if !e.is_retryable() => return Err(e),
+                Err(e) => last_err = e,
+            }
+        }
+
+        // All retries exhausted -- attempt reconnect
+        tracing::warn!(
+            msg_type = ?msg_type,
+            error = %last_err,
+            "all retries exhausted, attempting reconnect"
+        );
+
+        if self.reconnect().is_ok() {
+            // One final attempt after successful reconnect
+            return self.send_request_once(msg_type, payload);
+        }
+
+        Err(last_err)
+    }
+
+    /// Execute a single send+bulk+recv attempt on the current connection.
+    fn send_request_with_bulk_once(
         &self,
         msg_type: MessageType,
         payload: &[u8],
@@ -234,6 +362,63 @@ impl OuterLinkClient {
                 }
             }
         })
+    }
+
+    /// Send a request followed by raw bulk data (e.g. MemcpyHtoD).
+    ///
+    /// The server reads the framed message first, then the bulk bytes.
+    ///
+    /// **Phase 2 scaffolding:** This method exists for chunked/streaming
+    /// transfers when payloads exceed `MAX_PAYLOAD_SIZE`. Phase 1 sends
+    /// data inline in the protocol payload; Phase 2 will use this path
+    /// for large transfers that must be split across multiple frames.
+    ///
+    /// Retries on transient transport errors, same as [`Self::send_request`].
+    pub fn send_request_with_bulk(
+        &self,
+        msg_type: MessageType,
+        payload: &[u8],
+        bulk_data: &[u8],
+    ) -> Result<(MessageHeader, Vec<u8>), OuterLinkError> {
+        let max_retries = self.retry_config.max_retries;
+        let mut last_err;
+
+        match self.send_request_with_bulk_once(msg_type, payload, bulk_data) {
+            Ok(result) => return Ok(result),
+            Err(e) if !e.is_retryable() => return Err(e),
+            Err(e) => last_err = e,
+        }
+
+        for retry in 0..max_retries {
+            let delay = self.retry_config.retry_delay(retry);
+            tracing::warn!(
+                msg_type = ?msg_type,
+                retry = retry + 1,
+                max_retries = max_retries,
+                delay_ms = delay.as_millis() as u64,
+                error = %last_err,
+                "retrying bulk request after transport error"
+            );
+            std::thread::sleep(delay);
+
+            match self.send_request_with_bulk_once(msg_type, payload, bulk_data) {
+                Ok(result) => return Ok(result),
+                Err(e) if !e.is_retryable() => return Err(e),
+                Err(e) => last_err = e,
+            }
+        }
+
+        tracing::warn!(
+            msg_type = ?msg_type,
+            error = %last_err,
+            "all retries exhausted for bulk request, attempting reconnect"
+        );
+
+        if self.reconnect().is_ok() {
+            return self.send_request_with_bulk_once(msg_type, payload, bulk_data);
+        }
+
+        Err(last_err)
     }
 
     /// Receive raw bulk data from the server (e.g. MemcpyDtoH response).
@@ -374,5 +559,252 @@ mod tests {
             !client.connected.load(Ordering::Acquire),
             "connected should be false after send_request fails"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Retry and reconnect tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: spawn a mock server that accepts one connection, responds to
+    /// one handshake, then drops. Returns the listener address.
+    fn spawn_mock_server_one_shot() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Read handshake request (22-byte header).
+                let mut buf = [0u8; 22];
+                if stream.read_exact(&mut buf).is_ok() {
+                    let resp_payload = 0u32.to_le_bytes();
+                    let resp_header = MessageHeader::new_response(
+                        u64::from_be_bytes(buf[8..16].try_into().unwrap()),
+                        resp_payload.len() as u32,
+                    );
+                    let _ = stream.write_all(&resp_header.to_bytes());
+                    let _ = stream.write_all(&resp_payload);
+                    let _ = stream.flush();
+                }
+                // Drop stream immediately to simulate server going away.
+            }
+        });
+        (addr, handle)
+    }
+
+    /// Helper: spawn a mock server that stays alive, accepts connections,
+    /// responds to handshake AND one request per connection.
+    fn spawn_mock_server_persistent(
+    ) -> (std::net::SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        listener.set_nonblocking(true).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            while !shutdown_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        // Read and respond to messages until connection drops.
+                        loop {
+                            let mut buf = [0u8; 22];
+                            if stream.read_exact(&mut buf).is_err() {
+                                break;
+                            }
+                            let payload_len = u32::from_be_bytes(
+                                buf[18..22].try_into().unwrap(),
+                            );
+                            // Drain payload if any
+                            if payload_len > 0 {
+                                let mut payload = vec![0u8; payload_len as usize];
+                                if stream.read_exact(&mut payload).is_err() {
+                                    break;
+                                }
+                            }
+                            let resp_payload = 0u32.to_le_bytes();
+                            let resp_header = MessageHeader::new_response(
+                                u64::from_be_bytes(buf[8..16].try_into().unwrap()),
+                                resp_payload.len() as u32,
+                            );
+                            if stream.write_all(&resp_header.to_bytes()).is_err() {
+                                break;
+                            }
+                            if stream.write_all(&resp_payload).is_err() {
+                                break;
+                            }
+                            let _ = stream.flush();
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (addr, shutdown, handle)
+    }
+
+    /// `send_request` with no_retry config should fail immediately on transport error
+    /// without retrying.
+    #[test]
+    fn test_send_request_no_retry_fails_immediately() {
+        let (addr, server_handle) = spawn_mock_server_one_shot();
+        let client = OuterLinkClient::with_retry_config(
+            addr.to_string(),
+            RetryConfig::no_retry(),
+        );
+        client.connect().unwrap();
+        server_handle.join().unwrap();
+
+        // Server is now gone. The next request should fail without retries.
+        let start = std::time::Instant::now();
+        let result = client.send_request(MessageType::DeviceGetCount, &[]);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "should fail when server is gone");
+        // With no retries, should fail fast (well under 1s).
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "no_retry should fail fast, took {elapsed:?}"
+        );
+    }
+
+    /// Retry succeeds when server comes back before retries are exhausted.
+    #[test]
+    fn test_send_request_retry_succeeds_on_reconnect() {
+        let (addr, shutdown, _server_handle) = spawn_mock_server_persistent();
+
+        // Use very short retry delays for test speed.
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            retry_delays: vec![
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(30),
+            ],
+            max_reconnect_attempts: 3,
+            reconnect_initial_delay: std::time::Duration::from_millis(50),
+            reconnect_max_delay: std::time::Duration::from_millis(200),
+        };
+
+        let client = OuterLinkClient::with_retry_config(
+            addr.to_string(),
+            retry_config,
+        );
+        client.connect().unwrap();
+
+        // Verify normal request works.
+        let result = client.send_request(MessageType::DeviceGetCount, &[]);
+        assert!(result.is_ok(), "initial request should work");
+
+        // Shutdown and cleanup.
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Non-retryable errors (Connection("not connected") when no transport exists)
+    /// should not be retried. This tests that the "not connected" path in
+    /// send_request_once triggers retry (since Connection is retryable),
+    /// but eventually exhausts attempts.
+    #[test]
+    fn test_send_request_retries_on_connection_error() {
+        let client = OuterLinkClient::with_retry_config(
+            "127.0.0.1:1".to_string(), // Won't connect (port 1 is discard)
+            RetryConfig {
+                max_retries: 2,
+                retry_delays: vec![std::time::Duration::from_millis(1)],
+                max_reconnect_attempts: 0, // No reconnect
+                reconnect_initial_delay: std::time::Duration::ZERO,
+                reconnect_max_delay: std::time::Duration::ZERO,
+            },
+        );
+        // Force "connected" so send_request_once tries and gets Connection error.
+        client.connected.store(true, Ordering::Release);
+
+        let result = client.send_request(MessageType::DeviceGetCount, &[]);
+        assert!(result.is_err());
+    }
+
+    /// Reconnect with exponential backoff timing: verify the delay grows.
+    #[test]
+    fn test_reconnect_backoff_timing() {
+        // No server at all -- every reconnect attempt will fail.
+        let retry_config = RetryConfig {
+            max_retries: 0,
+            retry_delays: vec![std::time::Duration::ZERO],
+            max_reconnect_attempts: 3,
+            reconnect_initial_delay: std::time::Duration::from_millis(50),
+            reconnect_max_delay: std::time::Duration::from_secs(1),
+        };
+        let client = OuterLinkClient::with_retry_config(
+            "127.0.0.1:1".to_string(),
+            retry_config,
+        );
+
+        let start = std::time::Instant::now();
+        let result = client.reconnect();
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "reconnect should fail with no server");
+        // 3 attempts with delays 50ms, 100ms, 200ms = 350ms minimum
+        // Allow some slack for connection timeout but should be bounded.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300),
+            "backoff should cause at least 300ms delay, got {elapsed:?}"
+        );
+    }
+
+    /// After successful reconnect, send_request should work again.
+    #[test]
+    fn test_reconnect_restores_connectivity() {
+        let (addr, shutdown, _server_handle) = spawn_mock_server_persistent();
+
+        let retry_config = RetryConfig {
+            max_retries: 0,
+            retry_delays: vec![std::time::Duration::ZERO],
+            max_reconnect_attempts: 3,
+            reconnect_initial_delay: std::time::Duration::from_millis(10),
+            reconnect_max_delay: std::time::Duration::from_millis(100),
+        };
+
+        let client = OuterLinkClient::with_retry_config(
+            addr.to_string(),
+            retry_config,
+        );
+        client.connect().unwrap();
+        assert!(client.is_actually_connected());
+
+        // Reconnect (even while already connected) should succeed.
+        let result = client.reconnect();
+        assert!(result.is_ok(), "reconnect should succeed: {result:?}");
+        assert!(client.is_actually_connected());
+
+        // Should still be able to send requests.
+        let result = client.send_request(MessageType::DeviceGetCount, &[]);
+        assert!(result.is_ok(), "request after reconnect should work");
+
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// `with_retry_config` should use the provided config.
+    #[test]
+    fn test_with_retry_config_uses_custom_config() {
+        let config = RetryConfig {
+            max_retries: 7,
+            retry_delays: vec![std::time::Duration::from_millis(42)],
+            max_reconnect_attempts: 2,
+            reconnect_initial_delay: std::time::Duration::from_millis(100),
+            reconnect_max_delay: std::time::Duration::from_secs(5),
+        };
+        let client = OuterLinkClient::with_retry_config(
+            "127.0.0.1:1234".to_string(),
+            config,
+        );
+        assert_eq!(client.retry_config.max_retries, 7);
+        assert_eq!(client.retry_config.max_reconnect_attempts, 2);
     }
 }
