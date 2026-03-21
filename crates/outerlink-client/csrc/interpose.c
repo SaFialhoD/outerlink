@@ -103,6 +103,16 @@ static const hook_entry_t hook_table[] = {
     { "cuCtxGetDevice",          (void *)hook_cuCtxGetDevice },
     { "cuCtxSynchronize",        (void *)hook_cuCtxSynchronize },
 
+    /* Primary context */
+    { "cuDevicePrimaryCtxRetain",       (void *)hook_cuDevicePrimaryCtxRetain },
+    { "cuDevicePrimaryCtxRelease",      (void *)hook_cuDevicePrimaryCtxRelease_v2 },
+    { "cuDevicePrimaryCtxRelease_v2",   (void *)hook_cuDevicePrimaryCtxRelease_v2 },
+    { "cuDevicePrimaryCtxGetState",     (void *)hook_cuDevicePrimaryCtxGetState },
+    { "cuDevicePrimaryCtxSetFlags",     (void *)hook_cuDevicePrimaryCtxSetFlags_v2 },
+    { "cuDevicePrimaryCtxSetFlags_v2",  (void *)hook_cuDevicePrimaryCtxSetFlags_v2 },
+    { "cuDevicePrimaryCtxReset",        (void *)hook_cuDevicePrimaryCtxReset_v2 },
+    { "cuDevicePrimaryCtxReset_v2",     (void *)hook_cuDevicePrimaryCtxReset_v2 },
+
     /* Memory */
     { "cuMemAlloc_v2",           (void *)hook_cuMemAlloc_v2 },
     { "cuMemFree_v2",            (void *)hook_cuMemFree_v2 },
@@ -307,6 +317,37 @@ CUresult hook_cuCtxGetDevice(CUdevice *dev) {
 CUresult hook_cuCtxSynchronize(void) {
     ensure_init();
     return ol_cuCtxSynchronize();
+}
+
+/* -- Primary context -- */
+
+CUresult hook_cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
+    ensure_init();
+    unsigned long long ctx_u64 = 0;
+    CUresult r = ol_cuDevicePrimaryCtxRetain(&ctx_u64, dev);
+    if (r == CUDA_SUCCESS && pctx)
+        *pctx = (CUcontext)(uintptr_t)ctx_u64;
+    return r;
+}
+
+CUresult hook_cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
+    ensure_init();
+    return ol_cuDevicePrimaryCtxRelease(dev);
+}
+
+CUresult hook_cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int *flags, int *active) {
+    ensure_init();
+    return ol_cuDevicePrimaryCtxGetState(dev, flags, active);
+}
+
+CUresult hook_cuDevicePrimaryCtxSetFlags_v2(CUdevice dev, unsigned int flags) {
+    ensure_init();
+    return ol_cuDevicePrimaryCtxSetFlags(dev, flags);
+}
+
+CUresult hook_cuDevicePrimaryCtxReset_v2(CUdevice dev) {
+    ensure_init();
+    return ol_cuDevicePrimaryCtxReset(dev);
 }
 
 /* -- Memory -- */

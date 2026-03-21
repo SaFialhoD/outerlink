@@ -9,7 +9,7 @@
 //! resource allocated by the connection so they can be cleaned up when the
 //! connection drops (gracefully or not).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use outerlink_common::cuda_types::CuResult;
 use crate::gpu_backend::GpuBackend;
@@ -39,6 +39,8 @@ pub struct ConnectionSession {
     streams: HashSet<u64>,
     /// CUDA events created by this session.
     events: HashSet<u64>,
+    /// Primary contexts retained by this session: device -> ctx_handle.
+    primary_ctxs: HashMap<i32, u64>,
 }
 
 impl ConnectionSession {
@@ -52,6 +54,7 @@ impl ConnectionSession {
             modules: HashSet::new(),
             streams: HashSet::new(),
             events: HashSet::new(),
+            primary_ctxs: HashMap::new(),
         }
     }
 
@@ -159,6 +162,21 @@ impl ConnectionSession {
     /// Remove `event` from this session's tracked events.
     pub fn untrack_event(&mut self, event: u64) {
         self.events.remove(&event);
+    }
+
+    /// Record that this session retained a primary context for `device`.
+    /// Also tracks it as a regular context for current_ctx purposes.
+    pub fn track_primary_ctx(&mut self, device: i32, ctx: u64) {
+        self.primary_ctxs.insert(device, ctx);
+        self.contexts.insert(ctx);
+    }
+
+    /// Remove primary context tracking for `device`.
+    /// Also removes from the regular context set.
+    pub fn untrack_primary_ctx(&mut self, device: i32) {
+        if let Some(ctx) = self.primary_ctxs.remove(&device) {
+            self.contexts.remove(&ctx);
+        }
     }
 
     // --- Resource queries ---
@@ -291,7 +309,22 @@ impl ConnectionSession {
             }
         }
 
-        // 6. Contexts (last)
+        // 6a. Primary contexts (release before regular ctx destroy)
+        for (device, ctx_handle) in self.primary_ctxs.drain() {
+            self.contexts.remove(&ctx_handle);
+            match backend.primary_ctx_release(device) {
+                Ok(()) => {
+                    tracing::info!(device, handle = ctx_handle, "session cleanup: released primary ctx");
+                    report.succeeded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(device, error = ?e, "session cleanup: failed to release primary ctx");
+                    report.failed += 1;
+                }
+            }
+        }
+
+        // 6b. Contexts (remaining after primary removal)
         for ctx in self.contexts.drain() {
             match backend.ctx_destroy(ctx) {
                 Ok(()) => {
@@ -631,5 +664,67 @@ mod tests {
         let report = session.cleanup(&backend);
         assert_eq!(report.failed, 1);
         assert_eq!(report.succeeded, 0);
+    }
+
+    // --- Primary context tracking tests ---
+
+    #[test]
+    fn test_track_primary_ctx() {
+        let mut session = ConnectionSession::new();
+        session.track_primary_ctx(0, 0xC001);
+        assert_eq!(session.context_count(), 1);
+    }
+
+    #[test]
+    fn test_untrack_primary_ctx() {
+        let mut session = ConnectionSession::new();
+        session.track_primary_ctx(0, 0xC001);
+        session.untrack_primary_ctx(0);
+        assert_eq!(session.context_count(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_releases_primary_ctx() {
+        let backend = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Retain a primary context via the backend.
+        let ctx = backend.primary_ctx_retain(0).unwrap();
+        session.track_primary_ctx(0, ctx);
+
+        // Verify it is active.
+        let (_, active) = backend.primary_ctx_get_state(0).unwrap();
+        assert_eq!(active, 1);
+
+        // Cleanup should release the primary context.
+        let report = session.cleanup(&backend);
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(session.total_tracked_resources(), 0);
+
+        // Verify context was released (inactive now).
+        let (_, active) = backend.primary_ctx_get_state(0).unwrap();
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn test_cleanup_primary_ctx_does_not_double_destroy() {
+        let backend = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Retain primary ctx and also create a regular context.
+        let pctx = backend.primary_ctx_retain(0).unwrap();
+        session.track_primary_ctx(0, pctx);
+
+        let rctx = backend.ctx_create(0, 0).unwrap();
+        session.track_context(rctx);
+
+        // Session has 2 contexts tracked (primary + regular).
+        assert_eq!(session.context_count(), 2);
+
+        let report = session.cleanup(&backend);
+        // Primary ctx released (1 success) + regular ctx destroyed (1 success) = 2
+        assert_eq!(report.succeeded, 2);
+        assert_eq!(report.failed, 0);
     }
 }

@@ -186,6 +186,30 @@ pub trait GpuBackend: Send + Sync {
     /// The default implementation is a no-op, suitable for backends that
     /// do not track resources (e.g. forwarding proxies).
     fn shutdown(&self) {}
+
+    // --- Primary context management ---
+
+    /// Retain a reference to the primary context for `device`.
+    /// Increments the refcount and creates the context on first call.
+    /// Returns the same handle every time for the same device.
+    fn primary_ctx_retain(&self, device: i32) -> Result<u64, CuResult>;
+
+    /// Release a reference to the primary context for `device`.
+    /// Decrements the refcount and destroys the context when it reaches 0.
+    fn primary_ctx_release(&self, device: i32) -> Result<(), CuResult>;
+
+    /// Get the state of the primary context for `device`.
+    /// Returns (flags, active) where active is 1 if refcount > 0.
+    fn primary_ctx_get_state(&self, device: i32) -> Result<(u32, i32), CuResult>;
+
+    /// Set flags for the primary context of `device`.
+    /// Only valid when the refcount is 0 (context not active).
+    fn primary_ctx_set_flags(&self, device: i32, flags: u32) -> Result<(), CuResult>;
+
+    /// Reset the primary context for `device`.
+    /// Destroys regardless of refcount, resets refcount to 0.
+    /// Returns the old context handle if one existed.
+    fn primary_ctx_reset(&self, device: i32) -> Result<Option<u64>, CuResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +251,16 @@ struct StubEvent {
     timestamp_ns: u64,
 }
 
+/// State for a device's primary context.
+struct PrimaryCtxState {
+    /// Context handle (0 = not created yet).
+    ctx_handle: u64,
+    /// Reference count.
+    refcount: u32,
+    /// Flags set via cuDevicePrimaryCtxSetFlags.
+    flags: u32,
+}
+
 /// Combined state for the stub GPU backend, protected by a single `Mutex`
 /// to prevent deadlocks from multi-lock acquisition ordering.
 struct StubState {
@@ -260,6 +294,8 @@ struct StubState {
     host_allocations: HashMap<u64, Vec<u8>>,
     /// Counter for generating host memory handles.
     next_host_ptr: u64,
+    /// Primary contexts: device ordinal -> primary context state.
+    primary_contexts: HashMap<i32, PrimaryCtxState>,
 }
 
 impl StubState {
@@ -302,6 +338,7 @@ impl StubGpuBackend {
                 event_timestamp_counter: 1000,
                 host_allocations: HashMap::new(),
                 next_host_ptr: 0x0000_CAFE_0000_0000,
+                primary_contexts: HashMap::new(),
             }),
         }
     }
@@ -820,6 +857,98 @@ impl GpuBackend for StubGpuBackend {
         state.streams.clear();
         state.events.clear();
         state.host_allocations.clear();
+        state.primary_contexts.clear();
+    }
+
+    fn primary_ctx_retain(&self, device: i32) -> Result<u64, CuResult> {
+        Self::check_device(device)?;
+        let mut state = self.state.lock().unwrap();
+        // Ensure entry exists.
+        if !state.primary_contexts.contains_key(&device) {
+            state.primary_contexts.insert(device, PrimaryCtxState {
+                ctx_handle: 0,
+                refcount: 0,
+                flags: 0,
+            });
+        }
+        let needs_create = state.primary_contexts[&device].ctx_handle == 0;
+        if needs_create {
+            let id = state.next_ctx_id;
+            state.next_ctx_id += 1;
+            let flags = state.primary_contexts[&device].flags;
+            state.contexts.insert(id, StubContext { device, flags });
+            state.primary_contexts.get_mut(&device).unwrap().ctx_handle = id;
+        }
+        let entry = state.primary_contexts.get_mut(&device).unwrap();
+        entry.refcount += 1;
+        Ok(entry.ctx_handle)
+    }
+
+    fn primary_ctx_release(&self, device: i32) -> Result<(), CuResult> {
+        Self::check_device(device)?;
+        let mut state = self.state.lock().unwrap();
+        let (refcount, ctx_handle) = match state.primary_contexts.get(&device) {
+            Some(e) if e.refcount > 0 => (e.refcount, e.ctx_handle),
+            _ => return Err(CuResult::InvalidContext),
+        };
+        let new_refcount = refcount - 1;
+        if new_refcount == 0 {
+            state.contexts.remove(&ctx_handle);
+            let entry = state.primary_contexts.get_mut(&device).unwrap();
+            entry.refcount = 0;
+            entry.ctx_handle = 0;
+        } else {
+            state.primary_contexts.get_mut(&device).unwrap().refcount = new_refcount;
+        }
+        Ok(())
+    }
+
+    fn primary_ctx_get_state(&self, device: i32) -> Result<(u32, i32), CuResult> {
+        Self::check_device(device)?;
+        let state = self.state.lock().unwrap();
+        match state.primary_contexts.get(&device) {
+            Some(entry) => {
+                let active = if entry.refcount > 0 { 1 } else { 0 };
+                Ok((entry.flags, active))
+            }
+            None => Ok((0, 0)),
+        }
+    }
+
+    fn primary_ctx_set_flags(&self, device: i32, flags: u32) -> Result<(), CuResult> {
+        Self::check_device(device)?;
+        let mut state = self.state.lock().unwrap();
+        if !state.primary_contexts.contains_key(&device) {
+            state.primary_contexts.insert(device, PrimaryCtxState {
+                ctx_handle: 0,
+                refcount: 0,
+                flags: 0,
+            });
+        }
+        let entry = state.primary_contexts.get_mut(&device).unwrap();
+        if entry.refcount > 0 {
+            return Err(CuResult::PrimaryContextActive);
+        }
+        entry.flags = flags;
+        Ok(())
+    }
+
+    fn primary_ctx_reset(&self, device: i32) -> Result<Option<u64>, CuResult> {
+        Self::check_device(device)?;
+        let mut state = self.state.lock().unwrap();
+        let (old_handle, had_ctx) = match state.primary_contexts.get(&device) {
+            Some(entry) if entry.ctx_handle != 0 => (entry.ctx_handle, true),
+            Some(_) => (0, false),
+            None => return Ok(None),
+        };
+        if had_ctx {
+            state.contexts.remove(&old_handle);
+        }
+        let entry = state.primary_contexts.get_mut(&device).unwrap();
+        entry.ctx_handle = 0;
+        entry.refcount = 0;
+        // Preserve flags
+        Ok(if had_ctx { Some(old_handle) } else { None })
     }
 }
 
@@ -1532,5 +1661,117 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let ptr = gpu.mem_alloc(16).unwrap();
         assert_eq!(gpu.memset_d32_async(ptr, 0xFF, 4, 0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    // --- Primary context tests ---
+
+    #[test]
+    fn test_primary_ctx_retain_returns_same_handle() {
+        let gpu = StubGpuBackend::new();
+        let h1 = gpu.primary_ctx_retain(0).unwrap();
+        let h2 = gpu.primary_ctx_retain(0).unwrap();
+        assert_eq!(h1, h2, "repeated retain must return the same handle");
+        // Cleanup
+        let _ = gpu.primary_ctx_release(0);
+        let _ = gpu.primary_ctx_release(0);
+    }
+
+    #[test]
+    fn test_primary_ctx_retain_release_lifecycle() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.primary_ctx_retain(0).unwrap();
+        // Retain a second time
+        let ctx2 = gpu.primary_ctx_retain(0).unwrap();
+        assert_eq!(ctx, ctx2);
+        // First release: context still alive
+        gpu.primary_ctx_release(0).unwrap();
+        assert!(gpu.ctx_exists(ctx), "context should still exist after first release");
+        // Second release: refcount hits 0, context destroyed
+        gpu.primary_ctx_release(0).unwrap();
+        assert!(!gpu.ctx_exists(ctx), "context should be destroyed when refcount reaches 0");
+    }
+
+    #[test]
+    fn test_primary_ctx_get_state_active_inactive() {
+        let gpu = StubGpuBackend::new();
+        // No primary ctx yet: inactive
+        let (flags, active) = gpu.primary_ctx_get_state(0).unwrap();
+        assert_eq!(flags, 0);
+        assert_eq!(active, 0);
+        // Retain: active
+        let _ = gpu.primary_ctx_retain(0).unwrap();
+        let (_, active) = gpu.primary_ctx_get_state(0).unwrap();
+        assert_eq!(active, 1);
+        // Release: inactive again
+        gpu.primary_ctx_release(0).unwrap();
+        let (_, active) = gpu.primary_ctx_get_state(0).unwrap();
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn test_primary_ctx_set_flags_when_inactive() {
+        let gpu = StubGpuBackend::new();
+        gpu.primary_ctx_set_flags(0, 0x04).unwrap();
+        let (flags, _) = gpu.primary_ctx_get_state(0).unwrap();
+        assert_eq!(flags, 0x04);
+    }
+
+    #[test]
+    fn test_primary_ctx_set_flags_rejected_when_active() {
+        let gpu = StubGpuBackend::new();
+        let _ = gpu.primary_ctx_retain(0).unwrap();
+        assert_eq!(
+            gpu.primary_ctx_set_flags(0, 0x04),
+            Err(CuResult::PrimaryContextActive)
+        );
+        let _ = gpu.primary_ctx_release(0);
+    }
+
+    #[test]
+    fn test_primary_ctx_reset_destroys_regardless_of_refcount() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.primary_ctx_retain(0).unwrap();
+        let _ = gpu.primary_ctx_retain(0).unwrap(); // refcount = 2
+        let old = gpu.primary_ctx_reset(0).unwrap();
+        assert_eq!(old, Some(ctx));
+        assert!(!gpu.ctx_exists(ctx), "context should be destroyed after reset");
+        let (_, active) = gpu.primary_ctx_get_state(0).unwrap();
+        assert_eq!(active, 0, "should be inactive after reset");
+    }
+
+    #[test]
+    fn test_primary_ctx_reset_preserves_flags() {
+        let gpu = StubGpuBackend::new();
+        gpu.primary_ctx_set_flags(0, 0x08).unwrap();
+        let _ = gpu.primary_ctx_retain(0).unwrap();
+        gpu.primary_ctx_reset(0).unwrap();
+        let (flags, _) = gpu.primary_ctx_get_state(0).unwrap();
+        assert_eq!(flags, 0x08, "flags should be preserved after reset");
+    }
+
+    #[test]
+    fn test_primary_ctx_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        assert!(gpu.primary_ctx_retain(99).is_err());
+        assert!(gpu.primary_ctx_release(99).is_err());
+        assert!(gpu.primary_ctx_get_state(99).is_err());
+        assert!(gpu.primary_ctx_set_flags(99, 0).is_err());
+        assert!(gpu.primary_ctx_reset(99).is_err());
+    }
+
+    #[test]
+    fn test_primary_ctx_release_without_retain_fails() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.primary_ctx_release(0), Err(CuResult::InvalidContext));
+    }
+
+    #[test]
+    fn test_primary_ctx_retain_after_reset_creates_new() {
+        let gpu = StubGpuBackend::new();
+        let h1 = gpu.primary_ctx_retain(0).unwrap();
+        gpu.primary_ctx_reset(0).unwrap();
+        let h2 = gpu.primary_ctx_retain(0).unwrap();
+        assert_ne!(h1, h2, "new handle should be allocated after reset");
+        let _ = gpu.primary_ctx_release(0);
     }
 }

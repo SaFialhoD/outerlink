@@ -45,6 +45,11 @@ pub enum MessageType {
     CtxGetCurrent = 0x0023,
     CtxGetDevice = 0x0024,
     CtxSynchronize = 0x0025,
+    DevicePrimaryCtxRetain = 0x0026,
+    DevicePrimaryCtxRelease = 0x0027,
+    DevicePrimaryCtxGetState = 0x0028,
+    DevicePrimaryCtxSetFlags = 0x0029,
+    DevicePrimaryCtxReset = 0x002A,
 
     // Memory
     MemAlloc = 0x0030,
@@ -111,6 +116,11 @@ impl MessageType {
             0x0023 => Some(Self::CtxGetCurrent),
             0x0024 => Some(Self::CtxGetDevice),
             0x0025 => Some(Self::CtxSynchronize),
+            0x0026 => Some(Self::DevicePrimaryCtxRetain),
+            0x0027 => Some(Self::DevicePrimaryCtxRelease),
+            0x0028 => Some(Self::DevicePrimaryCtxGetState),
+            0x0029 => Some(Self::DevicePrimaryCtxSetFlags),
+            0x002A => Some(Self::DevicePrimaryCtxReset),
             0x0030 => Some(Self::MemAlloc),
             0x0031 => Some(Self::MemFree),
             0x0032 => Some(Self::MemcpyHtoD),
