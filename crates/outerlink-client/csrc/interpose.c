@@ -402,10 +402,25 @@ CUresult hook_cuGetErrorString(CUresult error, const char **pStr) {
 CUresult hook_cuModuleLoadData(CUmodule *module, const void *image) {
     ensure_init();
     unsigned long long mod_u64 = 0;
-    /* Note: we pass image pointer and a size of 0 (size is not available from
-     * the CUDA API signature -- the server will need to parse the binary to
-     * determine its size, or we calculate it from the PTX/cubin header). */
-    CUresult r = ol_cuModuleLoadData(&mod_u64, image, 0);
+    /* Determine image size: PTX is a null-terminated string; cubin is ELF.
+     * Detect format by inspecting first bytes. */
+    size_t data_len = 0;
+    if (image) {
+        const unsigned char *p = (const unsigned char *)image;
+        if (p[0] >= 0x20 && p[0] < 0x7F) {
+            /* PTX text — null-terminated string */
+            data_len = strlen((const char *)image) + 1;
+        } else if (p[0] == 0x7F && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') {
+            /* ELF cubin — compute size from section header table */
+            unsigned long long e_shoff = 0;
+            unsigned short e_shnum = 0, e_shentsize = 0;
+            memcpy(&e_shoff, p + 0x28, 8);
+            memcpy(&e_shentsize, p + 0x3A, 2);
+            memcpy(&e_shnum, p + 0x3C, 2);
+            data_len = (size_t)(e_shoff + (unsigned long long)e_shnum * e_shentsize);
+        }
+    }
+    CUresult r = ol_cuModuleLoadData(&mod_u64, image, data_len);
     if (r == CUDA_SUCCESS && module) {
         *module = (CUmodule)(uintptr_t)mod_u64;
     }
@@ -521,33 +536,225 @@ CUresult hook_cuEventQuery(CUevent hEvent) {
 /* -- Kernel launch -- */
 
 /*
- * The real CUDA cuLaunchKernel uses void** kernelParams where each pointer
- * points to a kernel argument's storage. However, the sizes of those arguments
- * are NOT part of the API -- they are determined by the kernel's signature.
+ * Kernel parameter forwarding
  *
- * At LD_PRELOAD interception time, we don't have access to the kernel's
- * parameter metadata. So we pass NULL/0 for params here. Applications that
- * need kernel params over the network must use the extended OuterLink API
- * (with explicit num_params and param_sizes).
+ * cuLaunchKernel provides two ways to pass arguments:
  *
- * Phase 2: Introspect cubin/PTX module metadata to infer param sizes.
+ *   1. `extra` array (CU_LAUNCH_PARAM_BUFFER_POINTER + _SIZE tags)
+ *      A packed buffer with total size. Trivial to forward -- we treat it
+ *      as a single "parameter" of the given size.
+ *
+ *   2. `kernelParams` (void** array of pointers to each argument)
+ *      Requires knowing per-parameter sizes. We use cuFuncGetParamInfo
+ *      (CUDA 12.3+) to introspect, with per-CUfunction caching.
+ *      Falls back to NULL if cuFuncGetParamInfo is unavailable.
  */
+
+/* ---- cuFuncGetParamInfo dynamic resolution ---- */
+
+typedef CUresult (*cuFuncGetParamInfo_fn)(CUfunction func, size_t paramIndex,
+                                          size_t *paramOffset, size_t *paramSize);
+
+static cuFuncGetParamInfo_fn real_cuFuncGetParamInfo = NULL;
+static int cuFuncGetParamInfo_resolved = 0; /* 0 = not tried, 1 = resolved, -1 = unavailable */
+
+static void resolve_cuFuncGetParamInfo(void) {
+    if (cuFuncGetParamInfo_resolved != 0)
+        return;
+    if (!real_dlsym) {
+        real_dlsym = (void *(*)(void *, const char *))
+            __libc_dlsym(RTLD_NEXT, "dlsym");
+    }
+    real_cuFuncGetParamInfo = (cuFuncGetParamInfo_fn)
+        real_dlsym(RTLD_NEXT, "cuFuncGetParamInfo");
+    cuFuncGetParamInfo_resolved = real_cuFuncGetParamInfo ? 1 : -1;
+}
+
+/* ---- Per-CUfunction param info cache ---- */
+
+#define PARAM_CACHE_MAX_FUNCS   256
+#define PARAM_CACHE_MAX_PARAMS  64   /* CUDA max is ~128 params, 4096 bytes total */
+
+typedef struct {
+    CUfunction func;
+    unsigned int num_params;
+    unsigned int param_sizes[PARAM_CACHE_MAX_PARAMS];
+} param_cache_entry_t;
+
+static param_cache_entry_t param_cache[PARAM_CACHE_MAX_FUNCS];
+static unsigned int param_cache_count = 0;
+static pthread_mutex_t param_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Look up cached param info for a CUfunction.
+ * Returns pointer to cache entry if found, NULL otherwise.
+ */
+static const param_cache_entry_t *param_cache_lookup(CUfunction func) {
+    for (unsigned int i = 0; i < param_cache_count; i++) {
+        if (param_cache[i].func == func) {
+            return &param_cache[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Query cuFuncGetParamInfo for all params and store in cache.
+ * Returns pointer to new cache entry, or NULL on failure.
+ * Caller must hold param_cache_mutex.
+ */
+static const param_cache_entry_t *param_cache_populate(CUfunction func) {
+    if (param_cache_count >= PARAM_CACHE_MAX_FUNCS) {
+        /* Cache full -- evict oldest (slot 0) by shifting.
+         * This is rare: most apps use far fewer than 256 kernels. */
+        memmove(&param_cache[0], &param_cache[1],
+                (PARAM_CACHE_MAX_FUNCS - 1) * sizeof(param_cache_entry_t));
+        param_cache_count = PARAM_CACHE_MAX_FUNCS - 1;
+    }
+
+    param_cache_entry_t *entry = &param_cache[param_cache_count];
+    entry->func = func;
+    entry->num_params = 0;
+
+    for (size_t i = 0; i < PARAM_CACHE_MAX_PARAMS; i++) {
+        size_t offset = 0, size = 0;
+        CUresult r = real_cuFuncGetParamInfo(func, i, &offset, &size);
+        if (r != CUDA_SUCCESS) {
+            /* CUDA_ERROR_INVALID_VALUE signals end of params */
+            break;
+        }
+        entry->param_sizes[i] = (unsigned int)size;
+        entry->num_params = (unsigned int)(i + 1);
+    }
+
+    param_cache_count++;
+    return entry;
+}
+
+/*
+ * Get param info for a CUfunction, using cache.
+ * Returns cache entry or NULL if cuFuncGetParamInfo is unavailable.
+ */
+static const param_cache_entry_t *get_func_param_info(CUfunction func) {
+    resolve_cuFuncGetParamInfo();
+    if (cuFuncGetParamInfo_resolved != 1)
+        return NULL;
+
+    /* Fast path: check cache without lock (safe for reads of stable entries) */
+    const param_cache_entry_t *cached = param_cache_lookup(func);
+    if (cached)
+        return cached;
+
+    /* Slow path: populate under lock */
+    pthread_mutex_lock(&param_cache_mutex);
+    /* Double-check after acquiring lock */
+    cached = param_cache_lookup(func);
+    if (!cached) {
+        cached = param_cache_populate(func);
+    }
+    pthread_mutex_unlock(&param_cache_mutex);
+    return cached;
+}
+
+/* ---- hook_cuLaunchKernel ---- */
+
 CUresult hook_cuLaunchKernel(CUfunction f,
                               unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                               unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
                               unsigned int sharedMemBytes, CUstream hStream,
                               void **kernelParams, void **extra) {
     ensure_init();
-    (void)kernelParams;  /* Cannot serialize without param sizes -- see comment above */
-    (void)extra;         /* 'extra' parameter style not yet supported */
-    return ol_cuLaunchKernel((unsigned long long)(uintptr_t)f,
-                              gridDimX, gridDimY, gridDimZ,
-                              blockDimX, blockDimY, blockDimZ,
-                              sharedMemBytes,
-                              (unsigned long long)(uintptr_t)hStream,
-                              NULL,  /* kernelParams -- requires extended API */
-                              0,     /* numParams */
-                              NULL); /* paramSizes */
+
+    /*
+     * Path 1: `extra` array -- the caller provides a packed parameter buffer.
+     *
+     * The array contains tagged entries:
+     *   CU_LAUNCH_PARAM_BUFFER_POINTER, <void* buffer>,
+     *   CU_LAUNCH_PARAM_BUFFER_SIZE,    <size_t* pSize>,
+     *   CU_LAUNCH_PARAM_END
+     *
+     * We extract the buffer and size, then pass the entire buffer as a
+     * single "parameter" to the Rust FFI. The server replays it via the
+     * same `extra` mechanism on the real GPU.
+     */
+    if (extra != NULL) {
+        const unsigned char *buffer_ptr = NULL;
+        unsigned int buffer_size = 0;
+
+        for (int i = 0; extra[i] != CU_LAUNCH_PARAM_END; /* manual advance */) {
+            if (extra[i] == CU_LAUNCH_PARAM_BUFFER_POINTER) {
+                buffer_ptr = (const unsigned char *)extra[i + 1];
+                i += 2;
+            } else if (extra[i] == CU_LAUNCH_PARAM_BUFFER_SIZE) {
+                size_t *psize = (size_t *)extra[i + 1];
+                buffer_size = (unsigned int)(*psize);
+                i += 2;
+            } else {
+                /* Unknown tag -- skip pair */
+                i += 2;
+            }
+        }
+
+        if (buffer_ptr != NULL && buffer_size > 0) {
+            /* Pass as a single param: the packed buffer */
+            const unsigned char *params_array[1] = { buffer_ptr };
+            unsigned int sizes_array[1] = { buffer_size };
+
+            return ol_cuLaunchKernel(
+                (unsigned long long)(uintptr_t)f,
+                gridDimX, gridDimY, gridDimZ,
+                blockDimX, blockDimY, blockDimZ,
+                sharedMemBytes,
+                (unsigned long long)(uintptr_t)hStream,
+                (const unsigned char *const *)params_array,
+                1,
+                sizes_array);
+        }
+
+        /* extra was provided but had no buffer -- launch with no params */
+        return ol_cuLaunchKernel(
+            (unsigned long long)(uintptr_t)f,
+            gridDimX, gridDimY, gridDimZ,
+            blockDimX, blockDimY, blockDimZ,
+            sharedMemBytes,
+            (unsigned long long)(uintptr_t)hStream,
+            NULL, 0, NULL);
+    }
+
+    /*
+     * Path 2: `kernelParams` -- void** array of pointers to each argument.
+     *
+     * We need per-parameter sizes from cuFuncGetParamInfo (CUDA 12.3+).
+     * If that API is unavailable, fall back to passing NULL (existing behavior).
+     */
+    if (kernelParams != NULL) {
+        const param_cache_entry_t *info = get_func_param_info(f);
+        if (info != NULL && info->num_params > 0) {
+            /* Build the params array for the Rust FFI.
+             * kernelParams[i] points to the storage for parameter i. */
+            return ol_cuLaunchKernel(
+                (unsigned long long)(uintptr_t)f,
+                gridDimX, gridDimY, gridDimZ,
+                blockDimX, blockDimY, blockDimZ,
+                sharedMemBytes,
+                (unsigned long long)(uintptr_t)hStream,
+                (const unsigned char *const *)kernelParams,
+                info->num_params,
+                info->param_sizes);
+        }
+        /* cuFuncGetParamInfo unavailable or zero params -- fall through */
+    }
+
+    /*
+     * Fallback: no params (kernelParams==NULL, or cuFuncGetParamInfo unavailable).
+     */
+    return ol_cuLaunchKernel(
+        (unsigned long long)(uintptr_t)f,
+        gridDimX, gridDimY, gridDimZ,
+        blockDimX, blockDimY, blockDimZ,
+        sharedMemBytes,
+        (unsigned long long)(uintptr_t)hStream,
+        NULL, 0, NULL);
 }
 
 /* -----------------------------------------------------------------------

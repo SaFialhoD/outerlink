@@ -89,12 +89,14 @@ extern CUresult ol_cuEventQuery(unsigned long long event);
 /* Kernel launch
  *
  * Uses the extended OuterLink signature with explicit param count and sizes.
- * The real CUDA API uses void** kernelParams with implicit sizes, but at
- * interception time we cannot infer parameter sizes without kernel metadata.
- * The C hook passes NULL/0 for params; real param passing requires the
- * extended API (num_params + param_sizes).
+ * The C hook (hook_cuLaunchKernel) handles two CUDA calling conventions:
  *
- * Phase 2 will add kernel signature introspection from module metadata.
+ *   1. `extra` path: Parses CU_LAUNCH_PARAM_BUFFER_POINTER/SIZE tags to
+ *      extract the packed buffer. Passed as a single param to Rust FFI.
+ *
+ *   2. `kernelParams` path: Uses cuFuncGetParamInfo (CUDA 12.3+, resolved
+ *      via dlsym) to introspect per-parameter sizes. Results are cached
+ *      per CUfunction. Falls back to NULL if unavailable (old drivers).
  */
 extern CUresult ol_cuLaunchKernel(unsigned long long func,
                                    unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,

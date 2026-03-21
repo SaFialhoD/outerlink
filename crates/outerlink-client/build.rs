@@ -11,15 +11,14 @@
 
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let cuda_stubs_dir = std::path::Path::new(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("cuda-stubs");
 
     // Only compile the C interposition layer on Linux
     if target_os == "linux" {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let cuda_stubs_dir = std::path::Path::new(&manifest_dir)
-            .join("..")
-            .join("..")
-            .join("cuda-stubs");
-
         cc::Build::new()
             .file("csrc/interpose.c")
             .include("csrc")
@@ -44,6 +43,6 @@ fn main() {
     // Rebuild if any C source or the build script changes
     println!("cargo:rerun-if-changed=csrc/interpose.c");
     println!("cargo:rerun-if-changed=csrc/interpose.h");
-    println!("cargo:rerun-if-changed=csrc/cuda.h");
+    println!("cargo:rerun-if-changed={}", cuda_stubs_dir.join("cuda.h").display());
     println!("cargo:rerun-if-changed=build.rs");
 }
