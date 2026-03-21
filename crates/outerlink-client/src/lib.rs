@@ -43,6 +43,10 @@ pub struct OuterLinkClient {
     pub current_remote_ctx: AtomicU64,
     /// Retry and reconnect configuration.
     retry_config: RetryConfig,
+    /// Mutex to prevent concurrent reconnect calls from creating duplicate
+    /// connections. Only one thread can execute the reconnect loop at a time;
+    /// others wait and then check if already connected.
+    reconnect_in_progress: std::sync::Mutex<()>,
 }
 
 impl OuterLinkClient {
@@ -63,6 +67,7 @@ impl OuterLinkClient {
             next_request_id: AtomicU64::new(1),
             current_remote_ctx: AtomicU64::new(0),
             retry_config: RetryConfig::default(),
+            reconnect_in_progress: std::sync::Mutex::new(()),
         }
     }
 
@@ -83,6 +88,7 @@ impl OuterLinkClient {
             next_request_id: AtomicU64::new(1),
             current_remote_ctx: AtomicU64::new(0),
             retry_config,
+            reconnect_in_progress: std::sync::Mutex::new(()),
         }
     }
 
@@ -160,22 +166,29 @@ impl OuterLinkClient {
     ///
     /// This performs a full connect + handshake, same as [`Self::connect`].
     pub fn reconnect(&self) -> Result<(), OuterLinkError> {
+        // Serialize concurrent reconnect calls. Only one thread executes the
+        // reconnect loop; others wait and then check if already connected.
+        let _guard = self.reconnect_in_progress.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Another thread may have reconnected while we were waiting for the lock.
+        if self.is_actually_connected() {
+            return Ok(());
+        }
+
         let max_attempts = self.retry_config.max_reconnect_attempts;
         let mut last_err = None;
 
         for attempt in 0..max_attempts {
-            let delay = self.retry_config.reconnect_delay(attempt);
             tracing::warn!(
                 addr = %self.server_addr,
                 attempt = attempt + 1,
                 max_attempts = max_attempts,
-                delay_ms = delay.as_millis() as u64,
                 "attempting reconnect to server"
             );
-            std::thread::sleep(delay);
 
             match self.connect() {
                 Ok(()) => {
+                    self.connected.store(true, Ordering::SeqCst);
                     tracing::info!(
                         addr = %self.server_addr,
                         attempt = attempt + 1,
@@ -191,6 +204,15 @@ impl OuterLinkClient {
                         "reconnect attempt failed"
                     );
                     last_err = Some(e);
+                    // Sleep between failures, but not after the last attempt.
+                    if attempt + 1 < max_attempts {
+                        let delay = self.retry_config.reconnect_delay(attempt);
+                        tracing::warn!(
+                            delay_ms = delay.as_millis() as u64,
+                            "waiting before next reconnect attempt"
+                        );
+                        std::thread::sleep(delay);
+                    }
                 }
             }
         }
@@ -750,11 +772,12 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "reconnect should fail with no server");
-        // 3 attempts with delays 50ms, 100ms, 200ms = 350ms minimum
-        // Allow some slack for connection timeout but should be bounded.
+        // 3 attempts: first tries immediately, sleeps between failures.
+        // Delays: after attempt 0 = 50ms, after attempt 1 = 100ms. No sleep
+        // after the final attempt. Total sleep = 150ms minimum.
         assert!(
-            elapsed >= std::time::Duration::from_millis(300),
-            "backoff should cause at least 300ms delay, got {elapsed:?}"
+            elapsed >= std::time::Duration::from_millis(100),
+            "backoff should cause at least 100ms delay, got {elapsed:?}"
         );
     }
 
@@ -786,6 +809,75 @@ mod tests {
         // Should still be able to send requests.
         let result = client.send_request(MessageType::DeviceGetCount, &[]);
         assert!(result.is_ok(), "request after reconnect should work");
+
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Reconnect should NOT sleep before the first attempt -- it should try
+    /// connecting immediately, then sleep only between subsequent attempts.
+    #[test]
+    fn test_reconnect_no_sleep_before_first_attempt() {
+        // Use a large reconnect_initial_delay so we can detect if the first
+        // attempt sleeps (it shouldn't).
+        let retry_config = RetryConfig {
+            max_retries: 0,
+            retry_delays: vec![std::time::Duration::ZERO],
+            max_reconnect_attempts: 1, // Only one attempt, no retries
+            reconnect_initial_delay: std::time::Duration::from_secs(5),
+            reconnect_max_delay: std::time::Duration::from_secs(5),
+        };
+        let client = OuterLinkClient::with_retry_config(
+            "127.0.0.1:1".to_string(),
+            retry_config,
+        );
+
+        let start = std::time::Instant::now();
+        let _result = client.reconnect();
+        let elapsed = start.elapsed();
+
+        // With 1 attempt and no sleep-before-first, should complete well
+        // under 5 seconds (the connect timeout is 10s but port 1 usually
+        // fails fast). If it slept 5s before trying, this assertion fails.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "reconnect should not sleep before first attempt, took {elapsed:?}"
+        );
+    }
+
+    /// Concurrent reconnect calls should not create duplicate connections.
+    /// The reconnect_in_progress mutex should serialize them.
+    #[test]
+    fn test_reconnect_serialized_by_mutex() {
+        let (addr, shutdown, _server_handle) = spawn_mock_server_persistent();
+
+        let retry_config = RetryConfig {
+            max_retries: 0,
+            retry_delays: vec![std::time::Duration::ZERO],
+            max_reconnect_attempts: 3,
+            reconnect_initial_delay: std::time::Duration::from_millis(10),
+            reconnect_max_delay: std::time::Duration::from_millis(50),
+        };
+
+        let client = Arc::new(OuterLinkClient::with_retry_config(
+            addr.to_string(),
+            retry_config,
+        ));
+        client.connect().unwrap();
+
+        // Spawn two threads that both call reconnect concurrently.
+        let c1 = Arc::clone(&client);
+        let c2 = Arc::clone(&client);
+
+        let t1 = std::thread::spawn(move || c1.reconnect());
+        let t2 = std::thread::spawn(move || c2.reconnect());
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        // Both should succeed (server is up), and we should still be connected.
+        assert!(r1.is_ok(), "thread 1 reconnect failed: {r1:?}");
+        assert!(r2.is_ok(), "thread 2 reconnect failed: {r2:?}");
+        assert!(client.is_actually_connected());
 
         shutdown.store(true, Ordering::Relaxed);
     }

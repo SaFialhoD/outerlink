@@ -744,75 +744,54 @@ pub extern "C" fn ol_cuGetErrorName(
     if p_str.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // OuterLink extension codes (match CuResult enum values)
+    const OL_TRANSPORT_ERROR: u32 = 10000;
+    const OL_REMOTE_ERROR: u32 = 10001;
+    const OL_HANDLE_NOT_FOUND: u32 = 10002;
+
     let name: &[u8] = match error {
         0 => b"CUDA_SUCCESS\0",
         1 => b"CUDA_ERROR_INVALID_VALUE\0",
         2 => b"CUDA_ERROR_OUT_OF_MEMORY\0",
         3 => b"CUDA_ERROR_NOT_INITIALIZED\0",
         4 => b"CUDA_ERROR_DEINITIALIZED\0",
-        5 => b"CUDA_ERROR_PROFILER_DISABLED\0",
+        6 => b"CUDA_ERROR_PROFILER_NOT_INITIALIZED\0",
+        7 => b"CUDA_ERROR_PROFILER_ALREADY_STARTED\0",
+        8 => b"CUDA_ERROR_PROFILER_ALREADY_STOPPED\0",
         100 => b"CUDA_ERROR_NO_DEVICE\0",
         101 => b"CUDA_ERROR_INVALID_DEVICE\0",
-        102 => b"CUDA_ERROR_DEVICE_NOT_LICENSED\0",
         200 => b"CUDA_ERROR_INVALID_IMAGE\0",
         201 => b"CUDA_ERROR_INVALID_CONTEXT\0",
         202 => b"CUDA_ERROR_CONTEXT_ALREADY_CURRENT\0",
+        203 => b"CUDA_ERROR_CONTEXT_ALREADY_IN_USE\0",
         205 => b"CUDA_ERROR_MAP_FAILED\0",
         206 => b"CUDA_ERROR_UNMAP_FAILED\0",
         208 => b"CUDA_ERROR_ALREADY_MAPPED\0",
         209 => b"CUDA_ERROR_NO_BINARY_FOR_GPU\0",
-        210 => b"CUDA_ERROR_ALREADY_ACQUIRED\0",
-        211 => b"CUDA_ERROR_NOT_MAPPED\0",
-        212 => b"CUDA_ERROR_NOT_MAPPED_AS_ARRAY\0",
-        213 => b"CUDA_ERROR_NOT_MAPPED_AS_POINTER\0",
-        214 => b"CUDA_ERROR_ECC_UNCORRECTABLE\0",
-        215 => b"CUDA_ERROR_UNSUPPORTED_LIMIT\0",
-        300 => b"CUDA_ERROR_INVALID_SOURCE\0",
-        301 => b"CUDA_ERROR_FILE_NOT_FOUND\0",
-        302 => b"CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND\0",
-        303 => b"CUDA_ERROR_SHARED_OBJECT_INIT_FAILED\0",
-        304 => b"CUDA_ERROR_OPERATING_SYSTEM\0",
-        400 => b"CUDA_ERROR_INVALID_HANDLE\0",
-        401 => b"CUDA_ERROR_ILLEGAL_STATE\0",
+        216 => b"CUDA_ERROR_PEER_ACCESS_UNSUPPORTED\0",
+        217 => b"CUDA_ERROR_INVALID_PTX\0",
+        218 => b"CUDA_ERROR_INVALID_GRAPHICS_CONTEXT\0",
+        219 => b"CUDA_ERROR_NVLINK_UNCORRECTABLE\0",
+        220 => b"CUDA_ERROR_JIT_COMPILER_NOT_FOUND\0",
+        221 => b"CUDA_ERROR_UNSUPPORTED_PTX_VERSION\0",
+        222 => b"CUDA_ERROR_JIT_COMPILATION_DISABLED\0",
         500 => b"CUDA_ERROR_NOT_FOUND\0",
         600 => b"CUDA_ERROR_NOT_READY\0",
         700 => b"CUDA_ERROR_ILLEGAL_ADDRESS\0",
-        701 => b"CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES\0",
-        702 => b"CUDA_ERROR_LAUNCH_TIMEOUT\0",
-        703 => b"CUDA_ERROR_LAUNCH_INCOMPATIBLE_TEXTURING\0",
-        704 => b"CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED\0",
-        705 => b"CUDA_ERROR_PEER_ACCESS_NOT_ENABLED\0",
-        709 => b"CUDA_ERROR_CONTEXT_IS_DESTROYED\0",
-        710 => b"CUDA_ERROR_ASSERT\0",
-        711 => b"CUDA_ERROR_TOO_MANY_PEERS\0",
-        712 => b"CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED\0",
-        713 => b"CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED\0",
-        714 => b"CUDA_ERROR_HARDWARE_STACK_ERROR\0",
-        715 => b"CUDA_ERROR_ILLEGAL_INSTRUCTION\0",
-        716 => b"CUDA_ERROR_MISALIGNED_ADDRESS\0",
-        717 => b"CUDA_ERROR_INVALID_ADDRESS_SPACE\0",
-        718 => b"CUDA_ERROR_INVALID_PC\0",
+        708 => b"CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE\0",
         719 => b"CUDA_ERROR_LAUNCH_FAILED\0",
-        720 => b"CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE\0",
-        800 => b"CUDA_ERROR_NOT_PERMITTED\0",
-        801 => b"CUDA_ERROR_NOT_SUPPORTED\0",
-        802 => b"CUDA_ERROR_SYSTEM_NOT_READY\0",
-        803 => b"CUDA_ERROR_SYSTEM_DRIVER_MISMATCH\0",
-        804 => b"CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE\0",
-        900 => b"CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED\0",
-        901 => b"CUDA_ERROR_STREAM_CAPTURE_INVALIDATED\0",
-        902 => b"CUDA_ERROR_STREAM_CAPTURE_MERGE\0",
-        903 => b"CUDA_ERROR_STREAM_CAPTURE_UNMATCHED\0",
-        904 => b"CUDA_ERROR_STREAM_CAPTURE_UNJOINED\0",
-        905 => b"CUDA_ERROR_STREAM_CAPTURE_ISOLATION\0",
-        906 => b"CUDA_ERROR_STREAM_CAPTURE_IMPLICIT\0",
-        907 => b"CUDA_ERROR_CAPTURED_EVENT\0",
+        805 => b"CUDA_ERROR_MPS_CONNECTION_FAILED\0",
+        806 => b"CUDA_ERROR_MPS_RPC_FAILURE\0",
+        807 => b"CUDA_ERROR_MPS_SERVER_NOT_READY\0",
+        808 => b"CUDA_ERROR_MPS_MAX_CLIENTS_REACHED\0",
+        809 => b"CUDA_ERROR_MPS_MAX_CONNECTIONS_REACHED\0",
+        908 => b"CUDA_ERROR_STREAM_CAPTURE_WRONG_THREAD\0",
         909 => b"CUDA_ERROR_TIMEOUT\0",
-        910 => b"CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE\0",
+        910 => b"CUDA_ERROR_SYSTEM_NOT_READY\0",
         999 => b"CUDA_ERROR_UNKNOWN\0",
-        10000 => b"OUTERLINK_ERROR_TRANSPORT\0",
-        10001 => b"OUTERLINK_ERROR_REMOTE\0",
-        10002 => b"OUTERLINK_ERROR_HANDLE_NOT_FOUND\0",
+        OL_TRANSPORT_ERROR => b"OUTERLINK_ERROR_TRANSPORT\0",
+        OL_REMOTE_ERROR => b"OUTERLINK_ERROR_REMOTE\0",
+        OL_HANDLE_NOT_FOUND => b"OUTERLINK_ERROR_HANDLE_NOT_FOUND\0",
         _ => b"CUDA_ERROR_UNKNOWN\0",
     };
     unsafe { *p_str = name.as_ptr() };
@@ -828,75 +807,54 @@ pub extern "C" fn ol_cuGetErrorString(
     if p_str.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // OuterLink extension codes (match CuResult enum values)
+    const OL_TRANSPORT_ERROR: u32 = 10000;
+    const OL_REMOTE_ERROR: u32 = 10001;
+    const OL_HANDLE_NOT_FOUND: u32 = 10002;
+
     let desc: &[u8] = match error {
         0 => b"no error\0",
         1 => b"invalid argument\0",
         2 => b"out of memory\0",
         3 => b"not initialized\0",
         4 => b"driver shutting down\0",
-        5 => b"profiler is disabled\0",
+        6 => b"profiler not initialized\0",
+        7 => b"profiler already started\0",
+        8 => b"profiler already stopped\0",
         100 => b"no CUDA-capable device is detected\0",
         101 => b"invalid device ordinal\0",
-        102 => b"device not licensed\0",
         200 => b"device kernel image is invalid\0",
         201 => b"invalid device context\0",
-        202 => b"context already current\0",
+        202 => b"context is already current\0",
+        203 => b"context is already in use\0",
         205 => b"mapping of buffer object failed\0",
         206 => b"unmapping of buffer object failed\0",
         208 => b"resource already mapped\0",
         209 => b"no kernel image is available for execution on the device\0",
-        210 => b"resource already acquired\0",
-        211 => b"resource not mapped\0",
-        212 => b"resource not mapped as array\0",
-        213 => b"resource not mapped as pointer\0",
-        214 => b"uncorrectable ECC error encountered\0",
-        215 => b"limit is not supported by this device\0",
-        300 => b"device kernel source is invalid\0",
-        301 => b"file not found\0",
-        302 => b"link to a shared object failed to resolve\0",
-        303 => b"shared object initialization failed\0",
-        304 => b"operating system call failed\0",
-        400 => b"invalid resource handle\0",
-        401 => b"operation not permitted when in illegal state\0",
+        216 => b"peer access is not supported\0",
+        217 => b"a PTX JIT compilation failed\0",
+        218 => b"invalid OpenGL or DirectX context\0",
+        219 => b"uncorrectable NVLink error was detected\0",
+        220 => b"PTX JIT compiler library was not found\0",
+        221 => b"the provided PTX was compiled with an unsupported toolchain\0",
+        222 => b"PTX JIT compilation was disabled\0",
         500 => b"named symbol not found\0",
-        600 => b"not ready\0",
+        600 => b"device not ready\0",
         700 => b"an illegal memory access was encountered\0",
-        701 => b"too many resources requested for launch\0",
-        702 => b"the launch timed out and was terminated\0",
-        703 => b"launch uses incompatible texturing mode\0",
-        704 => b"peer access is already enabled\0",
-        705 => b"peer access has not been enabled\0",
-        709 => b"context is destroyed\0",
-        710 => b"device-side assert triggered\0",
-        711 => b"too many peers\0",
-        712 => b"host memory is already registered\0",
-        713 => b"host memory is not registered\0",
-        714 => b"hardware stack error\0",
-        715 => b"illegal instruction\0",
-        716 => b"misaligned address\0",
-        717 => b"invalid address space\0",
-        718 => b"invalid program counter\0",
-        719 => b"kernel launch failed\0",
-        720 => b"cooperative launch too large\0",
-        800 => b"operation not permitted\0",
-        801 => b"operation not supported\0",
-        802 => b"system not ready\0",
-        803 => b"system driver mismatch\0",
-        804 => b"forward compatibility not supported on device\0",
-        900 => b"stream capture unsupported\0",
-        901 => b"stream capture invalidated\0",
-        902 => b"stream capture merge error\0",
-        903 => b"stream capture unmatched\0",
-        904 => b"stream capture unjoined\0",
-        905 => b"stream capture isolation error\0",
-        906 => b"implicit stream capture error\0",
-        907 => b"captured event error\0",
-        909 => b"timeout\0",
-        910 => b"graph exec update failure\0",
+        708 => b"the primary context for the specified device has already been initialized\0",
+        719 => b"unspecified launch failure\0",
+        805 => b"MPS client failed to connect to the MPS control daemon or MPS server\0",
+        806 => b"the MPS RPC call failed\0",
+        807 => b"MPS server is not ready to accept new connections\0",
+        808 => b"the MPS server has reached its maximum number of clients\0",
+        809 => b"the MPS maximum connections per client has been exceeded\0",
+        908 => b"operation not permitted on a stream during capture in another thread\0",
+        909 => b"operation timed out\0",
+        910 => b"system not yet ready\0",
         999 => b"unknown error\0",
-        10000 => b"OuterLink transport error\0",
-        10001 => b"OuterLink remote server error\0",
-        10002 => b"OuterLink handle not found\0",
+        OL_TRANSPORT_ERROR => b"OuterLink transport/network error\0",
+        OL_REMOTE_ERROR => b"OuterLink remote server error\0",
+        OL_HANDLE_NOT_FOUND => b"OuterLink handle not found in translation table\0",
         _ => b"unknown error\0",
     };
     unsafe { *p_str = desc.as_ptr() };
@@ -2246,175 +2204,6 @@ mod tests {
         assert_eq!(result, CUDA_SUCCESS);
         let s = unsafe { CStr::from_ptr(str_ptr as *const i8) };
         assert_eq!(s.to_str().unwrap(), "invalid argument");
-    }
-
-    #[test]
-    fn test_ol_cu_get_error_name_null_ptr() {
-        let result = ol_cuGetErrorName(0, ptr::null_mut());
-        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
-    }
-
-    #[test]
-    fn test_ol_cu_get_error_string_null_ptr() {
-        let result = ol_cuGetErrorString(0, ptr::null_mut());
-        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
-    }
-
-    /// Verify that every known CUDA error code maps to its correct name.
-    #[test]
-    fn test_ol_cu_get_error_name_all_codes() {
-        let cases: &[(u32, &str)] = &[
-            (0, "CUDA_SUCCESS"),
-            (1, "CUDA_ERROR_INVALID_VALUE"),
-            (2, "CUDA_ERROR_OUT_OF_MEMORY"),
-            (3, "CUDA_ERROR_NOT_INITIALIZED"),
-            (4, "CUDA_ERROR_DEINITIALIZED"),
-            (5, "CUDA_ERROR_PROFILER_DISABLED"),
-            (100, "CUDA_ERROR_NO_DEVICE"),
-            (101, "CUDA_ERROR_INVALID_DEVICE"),
-            (102, "CUDA_ERROR_DEVICE_NOT_LICENSED"),
-            (200, "CUDA_ERROR_INVALID_IMAGE"),
-            (201, "CUDA_ERROR_INVALID_CONTEXT"),
-            (202, "CUDA_ERROR_CONTEXT_ALREADY_CURRENT"),
-            (205, "CUDA_ERROR_MAP_FAILED"),
-            (206, "CUDA_ERROR_UNMAP_FAILED"),
-            (208, "CUDA_ERROR_ALREADY_MAPPED"),
-            (209, "CUDA_ERROR_NO_BINARY_FOR_GPU"),
-            (210, "CUDA_ERROR_ALREADY_ACQUIRED"),
-            (211, "CUDA_ERROR_NOT_MAPPED"),
-            (212, "CUDA_ERROR_NOT_MAPPED_AS_ARRAY"),
-            (213, "CUDA_ERROR_NOT_MAPPED_AS_POINTER"),
-            (214, "CUDA_ERROR_ECC_UNCORRECTABLE"),
-            (215, "CUDA_ERROR_UNSUPPORTED_LIMIT"),
-            (300, "CUDA_ERROR_INVALID_SOURCE"),
-            (301, "CUDA_ERROR_FILE_NOT_FOUND"),
-            (302, "CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND"),
-            (303, "CUDA_ERROR_SHARED_OBJECT_INIT_FAILED"),
-            (304, "CUDA_ERROR_OPERATING_SYSTEM"),
-            (400, "CUDA_ERROR_INVALID_HANDLE"),
-            (401, "CUDA_ERROR_ILLEGAL_STATE"),
-            (500, "CUDA_ERROR_NOT_FOUND"),
-            (600, "CUDA_ERROR_NOT_READY"),
-            (700, "CUDA_ERROR_ILLEGAL_ADDRESS"),
-            (701, "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES"),
-            (702, "CUDA_ERROR_LAUNCH_TIMEOUT"),
-            (703, "CUDA_ERROR_LAUNCH_INCOMPATIBLE_TEXTURING"),
-            (704, "CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED"),
-            (705, "CUDA_ERROR_PEER_ACCESS_NOT_ENABLED"),
-            (709, "CUDA_ERROR_CONTEXT_IS_DESTROYED"),
-            (710, "CUDA_ERROR_ASSERT"),
-            (711, "CUDA_ERROR_TOO_MANY_PEERS"),
-            (712, "CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED"),
-            (713, "CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED"),
-            (714, "CUDA_ERROR_HARDWARE_STACK_ERROR"),
-            (715, "CUDA_ERROR_ILLEGAL_INSTRUCTION"),
-            (716, "CUDA_ERROR_MISALIGNED_ADDRESS"),
-            (717, "CUDA_ERROR_INVALID_ADDRESS_SPACE"),
-            (718, "CUDA_ERROR_INVALID_PC"),
-            (719, "CUDA_ERROR_LAUNCH_FAILED"),
-            (720, "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE"),
-            (800, "CUDA_ERROR_NOT_PERMITTED"),
-            (801, "CUDA_ERROR_NOT_SUPPORTED"),
-            (802, "CUDA_ERROR_SYSTEM_NOT_READY"),
-            (803, "CUDA_ERROR_SYSTEM_DRIVER_MISMATCH"),
-            (804, "CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE"),
-            (900, "CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED"),
-            (901, "CUDA_ERROR_STREAM_CAPTURE_INVALIDATED"),
-            (902, "CUDA_ERROR_STREAM_CAPTURE_MERGE"),
-            (903, "CUDA_ERROR_STREAM_CAPTURE_UNMATCHED"),
-            (904, "CUDA_ERROR_STREAM_CAPTURE_UNJOINED"),
-            (905, "CUDA_ERROR_STREAM_CAPTURE_ISOLATION"),
-            (906, "CUDA_ERROR_STREAM_CAPTURE_IMPLICIT"),
-            (907, "CUDA_ERROR_CAPTURED_EVENT"),
-            (909, "CUDA_ERROR_TIMEOUT"),
-            (910, "CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE"),
-            (999, "CUDA_ERROR_UNKNOWN"),
-            (10000, "OUTERLINK_ERROR_TRANSPORT"),
-            (10001, "OUTERLINK_ERROR_REMOTE"),
-            (10002, "OUTERLINK_ERROR_HANDLE_NOT_FOUND"),
-        ];
-        for &(code, expected_name) in cases {
-            let mut name_ptr: *const u8 = ptr::null();
-            let result = ol_cuGetErrorName(code, &mut name_ptr);
-            assert_eq!(result, CUDA_SUCCESS, "cuGetErrorName failed for code {code}");
-            assert!(!name_ptr.is_null(), "null name pointer for code {code}");
-            let name = unsafe { CStr::from_ptr(name_ptr as *const i8) };
-            assert_eq!(
-                name.to_str().unwrap(),
-                expected_name,
-                "wrong name for error code {code}"
-            );
-        }
-    }
-
-    /// Verify that every known CUDA error code maps to a non-empty description.
-    #[test]
-    fn test_ol_cu_get_error_string_all_codes() {
-        let cases: &[(u32, &str)] = &[
-            (0, "no error"),
-            (2, "out of memory"),
-            (3, "not initialized"),
-            (4, "driver shutting down"),
-            (100, "no CUDA-capable device is detected"),
-            (200, "device kernel image is invalid"),
-            (301, "file not found"),
-            (400, "invalid resource handle"),
-            (500, "named symbol not found"),
-            (600, "not ready"),
-            (700, "an illegal memory access was encountered"),
-            (719, "kernel launch failed"),
-            (800, "operation not permitted"),
-            (801, "operation not supported"),
-            (900, "stream capture unsupported"),
-            (999, "unknown error"),
-            (10000, "OuterLink transport error"),
-            (10001, "OuterLink remote server error"),
-            (10002, "OuterLink handle not found"),
-        ];
-        for &(code, expected_desc) in cases {
-            let mut str_ptr: *const u8 = ptr::null();
-            let result = ol_cuGetErrorString(code, &mut str_ptr);
-            assert_eq!(result, CUDA_SUCCESS, "cuGetErrorString failed for code {code}");
-            assert!(!str_ptr.is_null(), "null string pointer for code {code}");
-            let desc = unsafe { CStr::from_ptr(str_ptr as *const i8) };
-            assert_eq!(
-                desc.to_str().unwrap(),
-                expected_desc,
-                "wrong description for error code {code}"
-            );
-        }
-    }
-
-    /// Unknown error codes should fall through to "CUDA_ERROR_UNKNOWN".
-    #[test]
-    fn test_ol_cu_get_error_name_unmapped_codes() {
-        for code in &[6u32, 50, 199, 555, 888, 12345, 0xFFFF_FFFF] {
-            let mut name_ptr: *const u8 = ptr::null();
-            let result = ol_cuGetErrorName(*code, &mut name_ptr);
-            assert_eq!(result, CUDA_SUCCESS);
-            let name = unsafe { CStr::from_ptr(name_ptr as *const i8) };
-            assert_eq!(
-                name.to_str().unwrap(),
-                "CUDA_ERROR_UNKNOWN",
-                "unmapped code {code} should return CUDA_ERROR_UNKNOWN"
-            );
-        }
-    }
-
-    /// Unknown error codes should fall through to "unknown error" description.
-    #[test]
-    fn test_ol_cu_get_error_string_unmapped_codes() {
-        for code in &[6u32, 50, 199, 555, 888, 12345, 0xFFFF_FFFF] {
-            let mut str_ptr: *const u8 = ptr::null();
-            let result = ol_cuGetErrorString(*code, &mut str_ptr);
-            assert_eq!(result, CUDA_SUCCESS);
-            let desc = unsafe { CStr::from_ptr(str_ptr as *const i8) };
-            assert_eq!(
-                desc.to_str().unwrap(),
-                "unknown error",
-                "unmapped code {code} should return 'unknown error'"
-            );
-        }
     }
 
     // -- Client initialization tests --

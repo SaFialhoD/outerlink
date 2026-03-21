@@ -50,8 +50,12 @@ impl RetryConfig {
     /// Get the delay for retry attempt `n` (0-indexed).
     ///
     /// Returns the n-th element of `retry_delays`, or the last element if
-    /// `n` exceeds the list length. Panics if `retry_delays` is empty.
+    /// `n` exceeds the list length. Returns `Duration::ZERO` if
+    /// `retry_delays` is empty.
     pub fn retry_delay(&self, n: u32) -> Duration {
+        if self.retry_delays.is_empty() {
+            return Duration::from_millis(0);
+        }
         let idx = (n as usize).min(self.retry_delays.len() - 1);
         self.retry_delays[idx]
     }
@@ -131,6 +135,17 @@ mod tests {
         let cfg = RetryConfig::no_retry();
         assert_eq!(cfg.max_retries, 0);
         assert_eq!(cfg.max_reconnect_attempts, 0);
+    }
+
+    #[test]
+    fn test_retry_delay_empty_vec_returns_zero() {
+        let cfg = RetryConfig {
+            retry_delays: vec![],
+            ..RetryConfig::default()
+        };
+        // Should not panic, should return Duration::ZERO
+        assert_eq!(cfg.retry_delay(0), Duration::from_millis(0));
+        assert_eq!(cfg.retry_delay(5), Duration::from_millis(0));
     }
 
     #[test]

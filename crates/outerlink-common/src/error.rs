@@ -49,12 +49,11 @@ pub enum OuterLinkError {
 }
 
 impl OuterLinkError {
-    /// Returns `true` if this error is a transport/IO failure that may succeed
-    /// on retry (e.g. broken pipe, connection reset, timeout).
+    /// Returns true if this error is transient and the operation should be retried.
     ///
-    /// Returns `false` for semantic errors like CUDA errors from the server,
-    /// protocol violations, or handle lookup failures -- those are valid
-    /// responses that retrying would not fix.
+    /// Transport, connection, and IO errors are retryable.
+    /// CUDA errors, protocol errors, and config errors are not — they represent
+    /// definitive outcomes that won't change on retry.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
@@ -75,8 +74,8 @@ impl OuterLinkError {
             }
             Self::Protocol(_) => CuResult::RemoteError,
             Self::HandleNotFound(_) => CuResult::HandleNotFound,
-            Self::Timeout(_) => CuResult::NotReady,
-            Self::NotReady(_) => CuResult::NotInitialized,
+            Self::Timeout(_) => CuResult::Timeout,
+            Self::NotReady(_) => CuResult::SystemNotReady,
             Self::Config(_) => CuResult::InvalidValue,
         }
     }
