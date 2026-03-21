@@ -9,13 +9,9 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::net::TcpListener;
 
-use outerlink_common::error::OuterLinkError;
-use outerlink_common::tcp_transport::TcpTransportConnection;
-use outerlink_common::transport::TransportConnection;
 use outerlink_server::cuda_backend::CudaGpuBackend;
 use outerlink_server::gpu_backend::{GpuBackend, StubGpuBackend};
-use outerlink_server::handler::handle_request;
-use outerlink_server::session::ConnectionSession;
+use outerlink_server::server::Server;
 
 /// Command-line arguments for the server.
 #[derive(Parser, Debug)]
@@ -69,75 +65,42 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(&args.listen).await?;
     tracing::info!("Listening on {}", listener.local_addr()?);
 
-    // Accept loop.
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                // Transient accept errors (fd exhaustion, connection aborted before
-                // accept completes, etc.) should not kill the daemon.
-                tracing::warn!(error = %e, "accept failed, retrying");
-                continue;
-            }
-        };
-        tracing::info!(%peer, "new connection");
+    // Build the server with graceful shutdown support.
+    let server = Server::new(listener, backend);
+    let shutdown_tx = server.shutdown_handle();
 
-        let backend = Arc::clone(&backend);
-        tokio::spawn(async move {
-            let conn = match TcpTransportConnection::new(stream) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(%peer, error = %e, "failed to initialise transport");
-                    return;
+    // Spawn a task that listens for Ctrl+C (SIGINT) or SIGTERM and
+    // fires the shutdown signal.
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => {
+                    tracing::info!("received Ctrl+C, initiating shutdown");
                 }
-            };
-            if let Err(e) = handle_connection(conn, backend).await {
-                tracing::error!(%peer, error = %e, "connection handler error");
+                _ = sigterm.recv() => {
+                    tracing::info!("received SIGTERM, initiating shutdown");
+                }
             }
-            tracing::info!(%peer, "connection closed");
-        });
-    }
-}
+        }
 
-/// Drive a single client connection to completion.
-///
-/// Reads messages in a loop via [`TcpTransportConnection`] (which provides
-/// TCP_NODELAY, magic/version validation, and payload-size bounds checking),
-/// dispatches each to [`handle_request`], and writes the response back.
-/// Returns when the client disconnects or a fatal I/O error occurs.
-async fn handle_connection(
-    conn: TcpTransportConnection,
-    backend: Arc<dyn GpuBackend>,
-) -> anyhow::Result<()> {
-    // Each connection gets its own session so per-thread state (like the
-    // current CUDA context) is isolated between clients.
-    let mut session = ConnectionSession::new();
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.expect("failed to listen for Ctrl+C");
+            tracing::info!("received Ctrl+C, initiating shutdown");
+        }
 
-    loop {
-        // 1. Receive the next framed message (header + payload).
-        let (header, payload) = match conn.recv_message().await {
-            Ok(msg) => msg,
-            Err(OuterLinkError::ConnectionClosed) => {
-                // Client closed the connection gracefully.
-                return Ok(());
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(e));
-            }
-        };
+        let _ = shutdown_tx.send(());
+    });
 
-        tracing::debug!(
-            request_id = header.request_id,
-            msg_type = ?header.msg_type,
-            payload_len = header.payload_len,
-            "received request"
-        );
+    // Run the server (blocks until shutdown completes).
+    server.run().await;
 
-        // 2. Dispatch.
-        let (resp_header, resp_payload) =
-            handle_request(&*backend, &header, &payload, &mut session);
-
-        // 3. Write the response.
-        conn.send_message(&resp_header, &resp_payload).await?;
-    }
+    tracing::info!("OuterLink Server exited");
+    Ok(())
 }

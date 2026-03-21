@@ -6,4 +6,5 @@
 pub mod cuda_backend;
 pub mod gpu_backend;
 pub mod handler;
+pub mod server;
 pub mod session;

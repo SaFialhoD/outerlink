@@ -168,7 +168,10 @@ pub fn handle_request(
             }
             let size = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
             match backend.mem_alloc(size) {
-                Ok(ptr) => success_with(rid, &ptr.to_le_bytes()),
+                Ok(ptr) => {
+                    session.track_mem_alloc(ptr);
+                    success_with(rid, &ptr.to_le_bytes())
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -179,6 +182,9 @@ pub fn handle_request(
             }
             let ptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
             let r = backend.mem_free(ptr);
+            if r == CuResult::Success {
+                session.untrack_mem_alloc(ptr);
+            }
             result_only(rid, r)
         }
 
@@ -226,6 +232,7 @@ pub fn handle_request(
             match backend.ctx_create(flags, device) {
                 Ok(ctx) => {
                     session.set_current_ctx(ctx);
+                    session.track_context(ctx);
                     success_with(rid, &ctx.to_le_bytes())
                 }
                 Err(e) => error_response(rid, e),
@@ -240,6 +247,7 @@ pub fn handle_request(
             match backend.ctx_destroy(ctx) {
                 Ok(()) => {
                     session.clear_if_current(ctx);
+                    session.untrack_context(ctx);
                     result_only(rid, CuResult::Success)
                 }
                 Err(e) => error_response(rid, e),
@@ -288,7 +296,10 @@ pub fn handle_request(
                 return error_response(rid, CuResult::InvalidValue);
             }
             match backend.module_load_data(payload) {
-                Ok(handle) => success_with(rid, &handle.to_le_bytes()),
+                Ok(handle) => {
+                    session.track_module(handle);
+                    success_with(rid, &handle.to_le_bytes())
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -299,7 +310,10 @@ pub fn handle_request(
             }
             let module = u64::from_le_bytes(payload[..8].try_into().unwrap());
             match backend.module_unload(module) {
-                Ok(()) => result_only(rid, CuResult::Success),
+                Ok(()) => {
+                    session.untrack_module(module);
+                    result_only(rid, CuResult::Success)
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -356,7 +370,10 @@ pub fn handle_request(
             }
             let flags = u32::from_le_bytes(payload[..4].try_into().unwrap());
             match backend.stream_create(flags) {
-                Ok(handle) => success_with(rid, &handle.to_le_bytes()),
+                Ok(handle) => {
+                    session.track_stream(handle);
+                    success_with(rid, &handle.to_le_bytes())
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -367,7 +384,10 @@ pub fn handle_request(
             }
             let stream = u64::from_le_bytes(payload[..8].try_into().unwrap());
             match backend.stream_destroy(stream) {
-                Ok(()) => result_only(rid, CuResult::Success),
+                Ok(()) => {
+                    session.untrack_stream(stream);
+                    result_only(rid, CuResult::Success)
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -402,7 +422,10 @@ pub fn handle_request(
             }
             let flags = u32::from_le_bytes(payload[..4].try_into().unwrap());
             match backend.event_create(flags) {
-                Ok(handle) => success_with(rid, &handle.to_le_bytes()),
+                Ok(handle) => {
+                    session.track_event(handle);
+                    success_with(rid, &handle.to_le_bytes())
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -413,7 +436,10 @@ pub fn handle_request(
             }
             let event = u64::from_le_bytes(payload[..8].try_into().unwrap());
             match backend.event_destroy(event) {
-                Ok(()) => result_only(rid, CuResult::Success),
+                Ok(()) => {
+                    session.untrack_event(event);
+                    result_only(rid, CuResult::Success)
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -604,7 +630,10 @@ pub fn handle_request(
             }
             let size = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
             match backend.mem_alloc_host(size) {
-                Ok(ptr) => success_with(rid, &ptr.to_le_bytes()),
+                Ok(ptr) => {
+                    session.track_host_alloc(ptr);
+                    success_with(rid, &ptr.to_le_bytes())
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -616,7 +645,10 @@ pub fn handle_request(
             }
             let ptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
             match backend.mem_free_host(ptr) {
-                Ok(()) => result_only(rid, CuResult::Success),
+                Ok(()) => {
+                    session.untrack_host_alloc(ptr);
+                    result_only(rid, CuResult::Success)
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -1898,5 +1930,173 @@ mod tests {
         let hdr = req(MessageType::MemsetD32Async, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr, &payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- Session resource tracking tests ---
+
+    #[test]
+    fn test_handler_tracks_mem_alloc() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        let payload = 256u64.to_le_bytes();
+        let hdr = req(MessageType::MemAlloc, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.mem_alloc_count(), 1);
+    }
+
+    #[test]
+    fn test_handler_untracks_mem_free() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Alloc
+        let payload = 256u64.to_le_bytes();
+        let hdr = req(MessageType::MemAlloc, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(session.mem_alloc_count(), 1);
+
+        // Free
+        let payload = ptr.to_le_bytes();
+        let hdr = req(MessageType::MemFree, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.mem_alloc_count(), 0);
+    }
+
+    #[test]
+    fn test_handler_tracks_ctx_create_and_destroy() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create context
+        let mut payload = 0u32.to_le_bytes().to_vec(); // flags
+        payload.extend_from_slice(&0i32.to_le_bytes()); // device
+        let hdr = req(MessageType::CtxCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(session.context_count(), 1);
+
+        // Destroy context
+        let payload = ctx.to_le_bytes();
+        let hdr = req(MessageType::CtxDestroy, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.context_count(), 0);
+    }
+
+    #[test]
+    fn test_handler_tracks_module_load_and_unload() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Load module
+        let payload = b"fake_ptx_data";
+        let hdr = req(MessageType::ModuleLoadData, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(session.module_count(), 1);
+
+        // Unload module
+        let payload = module.to_le_bytes();
+        let hdr = req(MessageType::ModuleUnload, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.module_count(), 0);
+    }
+
+    #[test]
+    fn test_handler_tracks_stream_create_and_destroy() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create stream
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::StreamCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(session.stream_count(), 1);
+
+        // Destroy stream
+        let payload = stream.to_le_bytes();
+        let hdr = req(MessageType::StreamDestroy, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.stream_count(), 0);
+    }
+
+    #[test]
+    fn test_handler_tracks_event_create_and_destroy() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create event
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::EventCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let event = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(session.event_count(), 1);
+
+        // Destroy event
+        let payload = event.to_le_bytes();
+        let hdr = req(MessageType::EventDestroy, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.event_count(), 0);
+    }
+
+    #[test]
+    fn test_handler_tracks_host_alloc_and_free() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Alloc host memory
+        let payload = 512u64.to_le_bytes();
+        let hdr = req(MessageType::MemAllocHost, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(session.host_alloc_count(), 1);
+
+        // Free host memory
+        let payload = ptr.to_le_bytes();
+        let hdr = req(MessageType::MemFreeHost, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.host_alloc_count(), 0);
+    }
+
+    #[test]
+    fn test_handler_cleanup_frees_all_via_session() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Allocate various resources through the handler.
+        let payload = 128u64.to_le_bytes();
+        let hdr = req(MessageType::MemAlloc, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let _ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::StreamCreate, payload.len() as u32);
+        dispatch_with(&gpu, &hdr, &payload, &mut session);
+
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::EventCreate, payload.len() as u32);
+        dispatch_with(&gpu, &hdr, &payload, &mut session);
+
+        assert_eq!(session.total_tracked_resources(), 3);
+
+        // Cleanup via session.
+        let report = session.cleanup(&gpu);
+        assert_eq!(report.succeeded, 3);
+        assert_eq!(report.failed, 0);
+        assert_eq!(session.total_tracked_resources(), 0);
     }
 }

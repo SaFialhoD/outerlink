@@ -42,7 +42,8 @@ pub fn assert_success(payload: &[u8]) -> &[u8] {
 }
 
 /// Spawn a server task that accepts ONE connection on `listener`, runs the
-/// recv-handle-send loop until the client disconnects, then exits.
+/// recv-handle-send loop until the client disconnects, then cleans up
+/// session resources and exits.
 ///
 /// Returns a `JoinHandle` so the test can await server completion and catch
 /// any panics.
@@ -68,6 +69,9 @@ pub fn spawn_server(
                 .await
                 .expect("server send failed");
         }
+
+        // Connection dropped -- clean up all resources this session allocated.
+        session.cleanup(&*backend);
     })
 }
 

@@ -952,6 +952,12 @@ impl GpuBackend for CudaGpuBackend {
         );
         Ok(())
     }
+
+    fn shutdown(&self) {
+        // The CUDA driver cleans up all resources when the process exits,
+        // but we log explicitly so operators know cleanup was intentional.
+        tracing::info!("CUDA backend: shutdown requested, driver will reclaim resources on exit");
+    }
 }
 
 impl CudaGpuBackend {

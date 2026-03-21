@@ -173,6 +173,19 @@ pub trait GpuBackend: Send + Sync {
         stream: u64,
         params: &[u8],
     ) -> Result<(), CuResult>;
+
+    // --- Lifecycle ---
+
+    /// Clean up all GPU resources held by this backend.
+    ///
+    /// Called during graceful shutdown. Implementations should destroy all
+    /// contexts, free all allocations, unload modules, destroy streams and
+    /// events, etc. After this call, the backend is in a "shut down" state
+    /// and should not be used for new operations.
+    ///
+    /// The default implementation is a no-op, suitable for backends that
+    /// do not track resources (e.g. forwarding proxies).
+    fn shutdown(&self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -787,6 +800,26 @@ impl GpuBackend for StubGpuBackend {
         }
         tracing::trace!(func, stream, "stub: launch_kernel (no-op)");
         Ok(())
+    }
+
+    fn shutdown(&self) {
+        let mut state = self.state.lock().unwrap();
+        tracing::info!(
+            contexts = state.contexts.len(),
+            allocations = state.allocations.len(),
+            modules = state.modules.len(),
+            streams = state.streams.len(),
+            events = state.events.len(),
+            host_allocations = state.host_allocations.len(),
+            "stub: shutdown — releasing all resources"
+        );
+        state.contexts.clear();
+        state.allocations.clear();
+        state.modules.clear();
+        state.functions.clear();
+        state.streams.clear();
+        state.events.clear();
+        state.host_allocations.clear();
     }
 }
 
