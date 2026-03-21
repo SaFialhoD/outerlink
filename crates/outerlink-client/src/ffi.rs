@@ -744,16 +744,54 @@ pub extern "C" fn ol_cuGetErrorName(
     if p_str.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // OuterLink extension codes (match CuResult enum values)
+    const OL_TRANSPORT_ERROR: u32 = 10000;
+    const OL_REMOTE_ERROR: u32 = 10001;
+    const OL_HANDLE_NOT_FOUND: u32 = 10002;
+
     let name: &[u8] = match error {
         0 => b"CUDA_SUCCESS\0",
         1 => b"CUDA_ERROR_INVALID_VALUE\0",
         2 => b"CUDA_ERROR_OUT_OF_MEMORY\0",
         3 => b"CUDA_ERROR_NOT_INITIALIZED\0",
+        4 => b"CUDA_ERROR_DEINITIALIZED\0",
+        6 => b"CUDA_ERROR_PROFILER_NOT_INITIALIZED\0",
+        7 => b"CUDA_ERROR_PROFILER_ALREADY_STARTED\0",
+        8 => b"CUDA_ERROR_PROFILER_ALREADY_STOPPED\0",
         100 => b"CUDA_ERROR_NO_DEVICE\0",
         101 => b"CUDA_ERROR_INVALID_DEVICE\0",
+        200 => b"CUDA_ERROR_INVALID_IMAGE\0",
         201 => b"CUDA_ERROR_INVALID_CONTEXT\0",
+        202 => b"CUDA_ERROR_CONTEXT_ALREADY_CURRENT\0",
+        203 => b"CUDA_ERROR_CONTEXT_ALREADY_IN_USE\0",
+        205 => b"CUDA_ERROR_MAP_FAILED\0",
+        206 => b"CUDA_ERROR_UNMAP_FAILED\0",
+        208 => b"CUDA_ERROR_ALREADY_MAPPED\0",
+        209 => b"CUDA_ERROR_NO_BINARY_FOR_GPU\0",
+        216 => b"CUDA_ERROR_PEER_ACCESS_UNSUPPORTED\0",
+        217 => b"CUDA_ERROR_INVALID_PTX\0",
+        218 => b"CUDA_ERROR_INVALID_GRAPHICS_CONTEXT\0",
+        219 => b"CUDA_ERROR_NVLINK_UNCORRECTABLE\0",
+        220 => b"CUDA_ERROR_JIT_COMPILER_NOT_FOUND\0",
+        221 => b"CUDA_ERROR_UNSUPPORTED_PTX_VERSION\0",
+        222 => b"CUDA_ERROR_JIT_COMPILATION_DISABLED\0",
         500 => b"CUDA_ERROR_NOT_FOUND\0",
+        600 => b"CUDA_ERROR_NOT_READY\0",
+        700 => b"CUDA_ERROR_ILLEGAL_ADDRESS\0",
+        708 => b"CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE\0",
+        719 => b"CUDA_ERROR_LAUNCH_FAILED\0",
+        805 => b"CUDA_ERROR_MPS_CONNECTION_FAILED\0",
+        806 => b"CUDA_ERROR_MPS_RPC_FAILURE\0",
+        807 => b"CUDA_ERROR_MPS_SERVER_NOT_READY\0",
+        808 => b"CUDA_ERROR_MPS_MAX_CLIENTS_REACHED\0",
+        809 => b"CUDA_ERROR_MPS_MAX_CONNECTIONS_REACHED\0",
+        908 => b"CUDA_ERROR_STREAM_CAPTURE_WRONG_THREAD\0",
+        909 => b"CUDA_ERROR_TIMEOUT\0",
+        910 => b"CUDA_ERROR_SYSTEM_NOT_READY\0",
         999 => b"CUDA_ERROR_UNKNOWN\0",
+        OL_TRANSPORT_ERROR => b"OUTERLINK_ERROR_TRANSPORT\0",
+        OL_REMOTE_ERROR => b"OUTERLINK_ERROR_REMOTE\0",
+        OL_HANDLE_NOT_FOUND => b"OUTERLINK_ERROR_HANDLE_NOT_FOUND\0",
         _ => b"CUDA_ERROR_UNKNOWN\0",
     };
     unsafe { *p_str = name.as_ptr() };
@@ -769,16 +807,54 @@ pub extern "C" fn ol_cuGetErrorString(
     if p_str.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // OuterLink extension codes (match CuResult enum values)
+    const OL_TRANSPORT_ERROR: u32 = 10000;
+    const OL_REMOTE_ERROR: u32 = 10001;
+    const OL_HANDLE_NOT_FOUND: u32 = 10002;
+
     let desc: &[u8] = match error {
         0 => b"no error\0",
         1 => b"invalid argument\0",
         2 => b"out of memory\0",
         3 => b"not initialized\0",
+        4 => b"driver shutting down\0",
+        6 => b"profiler not initialized\0",
+        7 => b"profiler already started\0",
+        8 => b"profiler already stopped\0",
         100 => b"no CUDA-capable device is detected\0",
         101 => b"invalid device ordinal\0",
+        200 => b"device kernel image is invalid\0",
         201 => b"invalid device context\0",
+        202 => b"context is already current\0",
+        203 => b"context is already in use\0",
+        205 => b"mapping of buffer object failed\0",
+        206 => b"unmapping of buffer object failed\0",
+        208 => b"resource already mapped\0",
+        209 => b"no kernel image is available for execution on the device\0",
+        216 => b"peer access is not supported\0",
+        217 => b"a PTX JIT compilation failed\0",
+        218 => b"invalid OpenGL or DirectX context\0",
+        219 => b"uncorrectable NVLink error was detected\0",
+        220 => b"PTX JIT compiler library was not found\0",
+        221 => b"the provided PTX was compiled with an unsupported toolchain\0",
+        222 => b"PTX JIT compilation was disabled\0",
         500 => b"named symbol not found\0",
+        600 => b"device not ready\0",
+        700 => b"an illegal memory access was encountered\0",
+        708 => b"the primary context for the specified device has already been initialized\0",
+        719 => b"unspecified launch failure\0",
+        805 => b"MPS client failed to connect to the MPS control daemon or MPS server\0",
+        806 => b"the MPS RPC call failed\0",
+        807 => b"MPS server is not ready to accept new connections\0",
+        808 => b"the MPS server has reached its maximum number of clients\0",
+        809 => b"the MPS maximum connections per client has been exceeded\0",
+        908 => b"operation not permitted on a stream during capture in another thread\0",
+        909 => b"operation timed out\0",
+        910 => b"system not yet ready\0",
         999 => b"unknown error\0",
+        OL_TRANSPORT_ERROR => b"OuterLink transport/network error\0",
+        OL_REMOTE_ERROR => b"OuterLink remote server error\0",
+        OL_HANDLE_NOT_FOUND => b"OuterLink handle not found in translation table\0",
         _ => b"unknown error\0",
     };
     unsafe { *p_str = desc.as_ptr() };

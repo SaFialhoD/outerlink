@@ -58,8 +58,8 @@ impl OuterLinkError {
             }
             Self::Protocol(_) => CuResult::RemoteError,
             Self::HandleNotFound(_) => CuResult::HandleNotFound,
-            Self::Timeout(_) => CuResult::NotReady,
-            Self::NotReady(_) => CuResult::NotInitialized,
+            Self::Timeout(_) => CuResult::Timeout,
+            Self::NotReady(_) => CuResult::SystemNotReady,
             Self::Config(_) => CuResult::InvalidValue,
         }
     }
