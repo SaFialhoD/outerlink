@@ -58,7 +58,22 @@ pub enum CuResult {
     NotFound = 500,
     NotReady = 600,
     IllegalAddress = 700,
+    LaunchOutOfResources = 701,
+    LaunchTimeout = 702,
+    LaunchIncompatibleTexturing = 703,
+    PeerAccessAlreadyEnabled = 704,
+    PeerAccessNotEnabled = 705,
     PrimaryContextActive = 708,
+    ContextIsDestroyed = 709,
+    Assert = 710,
+    TooManyPeers = 711,
+    HostMemoryAlreadyRegistered = 712,
+    HostMemoryNotRegistered = 713,
+    HardwareStackError = 714,
+    IllegalInstruction = 715,
+    MisalignedAddress = 716,
+    InvalidAddressSpace = 717,
+    InvalidPc = 718,
     LaunchFailed = 719,
     MpsConnectionFailed = 805,
     MpsRpcFailure = 806,
@@ -114,7 +129,22 @@ impl CuResult {
             500 => Self::NotFound,
             600 => Self::NotReady,
             700 => Self::IllegalAddress,
+            701 => Self::LaunchOutOfResources,
+            702 => Self::LaunchTimeout,
+            703 => Self::LaunchIncompatibleTexturing,
+            704 => Self::PeerAccessAlreadyEnabled,
+            705 => Self::PeerAccessNotEnabled,
             708 => Self::PrimaryContextActive,
+            709 => Self::ContextIsDestroyed,
+            710 => Self::Assert,
+            711 => Self::TooManyPeers,
+            712 => Self::HostMemoryAlreadyRegistered,
+            713 => Self::HostMemoryNotRegistered,
+            714 => Self::HardwareStackError,
+            715 => Self::IllegalInstruction,
+            716 => Self::MisalignedAddress,
+            717 => Self::InvalidAddressSpace,
+            718 => Self::InvalidPc,
             719 => Self::LaunchFailed,
             805 => Self::MpsConnectionFailed,
             806 => Self::MpsRpcFailure,
@@ -143,6 +173,82 @@ impl CuResult {
     /// Check if this result indicates success
     pub fn is_success(self) -> bool {
         matches!(self, Self::Success)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify all 700-range error codes round-trip through from_raw correctly
+    #[test]
+    fn from_raw_700_range_codes() {
+        let codes: &[(u32, CuResult)] = &[
+            (700, CuResult::IllegalAddress),
+            (701, CuResult::LaunchOutOfResources),
+            (702, CuResult::LaunchTimeout),
+            (703, CuResult::LaunchIncompatibleTexturing),
+            (704, CuResult::PeerAccessAlreadyEnabled),
+            (705, CuResult::PeerAccessNotEnabled),
+            (709, CuResult::ContextIsDestroyed),
+            (710, CuResult::Assert),
+            (711, CuResult::TooManyPeers),
+            (712, CuResult::HostMemoryAlreadyRegistered),
+            (713, CuResult::HostMemoryNotRegistered),
+            (714, CuResult::HardwareStackError),
+            (715, CuResult::IllegalInstruction),
+            (716, CuResult::MisalignedAddress),
+            (717, CuResult::InvalidAddressSpace),
+            (718, CuResult::InvalidPc),
+            (719, CuResult::LaunchFailed),
+        ];
+        for &(raw, expected) in codes {
+            assert_eq!(CuResult::from_raw(raw), expected, "from_raw({raw}) mismatch");
+        }
+    }
+
+    /// Verify as_raw round-trips for new 700-range codes
+    #[test]
+    fn as_raw_700_range_codes() {
+        assert_eq!(CuResult::LaunchOutOfResources.as_raw(), 701);
+        assert_eq!(CuResult::LaunchTimeout.as_raw(), 702);
+        assert_eq!(CuResult::LaunchIncompatibleTexturing.as_raw(), 703);
+        assert_eq!(CuResult::PeerAccessAlreadyEnabled.as_raw(), 704);
+        assert_eq!(CuResult::PeerAccessNotEnabled.as_raw(), 705);
+        assert_eq!(CuResult::ContextIsDestroyed.as_raw(), 709);
+        assert_eq!(CuResult::Assert.as_raw(), 710);
+        assert_eq!(CuResult::TooManyPeers.as_raw(), 711);
+        assert_eq!(CuResult::HostMemoryAlreadyRegistered.as_raw(), 712);
+        assert_eq!(CuResult::HostMemoryNotRegistered.as_raw(), 713);
+        assert_eq!(CuResult::HardwareStackError.as_raw(), 714);
+        assert_eq!(CuResult::IllegalInstruction.as_raw(), 715);
+        assert_eq!(CuResult::MisalignedAddress.as_raw(), 716);
+        assert_eq!(CuResult::InvalidAddressSpace.as_raw(), 717);
+        assert_eq!(CuResult::InvalidPc.as_raw(), 718);
+        assert_eq!(CuResult::LaunchFailed.as_raw(), 719);
+    }
+
+    /// Codes 706, 707 are not defined by CUDA -- should map to Unknown
+    #[test]
+    fn undefined_700_range_maps_to_unknown() {
+        assert_eq!(CuResult::from_raw(706), CuResult::Unknown);
+        assert_eq!(CuResult::from_raw(707), CuResult::Unknown);
+    }
+
+    /// All new variants should not be is_success()
+    #[test]
+    fn new_700_range_codes_are_errors() {
+        let errors = [
+            CuResult::LaunchOutOfResources,
+            CuResult::LaunchTimeout,
+            CuResult::PeerAccessAlreadyEnabled,
+            CuResult::Assert,
+            CuResult::HardwareStackError,
+            CuResult::MisalignedAddress,
+        ];
+        for e in errors {
+            assert!(!e.is_success(), "{e:?} should not be success");
+        }
     }
 }
 
