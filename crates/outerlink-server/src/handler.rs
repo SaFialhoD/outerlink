@@ -66,6 +66,11 @@ fn error_response(request_id: u64, err: CuResult) -> (MessageHeader, Vec<u8>) {
 /// | CtxGetCurrent        | (empty)                 | u64 ctx                               |
 /// | CtxGetDevice         | u64 ctx                 | i32 device                            |
 /// | CtxSynchronize       | (empty)                 | (empty)                               |
+/// | DevicePrimaryCtxRetain  | i32 device           | u64 ctx_handle                        |
+/// | DevicePrimaryCtxRelease | i32 device           | (empty)                               |
+/// | DevicePrimaryCtxGetState| i32 device           | u32 flags, i32 active                 |
+/// | DevicePrimaryCtxSetFlags| i32 device, u32 flags| (empty)                               |
+/// | DevicePrimaryCtxReset   | i32 device           | (empty)                               |
 pub fn handle_request(
     backend: &dyn GpuBackend,
     header: &MessageHeader,
@@ -290,6 +295,77 @@ pub fn handle_request(
             Ok(()) => result_only(rid, CuResult::Success),
             Err(e) => error_response(rid, e),
         },
+
+        // --- Primary context operations ---
+
+        MessageType::DevicePrimaryCtxRetain => {
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let device = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            match backend.primary_ctx_retain(device) {
+                Ok(ctx) => {
+                    session.track_primary_ctx(device, ctx);
+                    success_with(rid, &ctx.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::DevicePrimaryCtxRelease => {
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let device = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            match backend.primary_ctx_release(device) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::DevicePrimaryCtxGetState => {
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let device = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            match backend.primary_ctx_get_state(device) {
+                Ok((flags, active)) => {
+                    let mut data = [0u8; 8];
+                    data[..4].copy_from_slice(&flags.to_le_bytes());
+                    data[4..8].copy_from_slice(&active.to_le_bytes());
+                    success_with(rid, &data)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::DevicePrimaryCtxSetFlags => {
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let device = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            let flags = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+            match backend.primary_ctx_set_flags(device, flags) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::DevicePrimaryCtxReset => {
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let device = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            match backend.primary_ctx_reset(device) {
+                Ok(old_ctx) => {
+                    if old_ctx.is_some() {
+                        session.untrack_primary_ctx(device);
+                    }
+                    result_only(rid, CuResult::Success)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
 
         // --- Module operations ---
 
@@ -2101,5 +2177,132 @@ mod tests {
         assert_eq!(report.succeeded, 3);
         assert_eq!(report.failed, 0);
         assert_eq!(session.total_tracked_resources(), 0);
+    }
+
+    // --- Primary context handler tests ---
+
+    #[test]
+    fn test_primary_ctx_retain() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let payload = 0i32.to_le_bytes();
+        let hdr = req(MessageType::DevicePrimaryCtxRetain, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(ctx, 0);
+        // Second retain returns same handle
+        let (_, resp2) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp2), CuResult::Success);
+        let ctx2 = u64::from_le_bytes(resp2[4..12].try_into().unwrap());
+        assert_eq!(ctx, ctx2);
+    }
+
+    #[test]
+    fn test_primary_ctx_retain_tracks_in_session() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let payload = 0i32.to_le_bytes();
+        let hdr = req(MessageType::DevicePrimaryCtxRetain, payload.len() as u32);
+        dispatch_with(&gpu, &hdr, &payload, &mut session);
+        // Primary ctx should be tracked as a context
+        assert_eq!(session.context_count(), 1);
+    }
+
+    #[test]
+    fn test_primary_ctx_release() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let payload = 0i32.to_le_bytes();
+        // Retain first
+        let hdr = req(MessageType::DevicePrimaryCtxRetain, payload.len() as u32);
+        dispatch_with(&gpu, &hdr, &payload, &mut session);
+        // Release
+        let hdr = req(MessageType::DevicePrimaryCtxRelease, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_primary_ctx_get_state() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0i32.to_le_bytes();
+        // Not active
+        let hdr = req(MessageType::DevicePrimaryCtxGetState, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let flags = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let active = i32::from_le_bytes(resp[8..12].try_into().unwrap());
+        assert_eq!(flags, 0);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn test_primary_ctx_set_flags() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&0i32.to_le_bytes());
+        payload[4..8].copy_from_slice(&0x04u32.to_le_bytes());
+        let hdr = req(MessageType::DevicePrimaryCtxSetFlags, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        // Verify flags via GetState
+        let state_payload = 0i32.to_le_bytes();
+        let hdr = req(MessageType::DevicePrimaryCtxGetState, state_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &state_payload);
+        let flags = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(flags, 0x04);
+    }
+
+    #[test]
+    fn test_primary_ctx_set_flags_rejected_when_active() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        // Retain
+        let retain_payload = 0i32.to_le_bytes();
+        let hdr = req(MessageType::DevicePrimaryCtxRetain, retain_payload.len() as u32);
+        dispatch_with(&gpu, &hdr, &retain_payload, &mut session);
+        // Try to set flags while active
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&0i32.to_le_bytes());
+        payload[4..8].copy_from_slice(&0x04u32.to_le_bytes());
+        let hdr = req(MessageType::DevicePrimaryCtxSetFlags, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::PrimaryContextActive);
+    }
+
+    #[test]
+    fn test_primary_ctx_reset() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        // Retain
+        let payload = 0i32.to_le_bytes();
+        let hdr = req(MessageType::DevicePrimaryCtxRetain, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert!(gpu.ctx_exists(ctx));
+        // Reset
+        let hdr = req(MessageType::DevicePrimaryCtxReset, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert!(!gpu.ctx_exists(ctx));
+    }
+
+    #[test]
+    fn test_primary_ctx_retain_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        let payload = 99i32.to_le_bytes();
+        let hdr = req(MessageType::DevicePrimaryCtxRetain, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_ne!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_primary_ctx_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 2]; // too short
+        let hdr = req(MessageType::DevicePrimaryCtxRetain, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }

@@ -45,6 +45,13 @@ extern CUresult ol_cuCtxGetCurrent(unsigned long long *pctx);
 extern CUresult ol_cuCtxGetDevice(int *dev);
 extern CUresult ol_cuCtxSynchronize(void);
 
+/* Primary context management */
+extern CUresult ol_cuDevicePrimaryCtxRetain(unsigned long long *pctx, int dev);
+extern CUresult ol_cuDevicePrimaryCtxRelease(int dev);
+extern CUresult ol_cuDevicePrimaryCtxGetState(int dev, unsigned int *flags, int *active);
+extern CUresult ol_cuDevicePrimaryCtxSetFlags(int dev, unsigned int flags);
+extern CUresult ol_cuDevicePrimaryCtxReset(int dev);
+
 /* Memory management -- CUdeviceptr is unsigned long long */
 extern CUresult ol_cuMemAlloc_v2(unsigned long long *dptr, size_t bytesize);
 extern CUresult ol_cuMemFree_v2(unsigned long long dptr);
@@ -133,6 +140,13 @@ CUresult hook_cuCtxSetCurrent(CUcontext ctx);
 CUresult hook_cuCtxGetCurrent(CUcontext *pctx);
 CUresult hook_cuCtxGetDevice(CUdevice *dev);
 CUresult hook_cuCtxSynchronize(void);
+
+/* Primary context */
+CUresult hook_cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev);
+CUresult hook_cuDevicePrimaryCtxRelease_v2(CUdevice dev);
+CUresult hook_cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int *flags, int *active);
+CUresult hook_cuDevicePrimaryCtxSetFlags_v2(CUdevice dev, unsigned int flags);
+CUresult hook_cuDevicePrimaryCtxReset_v2(CUdevice dev);
 
 /* Memory */
 CUresult hook_cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize);

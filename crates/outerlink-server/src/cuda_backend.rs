@@ -109,6 +109,13 @@ type FnCuMemFreeHost = unsafe extern "C" fn(p: *mut std::ffi::c_void) -> i32;
 // Stream wait event
 type FnCuStreamWaitEvent = unsafe extern "C" fn(stream: usize, event: usize, flags: u32) -> i32;
 
+// Primary context operations
+type FnCuDevicePrimaryCtxRetain = unsafe extern "C" fn(pctx: *mut usize, dev: i32) -> i32;
+type FnCuDevicePrimaryCtxRelease = unsafe extern "C" fn(dev: i32) -> i32;
+type FnCuDevicePrimaryCtxGetState = unsafe extern "C" fn(dev: i32, flags: *mut u32, active: *mut i32) -> i32;
+type FnCuDevicePrimaryCtxSetFlags = unsafe extern "C" fn(dev: i32, flags: u32) -> i32;
+type FnCuDevicePrimaryCtxReset = unsafe extern "C" fn(dev: i32) -> i32;
+
 // Kernel launch
 type FnCuLaunchKernel = unsafe extern "C" fn(
     f: usize,
@@ -184,6 +191,12 @@ struct CudaApi {
     cu_event_query: Option<FnCuEventQuery>,
 
     cu_launch_kernel: Option<FnCuLaunchKernel>,
+
+    cu_device_primary_ctx_retain: Option<FnCuDevicePrimaryCtxRetain>,
+    cu_device_primary_ctx_release: Option<FnCuDevicePrimaryCtxRelease>,
+    cu_device_primary_ctx_get_state: Option<FnCuDevicePrimaryCtxGetState>,
+    cu_device_primary_ctx_set_flags: Option<FnCuDevicePrimaryCtxSetFlags>,
+    cu_device_primary_ctx_reset: Option<FnCuDevicePrimaryCtxReset>,
 }
 
 // Safety: The function pointers in CudaApi are plain function pointers
@@ -292,6 +305,12 @@ impl CudaApi {
             cu_event_query: load_sym!(lib, b"cuEventQuery\0"),
 
             cu_launch_kernel: load_sym!(lib, b"cuLaunchKernel\0"),
+
+            cu_device_primary_ctx_retain: load_sym!(lib, b"cuDevicePrimaryCtxRetain\0"),
+            cu_device_primary_ctx_release: load_sym!(lib, b"cuDevicePrimaryCtxRelease_v2\0", b"cuDevicePrimaryCtxRelease\0"),
+            cu_device_primary_ctx_get_state: load_sym!(lib, b"cuDevicePrimaryCtxGetState\0"),
+            cu_device_primary_ctx_set_flags: load_sym!(lib, b"cuDevicePrimaryCtxSetFlags_v2\0", b"cuDevicePrimaryCtxSetFlags\0"),
+            cu_device_primary_ctx_reset: load_sym!(lib, b"cuDevicePrimaryCtxReset_v2\0", b"cuDevicePrimaryCtxReset\0"),
         }
     }
 }
@@ -950,6 +969,53 @@ impl GpuBackend for CudaGpuBackend {
         // The CUDA driver cleans up all resources when the process exits,
         // but we log explicitly so operators know cleanup was intentional.
         tracing::info!("CUDA backend: shutdown requested, driver will reclaim resources on exit");
+    }
+
+    fn primary_ctx_retain(&self, device: i32) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_device_primary_ctx_retain)?;
+        let dev = self.resolve_device(device)?;
+        let mut ctx: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut ctx, dev))?;
+        }
+        Ok(ctx as u64)
+    }
+
+    fn primary_ctx_release(&self, device: i32) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_device_primary_ctx_release)?;
+        let dev = self.resolve_device(device)?;
+        unsafe {
+            map_cuda_result(func(dev))
+        }
+    }
+
+    fn primary_ctx_get_state(&self, device: i32) -> Result<(u32, i32), CuResult> {
+        let func = require_fn(&self.api.cu_device_primary_ctx_get_state)?;
+        let dev = self.resolve_device(device)?;
+        let mut flags: u32 = 0;
+        let mut active: i32 = 0;
+        unsafe {
+            map_cuda_result(func(dev, &mut flags, &mut active))?;
+        }
+        Ok((flags, active))
+    }
+
+    fn primary_ctx_set_flags(&self, device: i32, flags: u32) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_device_primary_ctx_set_flags)?;
+        let dev = self.resolve_device(device)?;
+        unsafe {
+            map_cuda_result(func(dev, flags))
+        }
+    }
+
+    fn primary_ctx_reset(&self, device: i32) -> Result<Option<u64>, CuResult> {
+        let func = require_fn(&self.api.cu_device_primary_ctx_reset)?;
+        let dev = self.resolve_device(device)?;
+        unsafe {
+            map_cuda_result(func(dev))?;
+        }
+        // Real CUDA doesn't return the old handle; we return None.
+        Ok(None)
     }
 }
 

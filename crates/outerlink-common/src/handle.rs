@@ -57,6 +57,15 @@ impl HandleMap {
         }
     }
 
+    /// Return the existing local handle for a remote, or create a new mapping.
+    ///
+    /// This is semantically identical to [`insert`] but makes the intent
+    /// explicit: primary contexts always return the same handle, so repeated
+    /// calls with the same remote must yield the same local.
+    pub fn insert_or_get(&self, remote: u64) -> u64 {
+        self.insert(remote)
+    }
+
     /// Look up the remote handle for a local synthetic handle.
     pub fn to_remote(&self, local: u64) -> Option<u64> {
         self.local_to_remote.get(&local).map(|v| *v)

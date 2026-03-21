@@ -30,6 +30,9 @@ const CUDA_ERROR_INVALID_CONTEXT: u32 = 201;
 // Used by cuModuleGetFunction and cuGetProcAddress when symbols are not found
 #[allow(dead_code)]
 const CUDA_ERROR_NOT_FOUND: u32 = 500;
+// Returned by server when cuDevicePrimaryCtxSetFlags is called on an active context
+#[allow(dead_code)]
+const CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE: u32 = 708;
 const CUDA_ERROR_UNKNOWN: u32 = 999;
 
 // ---------------------------------------------------------------------------
@@ -544,6 +547,127 @@ pub extern "C" fn ol_cuCtxSynchronize() -> u32 {
         // Transport error -- fall through to stub
     }
     // Stub: nothing to synchronize
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Primary context management
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuDevicePrimaryCtxRetain(pctx: *mut u64, dev: i32) -> u32 {
+    let client = get_client();
+    if pctx.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if dev < 0 || dev >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let payload = dev.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DevicePrimaryCtxRetain, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.contexts.insert_or_get(remote_ctx);
+                // NOTE: Do NOT update current_remote_ctx -- CUDA semantics say
+                // Retain does NOT set current context.
+                unsafe { *pctx = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: deterministic remote handle per device for idempotent insert_or_get
+    let stub_remote = 0xFFFF_0000_0000_0000u64 + dev as u64;
+    let synthetic = client.handles.contexts.insert_or_get(stub_remote);
+    unsafe { *pctx = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuDevicePrimaryCtxRelease(dev: i32) -> u32 {
+    let client = get_client();
+    if dev < 0 || dev >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let payload = dev.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DevicePrimaryCtxRelease, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuDevicePrimaryCtxGetState(dev: i32, flags: *mut u32, active: *mut i32) -> u32 {
+    let client = get_client();
+    if dev < 0 || dev >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    if flags.is_null() || active.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let payload = dev.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DevicePrimaryCtxGetState, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let f = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+                let a = i32::from_le_bytes(resp[8..12].try_into().unwrap());
+                unsafe {
+                    *flags = f;
+                    *active = a;
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: inactive, no flags
+    unsafe {
+        *flags = 0;
+        *active = 0;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuDevicePrimaryCtxSetFlags(dev: i32, flags: u32) -> u32 {
+    let client = get_client();
+    if dev < 0 || dev >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&dev.to_le_bytes());
+        payload[4..8].copy_from_slice(&flags.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DevicePrimaryCtxSetFlags, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuDevicePrimaryCtxReset(dev: i32) -> u32 {
+    let client = get_client();
+    if dev < 0 || dev >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let payload = dev.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DevicePrimaryCtxReset, &payload) {
+            return parse_result(&resp);
+        }
+    }
     CUDA_SUCCESS
 }
 
@@ -2736,5 +2860,100 @@ mod tests {
         assert_eq!(ol_cuEventCreate(&mut event, 0), CUDA_SUCCESS);
         assert_eq!(ol_cuStreamWaitEvent(0xDEAD, event, 0), CUDA_ERROR_INVALID_VALUE);
         let _ = ol_cuEventDestroy(event);
+    }
+
+    // -- Primary context tests --
+
+    #[test]
+    fn test_ol_cu_primary_ctx_retain() {
+        let mut ctx: u64 = 0;
+        let result = ol_cuDevicePrimaryCtxRetain(&mut ctx, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(ctx, 0);
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_retain_idempotent() {
+        let mut ctx1: u64 = 0;
+        let mut ctx2: u64 = 0;
+        assert_eq!(ol_cuDevicePrimaryCtxRetain(&mut ctx1, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuDevicePrimaryCtxRetain(&mut ctx2, 0), CUDA_SUCCESS);
+        assert_eq!(ctx1, ctx2, "repeated retain must return same handle");
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_retain_null_ptr() {
+        assert_eq!(ol_cuDevicePrimaryCtxRetain(ptr::null_mut(), 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_retain_invalid_device() {
+        let mut ctx: u64 = 0;
+        assert_eq!(ol_cuDevicePrimaryCtxRetain(&mut ctx, 99), CUDA_ERROR_INVALID_DEVICE);
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_release() {
+        assert_eq!(ol_cuDevicePrimaryCtxRelease(0), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_release_invalid_device() {
+        assert_eq!(ol_cuDevicePrimaryCtxRelease(99), CUDA_ERROR_INVALID_DEVICE);
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_get_state() {
+        let mut flags: u32 = 0xFF;
+        let mut active: i32 = -1;
+        let result = ol_cuDevicePrimaryCtxGetState(0, &mut flags, &mut active);
+        assert_eq!(result, CUDA_SUCCESS);
+        // In stub mode, should be inactive with no flags
+        assert_eq!(flags, 0);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_get_state_null_ptrs() {
+        let mut active: i32 = 0;
+        assert_eq!(
+            ol_cuDevicePrimaryCtxGetState(0, ptr::null_mut(), &mut active),
+            CUDA_ERROR_INVALID_VALUE
+        );
+        let mut flags: u32 = 0;
+        assert_eq!(
+            ol_cuDevicePrimaryCtxGetState(0, &mut flags, ptr::null_mut()),
+            CUDA_ERROR_INVALID_VALUE
+        );
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_get_state_invalid_device() {
+        let mut flags: u32 = 0;
+        let mut active: i32 = 0;
+        assert_eq!(
+            ol_cuDevicePrimaryCtxGetState(99, &mut flags, &mut active),
+            CUDA_ERROR_INVALID_DEVICE
+        );
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_set_flags() {
+        assert_eq!(ol_cuDevicePrimaryCtxSetFlags(0, 0x04), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_set_flags_invalid_device() {
+        assert_eq!(ol_cuDevicePrimaryCtxSetFlags(99, 0), CUDA_ERROR_INVALID_DEVICE);
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_reset() {
+        assert_eq!(ol_cuDevicePrimaryCtxReset(0), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_primary_ctx_reset_invalid_device() {
+        assert_eq!(ol_cuDevicePrimaryCtxReset(99), CUDA_ERROR_INVALID_DEVICE);
     }
 }
