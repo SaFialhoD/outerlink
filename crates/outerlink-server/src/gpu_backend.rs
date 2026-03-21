@@ -41,7 +41,7 @@ pub trait GpuBackend: Send + Sync {
     fn mem_alloc(&self, size: usize) -> Result<u64, CuResult>;
 
     /// Free a previously-allocated device pointer.
-    fn mem_free(&self, ptr: u64) -> CuResult;
+    fn mem_free(&self, ptr: u64) -> Result<(), CuResult>;
 
     /// Copy host data to device memory (host-to-device).
     fn memcpy_htod(&self, dst: u64, data: &[u8]) -> CuResult;
@@ -394,10 +394,10 @@ impl GpuBackend for StubGpuBackend {
         Ok(ptr)
     }
 
-    fn mem_free(&self, ptr: u64) -> CuResult {
+    fn mem_free(&self, ptr: u64) -> Result<(), CuResult> {
         match self.state.lock().unwrap().allocations.remove(&ptr) {
-            Some(_) => CuResult::Success,
-            None => CuResult::InvalidValue,
+            Some(_) => Ok(()),
+            None => Err(CuResult::InvalidValue),
         }
     }
 
@@ -887,9 +887,9 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let ptr = gpu.mem_alloc(1024).unwrap();
         assert_ne!(ptr, 0);
-        assert_eq!(gpu.mem_free(ptr), CuResult::Success);
+        assert!(gpu.mem_free(ptr).is_ok());
         // Double free should fail.
-        assert_eq!(gpu.mem_free(ptr), CuResult::InvalidValue);
+        assert_eq!(gpu.mem_free(ptr), Err(CuResult::InvalidValue));
     }
 
     #[test]
@@ -909,7 +909,7 @@ mod tests {
         let out = gpu.memcpy_dtoh(ptr, 256).unwrap();
         assert_eq!(out, data);
 
-        gpu.mem_free(ptr);
+        let _ = gpu.mem_free(ptr);
     }
 
     #[test]
@@ -918,7 +918,7 @@ mod tests {
         let ptr = gpu.mem_alloc(16).unwrap();
         let big = vec![0u8; 32];
         assert_eq!(gpu.memcpy_htod(ptr, &big), CuResult::InvalidValue);
-        gpu.mem_free(ptr);
+        let _ = gpu.mem_free(ptr);
     }
 
     #[test]
@@ -926,7 +926,7 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let ptr = gpu.mem_alloc(16).unwrap();
         assert_eq!(gpu.memcpy_dtoh(ptr, 32), Err(CuResult::InvalidValue));
-        gpu.mem_free(ptr);
+        let _ = gpu.mem_free(ptr);
     }
 
     #[test]
@@ -941,7 +941,7 @@ mod tests {
         assert_eq!(total2, total);
         assert_eq!(free2, total - 1024);
 
-        gpu.mem_free(ptr);
+        let _ = gpu.mem_free(ptr);
     }
 
     #[test]

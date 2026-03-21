@@ -549,18 +549,11 @@ impl GpuBackend for CudaGpuBackend {
         Ok(dptr)
     }
 
-    fn mem_free(&self, ptr: u64) -> CuResult {
-        let func = match require_fn(&self.api.cu_mem_free) {
-            Ok(f) => f,
-            Err(e) => return e,
-        };
-        match unsafe { map_cuda_result(func(ptr)) } {
-            Ok(()) => {
-                tracing::trace!(ptr, "VRAM freed");
-                CuResult::Success
-            }
-            Err(e) => e,
-        }
+    fn mem_free(&self, ptr: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_mem_free)?;
+        unsafe { map_cuda_result(func(ptr)) }?;
+        tracing::trace!(ptr, "VRAM freed");
+        Ok(())
     }
 
     fn memcpy_htod(&self, dst: u64, data: &[u8]) -> CuResult {

@@ -265,13 +265,15 @@ impl ConnectionSession {
 
         // 4. Device memory
         for ptr in self.mem_allocations.drain() {
-            let r = backend.mem_free(ptr);
-            if r == CuResult::Success {
-                tracing::info!(ptr = ptr, "session cleanup: freed device memory");
-                report.succeeded += 1;
-            } else {
-                tracing::warn!(ptr = ptr, error = ?r, "session cleanup: failed to free device memory");
-                report.failed += 1;
+            match backend.mem_free(ptr) {
+                Ok(()) => {
+                    tracing::info!(ptr = ptr, "session cleanup: freed device memory");
+                    report.succeeded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(ptr = ptr, error = ?e, "session cleanup: failed to free device memory");
+                    report.failed += 1;
+                }
             }
         }
 
@@ -569,7 +571,7 @@ mod tests {
         assert_eq!(session.current_ctx(), 0);
 
         // Verify the backend actually freed the resources: re-freeing should fail.
-        assert_ne!(backend.mem_free(ptr), CuResult::Success);
+        assert!(backend.mem_free(ptr).is_err());
         assert!(backend.ctx_destroy(ctx).is_err());
         assert!(backend.stream_destroy(stream).is_err());
         assert!(backend.event_destroy(event).is_err());
@@ -600,7 +602,7 @@ mod tests {
         assert!(data.is_ok(), "session B's allocation should still be valid");
 
         // Session A's memory should be gone.
-        assert_ne!(backend.mem_free(ptr_a), CuResult::Success);
+        assert!(backend.mem_free(ptr_a).is_err());
     }
 
     #[test]
@@ -621,8 +623,9 @@ mod tests {
         let ptr = backend.mem_alloc(256).unwrap();
         session.track_mem_alloc(ptr);
 
-        // Free it manually (simulating another session or external free).
-        backend.mem_free(ptr);
+        // Free it manually (simulating backend-level corruption — not a
+        // normal multi-session case, since resources are strictly per-session).
+        let _ = backend.mem_free(ptr);
 
         // Cleanup should report a failure for this resource.
         let report = session.cleanup(&backend);

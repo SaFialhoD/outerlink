@@ -181,11 +181,13 @@ pub fn handle_request(
                 return error_response(rid, CuResult::InvalidValue);
             }
             let ptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
-            let r = backend.mem_free(ptr);
-            if r == CuResult::Success {
-                session.untrack_mem_alloc(ptr);
+            match backend.mem_free(ptr) {
+                Ok(()) => {
+                    session.untrack_mem_alloc(ptr);
+                    result_only(rid, CuResult::Success)
+                }
+                Err(e) => result_only(rid, e),
             }
-            result_only(rid, r)
         }
 
         MessageType::MemcpyHtoD => {

@@ -134,7 +134,13 @@ impl Server {
             );
 
             let drain_result = tokio::time::timeout(self.drain_timeout, async {
-                while join_set.join_next().await.is_some() {}
+                while let Some(result) = join_set.join_next().await {
+                    if let Err(e) = result {
+                        if e.is_panic() {
+                            tracing::error!("connection task panicked during drain: {:?}", e);
+                        }
+                    }
+                }
             })
             .await;
 
@@ -149,7 +155,7 @@ impl Server {
                         "drain timeout expired, aborting remaining connections"
                     );
                     join_set.abort_all();
-                    // Wait for abort to complete.
+                    // Wait for abort to complete (cancelled tasks are expected here).
                     while join_set.join_next().await.is_some() {}
                 }
             }
@@ -164,8 +170,10 @@ impl Server {
 
 /// Drive a single client connection to completion.
 ///
-/// Also monitors the shutdown signal: when shutdown is requested, we allow
-/// the current in-flight request to finish but then stop reading new ones.
+/// Monitors the shutdown signal: when shutdown is requested, we finish
+/// processing the current in-flight request, then stop reading new ones.
+/// On any exit (clean close, error, or shutdown), session resources are
+/// cleaned up via `session.cleanup()`.
 async fn handle_connection(
     conn: TcpTransportConnection,
     backend: Arc<dyn GpuBackend>,
@@ -173,19 +181,36 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     let mut session = ConnectionSession::new();
 
+    let result = handle_connection_loop(&conn, &*backend, shutdown_rx, &mut session).await;
+
+    // Always clean up session resources, regardless of how we exit.
+    let report = session.cleanup(&*backend);
+    if report.succeeded > 0 || report.failed > 0 {
+        tracing::info!(
+            succeeded = report.succeeded,
+            failed = report.failed,
+            "session cleanup complete"
+        );
+    }
+
+    result
+}
+
+/// Inner loop for a single client connection.
+///
+/// Separated from `handle_connection` so that session cleanup is
+/// structurally guaranteed to run after this returns.
+async fn handle_connection_loop(
+    conn: &TcpTransportConnection,
+    backend: &dyn GpuBackend,
+    shutdown_rx: &mut watch::Receiver<()>,
+    session: &mut ConnectionSession,
+) -> anyhow::Result<()> {
     loop {
         // Wait for either a new message or a shutdown signal.
         let msg = tokio::select! {
-            biased;
-
             _ = shutdown_rx.changed() => {
                 tracing::debug!("connection received shutdown signal, finishing");
-                // Drain: continue processing already-received data but
-                // don't wait for the next request. We do one more non-blocking
-                // attempt to read and respond, then exit.
-                //
-                // In practice, the client will notice the connection close
-                // and reconnect to another server or retry.
                 return Ok(());
             }
 
@@ -207,11 +232,17 @@ async fn handle_connection(
             "received request"
         );
 
-        // Dispatch.
+        // Dispatch — always process a received message before checking shutdown.
         let (resp_header, resp_payload) =
-            handle_request(&*backend, &header, &payload, &mut session);
+            handle_request(backend, &header, &payload, session);
 
         // Write the response.
         conn.send_message(&resp_header, &resp_payload).await?;
+
+        // Check shutdown after completing this request, before reading next.
+        if shutdown_rx.has_changed().unwrap_or(true) {
+            tracing::debug!("shutdown pending, stopping after completed request");
+            return Ok(());
+        }
     }
 }
