@@ -465,6 +465,19 @@ done:\n\
     assert_success(&payload);
     eprintln!("[REAL GPU] Uploaded {n} floats to input buffer");
 
+    // Verify upload by reading back immediately
+    let mut verify_payload = input_ptr.to_le_bytes().to_vec();
+    verify_payload.extend_from_slice(&buf_size.to_le_bytes());
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::MemcpyDtoH, &verify_payload, 60).await;
+    let vdata = assert_success(&payload);
+    let verify_floats: Vec<f32> = vdata
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    eprintln!("[REAL GPU] Upload verify first 8: {:?}", &verify_floats[..8]);
+    eprintln!("[REAL GPU] Upload verify last  8: {:?}", &verify_floats[verify_floats.len()-8..]);
+
     // ---------------------------------------------------------------
     // 6. Launch kernel: grid=(1,1,1), block=(N,1,1), shared=0, stream=0
     // ---------------------------------------------------------------
@@ -578,4 +591,128 @@ done:\n\
 
     drop(client);
     server.await.unwrap();
+}
+
+/// Direct GPU test — bypasses TCP/handler entirely.
+/// Calls CudaGpuBackend methods directly to isolate whether the kernel
+/// launch bug is in the protocol layer or the CUDA calls.
+#[test]
+fn test_direct_kernel_launch() {
+    let backend = match CudaGpuBackend::new() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[SKIP] {e}");
+            return;
+        }
+    };
+    let init = backend.init();
+    assert!(init.is_success(), "init failed: {init:?}");
+
+    // 1. Create context
+    let ctx = backend.ctx_create(0, 0).expect("ctx_create");
+    eprintln!("[DIRECT] Context: 0x{ctx:016X}");
+
+    // 2. Load PTX
+    let ptx = b"\
+.version 7.0\n\
+.target sm_80\n\
+.address_size 64\n\
+\n\
+.visible .entry double_elements(\n\
+    .param .u64 input,\n\
+    .param .u64 output,\n\
+    .param .u32 n\n\
+)\n\
+{\n\
+    .reg .pred %p0;\n\
+    .reg .u32 %idx, %n;\n\
+    .reg .u64 %in_ptr, %out_ptr, %offset;\n\
+    .reg .f32 %val, %result;\n\
+\n\
+    ld.param.u64 %in_ptr, [input];\n\
+    ld.param.u64 %out_ptr, [output];\n\
+    ld.param.u32 %n, [n];\n\
+\n\
+    mov.u32 %idx, %tid.x;\n\
+    setp.ge.u32 %p0, %idx, %n;\n\
+    @%p0 bra done;\n\
+\n\
+    mul.wide.u32 %offset, %idx, 4;\n\
+    add.u64 %in_ptr, %in_ptr, %offset;\n\
+    add.u64 %out_ptr, %out_ptr, %offset;\n\
+\n\
+    ld.global.f32 %val, [%in_ptr];\n\
+    add.f32 %result, %val, %val;\n\
+    st.global.f32 [%out_ptr], %result;\n\
+\n\
+done:\n\
+    ret;\n\
+}\n\0";
+
+    let module = backend.module_load_data(ptx).expect("module_load_data");
+    eprintln!("[DIRECT] Module: 0x{module:016X}");
+
+    let func = backend.module_get_function(module, "double_elements").expect("get_function");
+    eprintln!("[DIRECT] Function: 0x{func:016X}");
+
+    // 3. Allocate + upload
+    let n: u32 = 8; // Small — easier to debug
+    let buf_size = (n as usize) * 4;
+    let input_ptr = backend.mem_alloc(buf_size).expect("alloc input");
+    let output_ptr = backend.mem_alloc(buf_size).expect("alloc output");
+    eprintln!("[DIRECT] input=0x{input_ptr:016X} output=0x{output_ptr:016X}");
+
+    let input_data: Vec<f32> = (1..=n).map(|i| i as f32).collect();
+    let input_bytes: Vec<u8> = input_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert!(backend.memcpy_htod(input_ptr, &input_bytes).is_success(), "htod failed");
+
+    // Verify upload by reading back
+    let readback = backend.memcpy_dtoh(input_ptr, buf_size).expect("dtoh readback");
+    let readback_floats: Vec<f32> = readback
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    eprintln!("[DIRECT] Upload verified: {:?}", readback_floats);
+
+    // 4. Launch kernel DIRECTLY (no serialization)
+    // Build params in the wire format: [4B num_params][4B size][bytes]...
+    let mut wire_params = Vec::new();
+    wire_params.extend_from_slice(&3_u32.to_le_bytes()); // num_params = 3
+    wire_params.extend_from_slice(&8_u32.to_le_bytes()); // param 0 size = 8
+    wire_params.extend_from_slice(&input_ptr.to_le_bytes()); // param 0: input ptr
+    wire_params.extend_from_slice(&8_u32.to_le_bytes()); // param 1 size = 8
+    wire_params.extend_from_slice(&output_ptr.to_le_bytes()); // param 1: output ptr
+    wire_params.extend_from_slice(&4_u32.to_le_bytes()); // param 2 size = 4
+    wire_params.extend_from_slice(&n.to_le_bytes()); // param 2: n (u32)
+
+    backend
+        .launch_kernel(func, [1, 1, 1], [n, 1, 1], 0, 0, &wire_params)
+        .expect("launch_kernel");
+
+    // 5. Synchronize
+    backend.ctx_synchronize().expect("ctx_synchronize");
+
+    // 6. Read back output
+    let output_bytes = backend.memcpy_dtoh(output_ptr, buf_size).expect("dtoh output");
+    let output_floats: Vec<f32> = output_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    eprintln!("[DIRECT] Output: {:?}", output_floats);
+
+    // 7. Verify
+    for (i, (&out, &inp)) in output_floats.iter().zip(input_data.iter()).enumerate() {
+        let expected = inp * 2.0;
+        assert!(
+            (out - expected).abs() < f32::EPSILON,
+            "MISMATCH at index {i}: expected {expected}, got {out}"
+        );
+    }
+    eprintln!("[DIRECT] ALL {n} elements correct!");
+
+    // 8. Cleanup
+    let _ = backend.mem_free(input_ptr);
+    let _ = backend.mem_free(output_ptr);
+    let _ = backend.module_unload(module);
+    let _ = backend.ctx_destroy(ctx);
 }
