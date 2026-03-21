@@ -130,12 +130,10 @@ impl OuterLinkClient {
             let conn = Arc::new(TcpTransportConnection::new(stream).map_err(|e| {
                 OuterLinkError::Connection(format!("failed to initialize connection: {}", e))
             })?);
-            let mut guard = self.connection.lock().unwrap();
-            *guard = Some(Arc::clone(&conn));
-            drop(guard);
-            self.connected.store(true, Ordering::Release);
 
-            // Send the one-time per-connection Handshake.
+            // Perform handshake BEFORE storing connection or setting connected flag.
+            // This prevents a race where another thread sees connected=true but the
+            // handshake hasn't completed (or fails).
             let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
             let header = MessageHeader::new_request(req_id, MessageType::Handshake, 0);
             conn.send_message(&header, &[]).await.map_err(|e| {
@@ -153,6 +151,12 @@ impl OuterLinkClient {
                     ));
                 }
             }
+
+            // Handshake succeeded — now store the connection and mark as connected.
+            let mut guard = self.connection.lock().unwrap();
+            *guard = Some(Arc::clone(&conn));
+            drop(guard);
+            self.connected.store(true, Ordering::Release);
 
             Ok(())
         })

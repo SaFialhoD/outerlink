@@ -54,7 +54,7 @@ impl RetryConfig {
     /// `retry_delays` is empty.
     pub fn retry_delay(&self, n: u32) -> Duration {
         if self.retry_delays.is_empty() {
-            return Duration::from_millis(0);
+            return Duration::ZERO;
         }
         let idx = (n as usize).min(self.retry_delays.len() - 1);
         self.retry_delays[idx]

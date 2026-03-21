@@ -49,13 +49,13 @@ make native
 
 # Run with interception
 make interpose OUTERLINK_LIB=../../target/release/libouterlink_client.so \
-               OUTERLINK_SERVER=192.168.1.100:9990
+               OUTERLINK_SERVER=192.168.1.100:14833
 ```
 
 Or manually:
 
 ```bash
-OUTERLINK_SERVER=192.168.1.100:9990 \
+OUTERLINK_SERVER=192.168.1.100:14833 \
 LD_PRELOAD=../../target/release/libouterlink_client.so \
 ./test_vector_add
 ```
@@ -105,6 +105,7 @@ The CUDA driver JIT-compiles PTX to the actual GPU architecture at load time, so
 - `crates/outerlink-client/csrc/interpose.h` -- Hook declarations and Rust FFI
 - `cuda-stubs/cuda.h` -- CUDA Driver API type stubs
 
-## Open Questions
+## Notes
 
-- The current `hook_cuLaunchKernel` in interpose.c passes NULL for kernel params because param sizes cannot be inferred from the Driver API signature alone. Phase 2 will add PTX metadata introspection to resolve this. Until then, kernel launches under interposition will not forward parameter data.
+- **Kernel parameter forwarding** is implemented via two paths in `hook_cuLaunchKernel`: the `extra` buffer path (universal) and `cuFuncGetParamInfo` introspection (CUDA 12.3+ / driver 545+). On older drivers, params fall back to NULL.
+- **Driver requirement**: The `cuFuncGetParamInfo` path requires NVIDIA driver >= 545. Verify with `nvidia-smi` before running the E2E test.

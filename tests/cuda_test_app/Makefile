@@ -13,7 +13,7 @@ CUDA_PATH ?= /usr/local/cuda
 OUTERLINK_LIB ?= ../../target/release/libouterlink_client.so
 
 # OuterLink server address for interposed mode
-OUTERLINK_SERVER ?= 127.0.0.1:9990
+OUTERLINK_SERVER ?= 127.0.0.1:14833
 
 # ---------- Compiler ----------
 
@@ -52,7 +52,7 @@ help:
 	@echo "Variables:"
 	@echo "  CUDA_PATH         CUDA toolkit location  (default: /usr/local/cuda)"
 	@echo "  OUTERLINK_LIB     Path to libouterlink_client.so"
-	@echo "  OUTERLINK_SERVER  Server address          (default: 127.0.0.1:9990)"
+	@echo "  OUTERLINK_SERVER  Server address          (default: 127.0.0.1:14833)"
 
 # Build the test binary linking against the real CUDA driver library.
 # This produces a native executable for baseline verification.

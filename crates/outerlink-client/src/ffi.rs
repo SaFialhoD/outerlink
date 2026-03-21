@@ -44,10 +44,8 @@ static CLIENT: OnceLock<OuterLinkClient> = OnceLock::new();
 /// Prevents handle collision when the same device is used for multiple contexts
 /// or when allocation sizes happen to collide.
 ///
-/// TODO: Remove this counter once real server integration is wired. At that point,
-/// remote handle values will come from the server's responses, not from a local
-/// counter. Every usage site (ol_cuCtxCreate_v2, ol_cuMemAlloc_v2, etc.) must be
-/// updated to use server-provided handles instead.
+/// When connected to a server, handles come from server responses. This counter is
+/// only used in disconnected/stub fallback mode to generate unique local handles.
 static STUB_HANDLE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0x1000);
 
@@ -755,6 +753,7 @@ pub extern "C" fn ol_cuGetErrorName(
         2 => b"CUDA_ERROR_OUT_OF_MEMORY\0",
         3 => b"CUDA_ERROR_NOT_INITIALIZED\0",
         4 => b"CUDA_ERROR_DEINITIALIZED\0",
+        5 => b"CUDA_ERROR_PROFILER_DISABLED\0",
         6 => b"CUDA_ERROR_PROFILER_NOT_INITIALIZED\0",
         7 => b"CUDA_ERROR_PROFILER_ALREADY_STARTED\0",
         8 => b"CUDA_ERROR_PROFILER_ALREADY_STOPPED\0",
@@ -818,6 +817,7 @@ pub extern "C" fn ol_cuGetErrorString(
         2 => b"out of memory\0",
         3 => b"not initialized\0",
         4 => b"driver shutting down\0",
+        5 => b"profiler is disabled for this run\0",
         6 => b"profiler not initialized\0",
         7 => b"profiler already started\0",
         8 => b"profiler already stopped\0",
