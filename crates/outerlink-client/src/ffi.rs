@@ -2117,6 +2117,219 @@ pub extern "C" fn ol_cuPointerGetAttributes(
 }
 
 // ---------------------------------------------------------------------------
+// Managed / unified memory operations
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemAllocManaged(dptr: *mut u64, byte_size: usize, flags: u32) -> u32 {
+    let client = get_client();
+    if dptr.is_null() || byte_size == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&(byte_size as u64).to_le_bytes());
+        payload.extend_from_slice(&flags.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemAllocManaged, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_devptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.device_ptrs.insert(remote_devptr);
+                device_alloc_sizes().lock().unwrap().insert(synthetic, byte_size);
+                unsafe { *dptr = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: generate a local-only handle (same as cuMemAlloc stub)
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.device_ptrs.insert(stub_remote);
+    device_alloc_sizes().lock().unwrap().insert(synthetic, byte_size);
+    unsafe { *dptr = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemPrefetchAsync(dptr: u64, count: usize, dst_device: i32, stream: u64) -> u32 {
+    let client = get_client();
+    // Validate: dptr must be a known device pointer
+    let remote_dptr = match client.handles.device_ptrs.to_remote(dptr) {
+        Some(r) => r,
+        None => return CUDA_ERROR_INVALID_VALUE,
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = Vec::with_capacity(28);
+        payload.extend_from_slice(&remote_dptr.to_le_bytes());
+        payload.extend_from_slice(&(count as u64).to_le_bytes());
+        payload.extend_from_slice(&dst_device.to_le_bytes());
+        let remote_stream = if stream == 0 { 0u64 } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        payload.extend_from_slice(&remote_stream.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemPrefetchAsync, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    // Stub: prefetch is a hint, always succeeds for a valid ptr
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemAdvise(dptr: u64, count: usize, advice: i32, device: i32) -> u32 {
+    let client = get_client();
+    let remote_dptr = match client.handles.device_ptrs.to_remote(dptr) {
+        Some(r) => r,
+        None => return CUDA_ERROR_INVALID_VALUE,
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = Vec::with_capacity(24);
+        payload.extend_from_slice(&remote_dptr.to_le_bytes());
+        payload.extend_from_slice(&(count as u64).to_le_bytes());
+        payload.extend_from_slice(&advice.to_le_bytes());
+        payload.extend_from_slice(&device.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemAdvise, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    // Stub: advice is a hint, always succeeds for a valid ptr
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemRangeGetAttribute(
+    data: *mut u8,
+    data_size: usize,
+    attribute: i32,
+    dptr: u64,
+    count: usize,
+) -> u32 {
+    let client = get_client();
+    if data.is_null() || data_size == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let remote_dptr = match client.handles.device_ptrs.to_remote(dptr) {
+        Some(r) => r,
+        None => return CUDA_ERROR_INVALID_VALUE,
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = Vec::with_capacity(20);
+        payload.extend_from_slice(&attribute.to_le_bytes());
+        payload.extend_from_slice(&remote_dptr.to_le_bytes());
+        payload.extend_from_slice(&(count as u64).to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemRangeGetAttribute, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let value = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                // Write as many bytes of the value as data_size allows
+                let write_len = data_size.min(8);
+                let value_bytes = value.to_le_bytes();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(value_bytes.as_ptr(), data, write_len);
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: return default (0) for known attributes, error for unknown
+    match attribute {
+        1 | 2 | 3 | 4 => {
+            let value: u64 = 0;
+            let write_len = data_size.min(8);
+            let value_bytes = value.to_le_bytes();
+            unsafe {
+                std::ptr::copy_nonoverlapping(value_bytes.as_ptr(), data, write_len);
+            }
+            CUDA_SUCCESS
+        }
+        _ => CUDA_ERROR_INVALID_VALUE,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemRangeGetAttributes(
+    data: *mut *mut u8,
+    data_sizes: *const usize,
+    attributes: *const i32,
+    num_attributes: usize,
+    dptr: u64,
+    count: usize,
+) -> u32 {
+    let client = get_client();
+    if data.is_null() || data_sizes.is_null() || attributes.is_null() || num_attributes == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let remote_dptr = match client.handles.device_ptrs.to_remote(dptr) {
+        Some(r) => r,
+        None => return CUDA_ERROR_INVALID_VALUE,
+    };
+    // Read attribute list
+    let attrs: Vec<i32> = unsafe {
+        std::slice::from_raw_parts(attributes, num_attributes).to_vec()
+    };
+    let sizes: Vec<usize> = unsafe {
+        std::slice::from_raw_parts(data_sizes, num_attributes).to_vec()
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = Vec::with_capacity(20 + num_attributes * 4);
+        payload.extend_from_slice(&remote_dptr.to_le_bytes());
+        payload.extend_from_slice(&(count as u64).to_le_bytes());
+        payload.extend_from_slice(&(num_attributes as i32).to_le_bytes());
+        for &a in &attrs {
+            payload.extend_from_slice(&a.to_le_bytes());
+        }
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemRangeGetAttributes, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            // Response: N * u64 values starting at offset 4
+            if resp.len() >= 4 + num_attributes * 8 {
+                for i in 0..num_attributes {
+                    let offset = 4 + i * 8;
+                    let value = u64::from_le_bytes(resp[offset..offset + 8].try_into().unwrap());
+                    let write_len = sizes[i].min(8);
+                    let value_bytes = value.to_le_bytes();
+                    unsafe {
+                        let out_ptr = *data.add(i);
+                        if !out_ptr.is_null() {
+                            std::ptr::copy_nonoverlapping(value_bytes.as_ptr(), out_ptr, write_len);
+                        }
+                    }
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: return defaults for each attribute
+    for i in 0..num_attributes {
+        match attrs[i] {
+            1 | 2 | 3 | 4 => {
+                let value: u64 = 0;
+                let write_len = sizes[i].min(8);
+                let value_bytes = value.to_le_bytes();
+                unsafe {
+                    let out_ptr = *data.add(i);
+                    if !out_ptr.is_null() {
+                        std::ptr::copy_nonoverlapping(value_bytes.as_ptr(), out_ptr, write_len);
+                    }
+                }
+            }
+            _ => return CUDA_ERROR_INVALID_VALUE,
+        }
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // Stream-ordered memory / pool operations
 // ---------------------------------------------------------------------------
 
@@ -8451,5 +8664,184 @@ mod tests {
     #[test]
     fn test_mem_get_allocation_granularity_null_output() {
         assert_eq!(ol_cuMemGetAllocationGranularity(ptr::null_mut(), ptr::null(), 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // ----- cuMemAllocManaged tests -----
+
+    #[test]
+    fn test_ol_cu_mem_alloc_managed() {
+        let mut dptr: u64 = 0;
+        let result = ol_cuMemAllocManaged(&mut dptr, 1024, 1);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(dptr, 0);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_alloc_managed_null_ptr() {
+        let result = ol_cuMemAllocManaged(ptr::null_mut(), 1024, 1);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_alloc_managed_zero_size() {
+        let mut dptr: u64 = 0;
+        let result = ol_cuMemAllocManaged(&mut dptr, 0, 1);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_alloc_managed_freeable() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAllocManaged(&mut dptr, 2048, 1), CUDA_SUCCESS);
+        // Should be freeable via regular cuMemFree
+        assert_eq!(ol_cuMemFree_v2(dptr), CUDA_SUCCESS);
+    }
+
+    // ----- cuMemPrefetchAsync tests -----
+
+    #[test]
+    fn test_ol_cu_mem_prefetch_async() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAllocManaged(&mut dptr, 1024, 1), CUDA_SUCCESS);
+        let result = ol_cuMemPrefetchAsync(dptr, 1024, 0, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_prefetch_async_invalid_ptr() {
+        let result = ol_cuMemPrefetchAsync(0xDEADBEEF, 1024, 0, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_prefetch_async_host_dest() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAllocManaged(&mut dptr, 512, 1), CUDA_SUCCESS);
+        // device = -1 means prefetch to host
+        let result = ol_cuMemPrefetchAsync(dptr, 512, -1, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+    }
+
+    // ----- cuMemAdvise tests -----
+
+    #[test]
+    fn test_ol_cu_mem_advise() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAllocManaged(&mut dptr, 1024, 1), CUDA_SUCCESS);
+        // CU_MEM_ADVISE_SET_READ_MOSTLY = 1
+        let result = ol_cuMemAdvise(dptr, 1024, 1, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_advise_invalid_ptr() {
+        let result = ol_cuMemAdvise(0xDEADBEEF, 1024, 1, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // ----- cuMemRangeGetAttribute tests -----
+
+    #[test]
+    fn test_ol_cu_mem_range_get_attribute() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAllocManaged(&mut dptr, 1024, 1), CUDA_SUCCESS);
+        let mut value: u64 = 0xFF;
+        let result = ol_cuMemRangeGetAttribute(
+            &mut value as *mut u64 as *mut u8,
+            std::mem::size_of::<u64>(),
+            1, // READ_MOSTLY
+            dptr,
+            1024,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(value, 0); // default = false
+    }
+
+    #[test]
+    fn test_ol_cu_mem_range_get_attribute_null_data() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAllocManaged(&mut dptr, 1024, 1), CUDA_SUCCESS);
+        let result = ol_cuMemRangeGetAttribute(ptr::null_mut(), 8, 1, dptr, 1024);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_range_get_attribute_invalid_ptr() {
+        let mut value: u64 = 0;
+        let result = ol_cuMemRangeGetAttribute(
+            &mut value as *mut u64 as *mut u8,
+            8,
+            1,
+            0xDEADBEEF,
+            1024,
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_range_get_attribute_invalid_attr() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAllocManaged(&mut dptr, 1024, 1), CUDA_SUCCESS);
+        let mut value: u64 = 0;
+        let result = ol_cuMemRangeGetAttribute(
+            &mut value as *mut u64 as *mut u8,
+            8,
+            999,
+            dptr,
+            1024,
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // ----- cuMemRangeGetAttributes tests -----
+
+    #[test]
+    fn test_ol_cu_mem_range_get_attributes() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAllocManaged(&mut dptr, 1024, 1), CUDA_SUCCESS);
+        let attrs: [i32; 2] = [1, 2]; // READ_MOSTLY, PREFERRED_LOCATION
+        let mut v0: u64 = 0xFF;
+        let mut v1: u64 = 0xFF;
+        let mut data_ptrs: [*mut u8; 2] = [
+            &mut v0 as *mut u64 as *mut u8,
+            &mut v1 as *mut u64 as *mut u8,
+        ];
+        let sizes: [usize; 2] = [8, 8];
+        let result = ol_cuMemRangeGetAttributes(
+            data_ptrs.as_mut_ptr(),
+            sizes.as_ptr(),
+            attrs.as_ptr(),
+            2,
+            dptr,
+            1024,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(v0, 0);
+        assert_eq!(v1, 0);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_range_get_attributes_null_args() {
+        assert_eq!(
+            ol_cuMemRangeGetAttributes(ptr::null_mut(), ptr::null(), ptr::null(), 0, 0, 0),
+            CUDA_ERROR_INVALID_VALUE
+        );
+    }
+
+    #[test]
+    fn test_ol_cu_mem_range_get_attributes_invalid_ptr() {
+        let attrs: [i32; 1] = [1];
+        let mut v0: u64 = 0;
+        let mut data_ptrs: [*mut u8; 1] = [&mut v0 as *mut u64 as *mut u8];
+        let sizes: [usize; 1] = [8];
+        let result = ol_cuMemRangeGetAttributes(
+            data_ptrs.as_mut_ptr(),
+            sizes.as_ptr(),
+            attrs.as_ptr(),
+            1,
+            0xDEADBEEF,
+            1024,
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
     }
 }

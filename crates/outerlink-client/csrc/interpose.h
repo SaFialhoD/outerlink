@@ -124,6 +124,13 @@ extern CUresult ol_cuGraphLaunch(unsigned long long graphExec, unsigned long lon
 extern CUresult ol_cuGraphExecDestroy(unsigned long long graphExec);
 extern CUresult ol_cuGraphDestroy(unsigned long long graph);
 
+/* Managed / unified memory (CUDA 6.0+) */
+extern CUresult ol_cuMemAllocManaged(unsigned long long *dptr, size_t bytesize, unsigned int flags);
+extern CUresult ol_cuMemPrefetchAsync(unsigned long long dptr, size_t count, int dstDevice, unsigned long long hStream);
+extern CUresult ol_cuMemAdvise(unsigned long long dptr, size_t count, int advice, int device);
+extern CUresult ol_cuMemRangeGetAttribute(unsigned char *data, size_t dataSize, int attribute, unsigned long long devPtr, size_t count);
+extern CUresult ol_cuMemRangeGetAttributes(unsigned char **data, const size_t *dataSizes, const int *attributes, size_t numAttributes, unsigned long long devPtr, size_t count);
+
 /* Stream-ordered memory / pool (CUDA 11.2+) */
 extern CUresult ol_cuMemAllocAsync(unsigned long long *dptr, size_t bytesize, unsigned long long hStream);
 extern CUresult ol_cuMemFreeAsync(unsigned long long dptr, unsigned long long hStream);
@@ -319,6 +326,13 @@ CUresult hook_cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short value, size
 CUresult hook_cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount);
 CUresult hook_cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream);
 CUresult hook_cuMemGetInfo_v2(size_t *free, size_t *total);
+
+/* Managed / unified memory */
+CUresult hook_cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize, unsigned int flags);
+CUresult hook_cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count, CUdevice dstDevice, CUstream hStream);
+CUresult hook_cuMemAdvise(CUdeviceptr devPtr, size_t count, int advice, CUdevice device);
+CUresult hook_cuMemRangeGetAttribute(void *data, size_t dataSize, int attribute, CUdeviceptr devPtr, size_t count);
+CUresult hook_cuMemRangeGetAttributes(void **data, size_t *dataSizes, int *attributes, size_t numAttributes, CUdeviceptr devPtr, size_t count);
 
 /* Memory pool (CUDA 11.2+) */
 CUresult hook_cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream hStream);

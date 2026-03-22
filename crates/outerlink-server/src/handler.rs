@@ -1910,6 +1910,98 @@ pub fn handle_request_full(
             }
         }
 
+        // --- Managed / unified memory ---
+
+        MessageType::MemAllocManaged => {
+            // Payload: u64 byte_size + u32 flags = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let byte_size = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
+            let flags = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            match backend.mem_alloc_managed(byte_size, flags) {
+                Ok(ptr) => {
+                    session.track_mem_alloc(ptr);
+                    success_with(rid, &ptr.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemPrefetchAsync => {
+            // Payload: u64 dptr + u64 count + i32 dst_device + u64 stream = 28 bytes
+            if payload.len() < 28 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let dptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let count = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+            let dst_device = i32::from_le_bytes(payload[16..20].try_into().unwrap());
+            let stream = u64::from_le_bytes(payload[20..28].try_into().unwrap());
+            match backend.mem_prefetch_async(dptr, count, dst_device, stream) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemAdvise => {
+            // Payload: u64 dptr + u64 count + i32 advice + i32 device = 24 bytes
+            if payload.len() < 24 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let dptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let count = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+            let advice = i32::from_le_bytes(payload[16..20].try_into().unwrap());
+            let device = i32::from_le_bytes(payload[20..24].try_into().unwrap());
+            match backend.mem_advise(dptr, count, advice, device) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemRangeGetAttribute => {
+            // Payload: i32 attribute + u64 dptr + u64 count = 20 bytes
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let attribute = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            let dptr = u64::from_le_bytes(payload[4..12].try_into().unwrap());
+            let count = u64::from_le_bytes(payload[12..20].try_into().unwrap()) as usize;
+            match backend.mem_range_get_attribute(attribute, dptr, count) {
+                Ok(value) => success_with(rid, &value.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemRangeGetAttributes => {
+            // Payload: u64 dptr + u64 count + i32 num_attrs + N * i32 attrs
+            // Minimum: 8 + 8 + 4 = 20 bytes (with 0 attrs)
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let dptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let count = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+            let num_attrs = i32::from_le_bytes(payload[16..20].try_into().unwrap()) as usize;
+            let needed = 20 + num_attrs * 4;
+            if payload.len() < needed || num_attrs > 64 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let mut attrs = Vec::with_capacity(num_attrs);
+            for i in 0..num_attrs {
+                let offset = 20 + i * 4;
+                attrs.push(i32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()));
+            }
+            match backend.mem_range_get_attributes(&attrs, dptr, count) {
+                Ok(values) => {
+                    let mut data = Vec::with_capacity(values.len() * 8);
+                    for v in &values {
+                        data.extend_from_slice(&v.to_le_bytes());
+                    }
+                    success_with(rid, &data)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         // --- MemGetAllocationGranularity ---
         MessageType::MemGetAllocationGranularity => {
             // [4B location_type][4B location_id][4B option] = 12 bytes
@@ -6140,6 +6232,137 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let hdr = req(MessageType::MemGetAllocationGranularity, 8);
         let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- Managed / unified memory handler tests -----
+
+    #[test]
+    fn test_handler_mem_alloc_managed() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&1024u64.to_le_bytes()); // byte_size
+        payload.extend_from_slice(&1u32.to_le_bytes());    // flags (CU_MEM_ATTACH_GLOBAL)
+        let hdr = req(MessageType::MemAllocManaged, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(ptr, 0);
+    }
+
+    #[test]
+    fn test_handler_mem_alloc_managed_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemAllocManaged, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_handler_mem_alloc_managed_zero_size() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&0u64.to_le_bytes());  // byte_size = 0
+        payload.extend_from_slice(&1u32.to_le_bytes());  // flags
+        let hdr = req(MessageType::MemAllocManaged, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_handler_mem_prefetch_async() {
+        let gpu = StubGpuBackend::new();
+        // First allocate
+        let ptr = gpu.mem_alloc(1024).unwrap();
+        let mut payload = Vec::with_capacity(28);
+        payload.extend_from_slice(&ptr.to_le_bytes());     // dptr
+        payload.extend_from_slice(&1024u64.to_le_bytes()); // count
+        payload.extend_from_slice(&0i32.to_le_bytes());    // dst_device
+        payload.extend_from_slice(&0u64.to_le_bytes());    // stream
+        let hdr = req(MessageType::MemPrefetchAsync, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_handler_mem_prefetch_async_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemPrefetchAsync, 16);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 16]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_handler_mem_advise() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(1024).unwrap();
+        let mut payload = Vec::with_capacity(24);
+        payload.extend_from_slice(&ptr.to_le_bytes());     // dptr
+        payload.extend_from_slice(&1024u64.to_le_bytes()); // count
+        payload.extend_from_slice(&1i32.to_le_bytes());    // advice (SET_READ_MOSTLY)
+        payload.extend_from_slice(&0i32.to_le_bytes());    // device
+        let hdr = req(MessageType::MemAdvise, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_handler_mem_advise_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemAdvise, 12);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 12]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_handler_mem_range_get_attribute() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(1024).unwrap();
+        let mut payload = Vec::with_capacity(20);
+        payload.extend_from_slice(&1i32.to_le_bytes());    // attribute (READ_MOSTLY)
+        payload.extend_from_slice(&ptr.to_le_bytes());     // dptr
+        payload.extend_from_slice(&1024u64.to_le_bytes()); // count
+        let hdr = req(MessageType::MemRangeGetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let val = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(val, 0); // read_mostly = false by default
+    }
+
+    #[test]
+    fn test_handler_mem_range_get_attribute_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemRangeGetAttribute, 12);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 12]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_handler_mem_range_get_attributes() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(1024).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&ptr.to_le_bytes());     // dptr
+        payload.extend_from_slice(&1024u64.to_le_bytes()); // count
+        payload.extend_from_slice(&2i32.to_le_bytes());    // num_attrs = 2
+        payload.extend_from_slice(&1i32.to_le_bytes());    // attr 0: READ_MOSTLY
+        payload.extend_from_slice(&2i32.to_le_bytes());    // attr 1: PREFERRED_LOCATION
+        let hdr = req(MessageType::MemRangeGetAttributes, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        // 2 x u64 values
+        assert!(resp.len() >= 4 + 16);
+        let v0 = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        let v1 = u64::from_le_bytes(resp[12..20].try_into().unwrap());
+        assert_eq!(v0, 0);
+        assert_eq!(v1, 0);
+    }
+
+    #[test]
+    fn test_handler_mem_range_get_attributes_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemRangeGetAttributes, 12);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 12]);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }

@@ -152,6 +152,13 @@ type FnCuMemAllocPitch = unsafe extern "C" fn(dptr: *mut u64, pitch: *mut usize,
 type FnCuModuleLoad = unsafe extern "C" fn(module: *mut usize, fname: *const u8) -> i32;
 type FnCuModuleLoadFatBinary = unsafe extern "C" fn(module: *mut usize, fat_cubin: *const u8) -> i32;
 
+// Managed / unified memory (CUDA 6.0+)
+type FnCuMemAllocManaged = unsafe extern "C" fn(dptr: *mut u64, bytesize: usize, flags: u32) -> i32;
+type FnCuMemPrefetchAsync = unsafe extern "C" fn(dptr: u64, count: usize, dst_device: i32, stream: usize) -> i32;
+type FnCuMemAdvise = unsafe extern "C" fn(dptr: u64, count: usize, advice: i32, device: i32) -> i32;
+type FnCuMemRangeGetAttribute = unsafe extern "C" fn(data: *mut std::ffi::c_void, data_size: usize, attribute: i32, dptr: u64, count: usize) -> i32;
+type FnCuMemRangeGetAttributes = unsafe extern "C" fn(data: *mut *mut std::ffi::c_void, data_sizes: *const usize, attributes: *const i32, num_attributes: usize, dptr: u64, count: usize) -> i32;
+
 // Stream-ordered memory / pool operations (CUDA 11.2+)
 type FnCuMemAllocAsync = unsafe extern "C" fn(dptr: *mut u64, bytesize: usize, stream: usize) -> i32;
 type FnCuMemFreeAsync = unsafe extern "C" fn(dptr: u64, stream: usize) -> i32;
@@ -318,6 +325,12 @@ struct CudaApi {
     cu_memset_d32_async: Option<FnCuMemsetD32Async>,
     cu_memset_d16: Option<FnCuMemsetD16>,
     cu_memset_d16_async: Option<FnCuMemsetD16Async>,
+    // Managed / unified memory
+    cu_mem_alloc_managed: Option<FnCuMemAllocManaged>,
+    cu_mem_prefetch_async: Option<FnCuMemPrefetchAsync>,
+    cu_mem_advise: Option<FnCuMemAdvise>,
+    cu_mem_range_get_attribute: Option<FnCuMemRangeGetAttribute>,
+    cu_mem_range_get_attributes: Option<FnCuMemRangeGetAttributes>,
     // Stream-ordered memory / pool (CUDA 11.2+)
     cu_mem_alloc_async: Option<FnCuMemAllocAsync>,
     cu_mem_free_async: Option<FnCuMemFreeAsync>,
@@ -497,6 +510,12 @@ impl CudaApi {
             cu_memset_d32_async: load_sym!(lib, b"cuMemsetD32Async\0"),
             cu_memset_d16: load_sym!(lib, b"cuMemsetD16_v2\0", b"cuMemsetD16\0"),
             cu_memset_d16_async: load_sym!(lib, b"cuMemsetD16Async\0"),
+            // Managed / unified memory (CUDA 6.0+)
+            cu_mem_alloc_managed: load_sym!(lib, b"cuMemAllocManaged\0"),
+            cu_mem_prefetch_async: load_sym!(lib, b"cuMemPrefetchAsync\0"),
+            cu_mem_advise: load_sym!(lib, b"cuMemAdvise\0"),
+            cu_mem_range_get_attribute: load_sym!(lib, b"cuMemRangeGetAttribute\0"),
+            cu_mem_range_get_attributes: load_sym!(lib, b"cuMemRangeGetAttributes\0"),
             // Stream-ordered memory / pool (CUDA 11.2+, optional)
             cu_mem_alloc_async: load_sym!(lib, b"cuMemAllocAsync\0"),
             cu_mem_free_async: load_sym!(lib, b"cuMemFreeAsync\0"),
@@ -1986,6 +2005,51 @@ impl GpuBackend for CudaGpuBackend {
             map_cuda_result(func(&mut granularity, &loc as *const _ as *const std::ffi::c_void, option))?;
         }
         Ok(granularity as u64)
+    }
+
+    // --- Managed / unified memory ---
+
+    fn mem_alloc_managed(&self, byte_size: usize, flags: u32) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_mem_alloc_managed)?;
+        if byte_size == 0 {
+            return Err(CuResult::InvalidValue);
+        }
+        let mut dptr: u64 = 0;
+        unsafe {
+            map_cuda_result(func(&mut dptr, byte_size, flags))?;
+        }
+        Ok(dptr)
+    }
+
+    fn mem_prefetch_async(&self, dptr: u64, count: usize, dst_device: i32, stream: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_mem_prefetch_async)?;
+        unsafe {
+            map_cuda_result(func(dptr, count, dst_device, stream as usize))?;
+        }
+        Ok(())
+    }
+
+    fn mem_advise(&self, dptr: u64, count: usize, advice: i32, device: i32) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_mem_advise)?;
+        unsafe {
+            map_cuda_result(func(dptr, count, advice, device))?;
+        }
+        Ok(())
+    }
+
+    fn mem_range_get_attribute(&self, attribute: i32, dptr: u64, count: usize) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_mem_range_get_attribute)?;
+        let mut value: u64 = 0;
+        unsafe {
+            map_cuda_result(func(
+                &mut value as *mut u64 as *mut std::ffi::c_void,
+                std::mem::size_of::<u64>(),
+                attribute,
+                dptr,
+                count,
+            ))?;
+        }
+        Ok(value)
     }
 }
 

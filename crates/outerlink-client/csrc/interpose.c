@@ -165,6 +165,13 @@ static const hook_entry_t hook_table[] = {
     { "cuMemcpyAsync",           (void *)hook_cuMemcpyAsync },
     { "cuMemGetInfo_v2",         (void *)hook_cuMemGetInfo_v2 },
 
+    /* Managed / unified memory */
+    { "cuMemAllocManaged",       (void *)hook_cuMemAllocManaged },
+    { "cuMemPrefetchAsync",      (void *)hook_cuMemPrefetchAsync },
+    { "cuMemAdvise",             (void *)hook_cuMemAdvise },
+    { "cuMemRangeGetAttribute",  (void *)hook_cuMemRangeGetAttribute },
+    { "cuMemRangeGetAttributes", (void *)hook_cuMemRangeGetAttributes },
+
     /* Memory pool (CUDA 11.2+) */
     { "cuMemAllocAsync",         (void *)hook_cuMemAllocAsync },
     { "cuMemFreeAsync",          (void *)hook_cuMemFreeAsync },
@@ -669,6 +676,39 @@ CUresult hook_cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, 
     ensure_init();
     return ol_cuMemcpyAsync((unsigned long long)dst, (unsigned long long)src, ByteCount,
                              (unsigned long long)(uintptr_t)hStream);
+}
+
+/* -- Managed / unified memory -- */
+
+CUresult hook_cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize, unsigned int flags) {
+    ensure_init();
+    return ol_cuMemAllocManaged((unsigned long long *)dptr, bytesize, flags);
+}
+
+CUresult hook_cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count, CUdevice dstDevice, CUstream hStream) {
+    ensure_init();
+    return ol_cuMemPrefetchAsync((unsigned long long)devPtr, count, (int)dstDevice,
+                                  (unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuMemAdvise(CUdeviceptr devPtr, size_t count, int advice, CUdevice device) {
+    ensure_init();
+    return ol_cuMemAdvise((unsigned long long)devPtr, count, advice, (int)device);
+}
+
+CUresult hook_cuMemRangeGetAttribute(void *data, size_t dataSize, int attribute,
+                                      CUdeviceptr devPtr, size_t count) {
+    ensure_init();
+    return ol_cuMemRangeGetAttribute((unsigned char *)data, dataSize, attribute,
+                                      (unsigned long long)devPtr, count);
+}
+
+CUresult hook_cuMemRangeGetAttributes(void **data, size_t *dataSizes, int *attributes,
+                                       size_t numAttributes, CUdeviceptr devPtr, size_t count) {
+    ensure_init();
+    return ol_cuMemRangeGetAttributes((unsigned char **)data, (const size_t *)dataSizes,
+                                       (const int *)attributes, numAttributes,
+                                       (unsigned long long)devPtr, count);
 }
 
 /* -- Memory pool (CUDA 11.2+) -- */

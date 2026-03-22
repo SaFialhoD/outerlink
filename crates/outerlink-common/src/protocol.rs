@@ -138,6 +138,13 @@ pub enum MessageType {
     DeviceSetMemPool = 0x00CA,
     MemGetAllocationGranularity = 0x00CB,
 
+    // Memory (managed / unified)
+    MemAllocManaged = 0x00BC,
+    MemPrefetchAsync = 0x00BD,
+    MemAdvise = 0x00BE,
+    MemRangeGetAttribute = 0x00BF,
+    MemRangeGetAttributes = 0x00CC,
+
     // Memory (extended)
     MemHostGetDevicePointer = 0x00B3,
     MemHostGetFlags = 0x00B4,
@@ -281,6 +288,11 @@ impl MessageType {
             0x00C9 => Some(Self::DeviceGetMemPool),
             0x00CA => Some(Self::DeviceSetMemPool),
             0x00CB => Some(Self::MemGetAllocationGranularity),
+            0x00BC => Some(Self::MemAllocManaged),
+            0x00BD => Some(Self::MemPrefetchAsync),
+            0x00BE => Some(Self::MemAdvise),
+            0x00BF => Some(Self::MemRangeGetAttribute),
+            0x00CC => Some(Self::MemRangeGetAttributes),
             0x00B2 => Some(Self::MemGetAddressRange),
             0x00B3 => Some(Self::MemHostGetDevicePointer),
             0x00B4 => Some(Self::MemHostGetFlags),

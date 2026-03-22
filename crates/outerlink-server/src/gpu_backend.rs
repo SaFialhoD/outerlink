@@ -433,6 +433,35 @@ pub trait GpuBackend: Send + Sync {
     /// Returns alignment in bytes (stub: 512).
     fn mem_get_allocation_granularity(&self, location_type: i32, location_id: i32, option: i32) -> Result<u64, CuResult>;
 
+    // --- Managed / unified memory operations ---
+
+    /// Allocate managed (unified) memory.
+    /// In the stub, this delegates to regular `mem_alloc` since managed memory
+    /// is conceptually device memory that the driver migrates on demand.
+    fn mem_alloc_managed(&self, byte_size: usize, flags: u32) -> Result<u64, CuResult>;
+
+    /// Prefetch managed memory to a device (or host if device == -1).
+    /// This is a performance hint; the stub validates the pointer and returns Success.
+    fn mem_prefetch_async(&self, dptr: u64, count: usize, dst_device: i32, stream: u64) -> Result<(), CuResult>;
+
+    /// Set memory advice/hints on a managed allocation.
+    /// This is a performance hint; the stub validates the pointer and returns Success.
+    fn mem_advise(&self, dptr: u64, count: usize, advice: i32, device: i32) -> Result<(), CuResult>;
+
+    /// Query a single attribute of a managed memory range.
+    /// Returns a sensible default in stub mode.
+    fn mem_range_get_attribute(&self, attribute: i32, dptr: u64, count: usize) -> Result<u64, CuResult>;
+
+    /// Query multiple attributes of a managed memory range.
+    /// Delegates to `mem_range_get_attribute` for each attribute.
+    fn mem_range_get_attributes(&self, attributes: &[i32], dptr: u64, count: usize) -> Result<Vec<u64>, CuResult> {
+        let mut results = Vec::with_capacity(attributes.len());
+        for &attr in attributes {
+            results.push(self.mem_range_get_attribute(attr, dptr, count)?);
+        }
+        Ok(results)
+    }
+
     // --- JIT Linker operations ---
 
     /// Create a JIT linker state object (cuLinkCreate).
@@ -2029,6 +2058,52 @@ impl GpuBackend for StubGpuBackend {
     fn mem_get_allocation_granularity(&self, _location_type: i32, _location_id: i32, _option: i32) -> Result<u64, CuResult> {
         // Stub: return 512 bytes (NVIDIA standard minimum alignment).
         Ok(512)
+    }
+
+    // --- Managed / unified memory operations ---
+
+    fn mem_alloc_managed(&self, byte_size: usize, _flags: u32) -> Result<u64, CuResult> {
+        // Managed memory is just device memory from OuterLink's perspective.
+        // The stub delegates to the regular mem_alloc path.
+        self.mem_alloc(byte_size)
+    }
+
+    fn mem_prefetch_async(&self, dptr: u64, _count: usize, _dst_device: i32, _stream: u64) -> Result<(), CuResult> {
+        // Prefetch is a performance hint; validate the pointer exists and return success.
+        let state = self.state.lock().unwrap();
+        if !state.allocations.contains_key(&dptr) {
+            return Err(CuResult::InvalidValue);
+        }
+        Ok(())
+    }
+
+    fn mem_advise(&self, dptr: u64, _count: usize, _advice: i32, _device: i32) -> Result<(), CuResult> {
+        // Advice is a performance hint; validate the pointer exists and return success.
+        let state = self.state.lock().unwrap();
+        if !state.allocations.contains_key(&dptr) {
+            return Err(CuResult::InvalidValue);
+        }
+        Ok(())
+    }
+
+    fn mem_range_get_attribute(&self, attribute: i32, dptr: u64, _count: usize) -> Result<u64, CuResult> {
+        // Validate the pointer exists.
+        let state = self.state.lock().unwrap();
+        if !state.allocations.contains_key(&dptr) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Return sensible defaults for known attributes.
+        // CU_MEM_RANGE_ATTRIBUTE_READ_MOSTLY = 1 -> 0 (not read-mostly)
+        // CU_MEM_RANGE_ATTRIBUTE_PREFERRED_LOCATION = 2 -> 0 (device 0)
+        // CU_MEM_RANGE_ATTRIBUTE_ACCESSED_BY = 3 -> 0 (device 0)
+        // CU_MEM_RANGE_ATTRIBUTE_LAST_PREFETCH_LOCATION = 4 -> 0 (device 0)
+        match attribute {
+            1 => Ok(0), // read_mostly = false
+            2 => Ok(0), // preferred_location = device 0
+            3 => Ok(0), // accessed_by = device 0
+            4 => Ok(0), // last_prefetch_location = device 0
+            _ => Err(CuResult::InvalidValue),
+        }
     }
 }
 
@@ -4584,5 +4659,121 @@ mod tests {
         // Stub always returns 512 regardless of params.
         let gran = gpu.mem_get_allocation_granularity(1, 0, 1).unwrap();
         assert_eq!(gran, 512);
+    }
+
+    // -----------------------------------------------------------------------
+    // Managed / unified memory tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mem_alloc_managed_basic() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_managed(1024, 1).unwrap();
+        assert_ne!(ptr, 0);
+    }
+
+    #[test]
+    fn test_mem_alloc_managed_zero_size() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_alloc_managed(0, 1), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_alloc_managed_freeable() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_managed(2048, 1).unwrap();
+        // Should be freeable via regular mem_free
+        assert_eq!(gpu.mem_free(ptr), Ok(()));
+    }
+
+    #[test]
+    fn test_mem_prefetch_async_valid() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_managed(1024, 1).unwrap();
+        assert_eq!(gpu.mem_prefetch_async(ptr, 1024, 0, 0), Ok(()));
+    }
+
+    #[test]
+    fn test_mem_prefetch_async_invalid_ptr() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_prefetch_async(0xDEAD, 1024, 0, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_prefetch_async_host_destination() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_managed(512, 1).unwrap();
+        // device = -1 means host; still a valid hint
+        assert_eq!(gpu.mem_prefetch_async(ptr, 512, -1, 0), Ok(()));
+    }
+
+    #[test]
+    fn test_mem_advise_valid() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_managed(1024, 1).unwrap();
+        // CU_MEM_ADVISE_SET_READ_MOSTLY = 1
+        assert_eq!(gpu.mem_advise(ptr, 1024, 1, 0), Ok(()));
+    }
+
+    #[test]
+    fn test_mem_advise_invalid_ptr() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_advise(0xDEAD, 1024, 1, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_range_get_attribute_read_mostly() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_managed(1024, 1).unwrap();
+        // attribute 1 = CU_MEM_RANGE_ATTRIBUTE_READ_MOSTLY
+        let val = gpu.mem_range_get_attribute(1, ptr, 1024).unwrap();
+        assert_eq!(val, 0);
+    }
+
+    #[test]
+    fn test_mem_range_get_attribute_preferred_location() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_managed(1024, 1).unwrap();
+        // attribute 2 = CU_MEM_RANGE_ATTRIBUTE_PREFERRED_LOCATION
+        let val = gpu.mem_range_get_attribute(2, ptr, 1024).unwrap();
+        assert_eq!(val, 0); // device 0
+    }
+
+    #[test]
+    fn test_mem_range_get_attribute_invalid_ptr() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_range_get_attribute(1, 0xDEAD, 1024), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_range_get_attribute_invalid_attribute() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_managed(1024, 1).unwrap();
+        assert_eq!(gpu.mem_range_get_attribute(999, ptr, 1024), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_range_get_attributes_multiple() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_managed(1024, 1).unwrap();
+        let attrs = vec![1, 2, 3, 4]; // all known attributes
+        let vals = gpu.mem_range_get_attributes(&attrs, ptr, 1024).unwrap();
+        assert_eq!(vals.len(), 4);
+        assert!(vals.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn test_mem_range_get_attributes_one_invalid() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_managed(1024, 1).unwrap();
+        let attrs = vec![1, 999]; // second is invalid
+        assert_eq!(gpu.mem_range_get_attributes(&attrs, ptr, 1024), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_range_get_attributes_invalid_ptr() {
+        let gpu = StubGpuBackend::new();
+        let attrs = vec![1, 2];
+        assert_eq!(gpu.mem_range_get_attributes(&attrs, 0xDEAD, 1024), Err(CuResult::InvalidValue));
     }
 }

@@ -252,6 +252,13 @@ CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlocks, CU
 CUresult cuOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize, CUfunction func, CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize, int blockSizeLimit);
 CUresult cuOccupancyMaxPotentialBlockSizeWithFlags(int *minGridSize, int *blockSize, CUfunction func, CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize, int blockSizeLimit, unsigned int flags);
 
+/* Function declarations - Managed / unified memory (CUDA 6.0+) */
+CUresult cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize, unsigned int flags);
+CUresult cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count, CUdevice dstDevice, CUstream hStream);
+CUresult cuMemAdvise(CUdeviceptr devPtr, size_t count, int advice, CUdevice device);
+CUresult cuMemRangeGetAttribute(void *data, size_t dataSize, int attribute, CUdeviceptr devPtr, size_t count);
+CUresult cuMemRangeGetAttributes(void **data, size_t *dataSizes, int *attributes, size_t numAttributes, CUdeviceptr devPtr, size_t count);
+
 /* Function declarations - Memory pool (CUDA 11.2+) */
 CUresult cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream hStream);
 CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream);
