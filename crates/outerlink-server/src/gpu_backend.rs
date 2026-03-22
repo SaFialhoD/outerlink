@@ -188,6 +188,31 @@ pub trait GpuBackend: Send + Sync {
 
     // --- Lifecycle ---
 
+    // --- Context stack & query operations ---
+
+    /// Push a context onto the per-thread context stack.
+    fn ctx_push_current(&self, ctx: u64) -> Result<(), CuResult>;
+
+    /// Pop the top context from the stack and return its handle.
+    fn ctx_pop_current(&self) -> Result<u64, CuResult>;
+
+    /// Get the API version for a context.
+    fn ctx_get_api_version(&self, ctx: u64) -> Result<u32, CuResult>;
+
+    /// Get a resource limit value (stack size, printf FIFO, malloc heap, etc.).
+    fn ctx_get_limit(&self, limit: u32) -> Result<u64, CuResult>;
+
+    /// Set a resource limit value.
+    fn ctx_set_limit(&self, limit: u32, value: u64) -> Result<(), CuResult>;
+
+    /// Get the range of valid stream priorities (least, greatest).
+    fn ctx_get_stream_priority_range(&self) -> Result<(i32, i32), CuResult>;
+
+    /// Get the flags of the current context.
+    fn ctx_get_flags(&self) -> Result<u32, CuResult>;
+
+    // --- Lifecycle ---
+
     /// Clean up all GPU resources held by this backend.
     ///
     /// Called during graceful shutdown. Implementations should destroy all
@@ -308,6 +333,10 @@ struct StubState {
     next_host_ptr: u64,
     /// Primary contexts: device ordinal -> primary context state.
     primary_contexts: HashMap<i32, PrimaryCtxState>,
+    /// Context stack for push/pop operations.
+    context_stack: Vec<u64>,
+    /// Resource limits: CU_LIMIT_* -> value.
+    context_limits: HashMap<u32, u64>,
 }
 
 impl StubState {
@@ -351,6 +380,14 @@ impl StubGpuBackend {
                 host_allocations: HashMap::new(),
                 next_host_ptr: 0x0000_CAFE_0000_0000,
                 primary_contexts: HashMap::new(),
+                context_stack: Vec::new(),
+                context_limits: {
+                    let mut m = HashMap::new();
+                    m.insert(0x00, 1024);       // CU_LIMIT_STACK_SIZE
+                    m.insert(0x01, 1_048_576);   // CU_LIMIT_PRINTF_FIFO_SIZE
+                    m.insert(0x02, 8_388_608);   // CU_LIMIT_MALLOC_HEAP_SIZE
+                    m
+                },
             }),
         }
     }
@@ -881,6 +918,52 @@ impl GpuBackend for StubGpuBackend {
         Ok(())
     }
 
+    // --- Context stack & query operations ---
+
+    fn ctx_push_current(&self, ctx: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if !state.contexts.contains_key(&ctx) {
+            return Err(CuResult::InvalidContext);
+        }
+        state.context_stack.push(ctx);
+        Ok(())
+    }
+
+    fn ctx_pop_current(&self) -> Result<u64, CuResult> {
+        let mut state = self.state.lock().unwrap();
+        state.context_stack.pop().ok_or(CuResult::InvalidContext)
+    }
+
+    fn ctx_get_api_version(&self, ctx: u64) -> Result<u32, CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.contexts.contains_key(&ctx) {
+            return Err(CuResult::InvalidContext);
+        }
+        // Simulated CUDA 12.0 API version
+        Ok(12000)
+    }
+
+    fn ctx_get_limit(&self, limit: u32) -> Result<u64, CuResult> {
+        let state = self.state.lock().unwrap();
+        state.context_limits.get(&limit).copied().ok_or(CuResult::InvalidValue)
+    }
+
+    fn ctx_set_limit(&self, limit: u32, value: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        state.context_limits.insert(limit, value);
+        Ok(())
+    }
+
+    fn ctx_get_stream_priority_range(&self) -> Result<(i32, i32), CuResult> {
+        // Standard NVIDIA range: 0 = lowest priority, -1 = highest priority
+        Ok((0, -1))
+    }
+
+    fn ctx_get_flags(&self) -> Result<u32, CuResult> {
+        // Default flags (CU_CTX_SCHED_AUTO = 0)
+        Ok(0)
+    }
+
     fn shutdown(&self) {
         let mut state = self.state.lock().unwrap();
         tracing::info!(
@@ -900,6 +983,8 @@ impl GpuBackend for StubGpuBackend {
         state.events.clear();
         state.host_allocations.clear();
         state.primary_contexts.clear();
+        state.context_stack.clear();
+        state.context_limits.clear();
     }
 
     fn primary_ctx_retain(&self, device: i32) -> Result<u64, CuResult> {
@@ -1913,5 +1998,102 @@ mod tests {
         assert_eq!(gpu.func_get_attribute(9999, func), Err(CuResult::InvalidValue));
         assert_eq!(gpu.func_get_attribute(-1, func), Err(CuResult::InvalidValue));
         assert_eq!(gpu.func_get_attribute(16, func), Err(CuResult::InvalidValue));
+    }
+
+    // --- Context push/pop tests ---
+
+    #[test]
+    fn test_ctx_push_pop_roundtrip() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        assert!(gpu.ctx_push_current(ctx).is_ok());
+        let popped = gpu.ctx_pop_current().unwrap();
+        assert_eq!(popped, ctx);
+    }
+
+    #[test]
+    fn test_ctx_push_invalid_context() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_push_current(0xDEAD), Err(CuResult::InvalidContext));
+    }
+
+    #[test]
+    fn test_ctx_pop_empty_stack() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_pop_current(), Err(CuResult::InvalidContext));
+    }
+
+    #[test]
+    fn test_ctx_push_pop_lifo_order() {
+        let gpu = StubGpuBackend::new();
+        let ctx1 = gpu.ctx_create(0, 0).unwrap();
+        let ctx2 = gpu.ctx_create(0, 0).unwrap();
+        gpu.ctx_push_current(ctx1).unwrap();
+        gpu.ctx_push_current(ctx2).unwrap();
+        assert_eq!(gpu.ctx_pop_current().unwrap(), ctx2);
+        assert_eq!(gpu.ctx_pop_current().unwrap(), ctx1);
+    }
+
+    // --- Context API version tests ---
+
+    #[test]
+    fn test_ctx_get_api_version() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        assert_eq!(gpu.ctx_get_api_version(ctx).unwrap(), 12000);
+    }
+
+    #[test]
+    fn test_ctx_get_api_version_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_get_api_version(0xDEAD), Err(CuResult::InvalidContext));
+    }
+
+    // --- Context limits tests ---
+
+    #[test]
+    fn test_ctx_get_limit_defaults() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_get_limit(0x00).unwrap(), 1024);       // stack size
+        assert_eq!(gpu.ctx_get_limit(0x01).unwrap(), 1_048_576);   // printf FIFO
+        assert_eq!(gpu.ctx_get_limit(0x02).unwrap(), 8_388_608);   // malloc heap
+    }
+
+    #[test]
+    fn test_ctx_get_limit_unknown() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_get_limit(0xFF), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_ctx_set_limit() {
+        let gpu = StubGpuBackend::new();
+        gpu.ctx_set_limit(0x00, 2048).unwrap();
+        assert_eq!(gpu.ctx_get_limit(0x00).unwrap(), 2048);
+    }
+
+    #[test]
+    fn test_ctx_set_limit_new_key() {
+        let gpu = StubGpuBackend::new();
+        gpu.ctx_set_limit(0x05, 12345).unwrap();
+        assert_eq!(gpu.ctx_get_limit(0x05).unwrap(), 12345);
+    }
+
+    // --- Stream priority range tests ---
+
+    #[test]
+    fn test_ctx_get_stream_priority_range() {
+        let gpu = StubGpuBackend::new();
+        let (least, greatest) = gpu.ctx_get_stream_priority_range().unwrap();
+        assert_eq!(least, 0);
+        assert_eq!(greatest, -1);
+    }
+
+    // --- Context flags tests ---
+
+    #[test]
+    fn test_ctx_get_flags() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_get_flags().unwrap(), 0);
     }
 }

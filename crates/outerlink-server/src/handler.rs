@@ -71,6 +71,13 @@ fn error_response(request_id: u64, err: CuResult) -> (MessageHeader, Vec<u8>) {
 /// | DevicePrimaryCtxGetState| i32 device           | u32 flags, i32 active                 |
 /// | DevicePrimaryCtxSetFlags| i32 device, u32 flags| (empty)                               |
 /// | DevicePrimaryCtxReset   | i32 device           | (empty)                               |
+/// | CtxPushCurrent          | u64 ctx              | (empty)                               |
+/// | CtxPopCurrent           | (empty)              | u64 ctx                               |
+/// | CtxGetApiVersion        | u64 ctx              | u32 version                           |
+/// | CtxGetLimit             | u32 limit_type       | u64 value                             |
+/// | CtxSetLimit             | u32 limit_type, u64 val | (empty)                            |
+/// | CtxGetStreamPriorityRange| (empty)             | i32 least, i32 greatest               |
+/// | CtxGetFlags             | (empty)              | u32 flags                             |
 /// | FuncGetAttribute        | i32 attrib, u64 func | i32 value                             |
 pub fn handle_request(
     backend: &dyn GpuBackend,
@@ -294,6 +301,73 @@ pub fn handle_request(
 
         MessageType::CtxSynchronize => match backend.ctx_synchronize() {
             Ok(()) => result_only(rid, CuResult::Success),
+            Err(e) => error_response(rid, e),
+        },
+
+        MessageType::CtxPushCurrent => {
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let ctx = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.ctx_push_current(ctx) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::CtxPopCurrent => match backend.ctx_pop_current() {
+            Ok(ctx) => success_with(rid, &ctx.to_le_bytes()),
+            Err(e) => error_response(rid, e),
+        },
+
+        MessageType::CtxGetApiVersion => {
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let ctx = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.ctx_get_api_version(ctx) {
+                Ok(ver) => success_with(rid, &ver.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::CtxGetLimit => {
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let limit = u32::from_le_bytes(payload[..4].try_into().unwrap());
+            match backend.ctx_get_limit(limit) {
+                Ok(value) => success_with(rid, &value.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::CtxSetLimit => {
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let limit = u32::from_le_bytes(payload[..4].try_into().unwrap());
+            let value = u64::from_le_bytes(payload[4..12].try_into().unwrap());
+            match backend.ctx_set_limit(limit, value) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::CtxGetStreamPriorityRange => {
+            match backend.ctx_get_stream_priority_range() {
+                Ok((least, greatest)) => {
+                    let mut data = [0u8; 8];
+                    data[..4].copy_from_slice(&least.to_le_bytes());
+                    data[4..8].copy_from_slice(&greatest.to_le_bytes());
+                    success_with(rid, &data)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::CtxGetFlags => match backend.ctx_get_flags() {
+            Ok(flags) => success_with(rid, &flags.to_le_bytes()),
             Err(e) => error_response(rid, e),
         },
 
@@ -2600,5 +2674,160 @@ mod tests {
         let (_, resp) = dispatch(&gpu, &hdr, &payload2);
         // Should reject (not panic) due to payload length mismatch
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- CtxPushCurrent / CtxPopCurrent handler tests ---
+
+    #[test]
+    fn test_ctx_push_pop_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create a context first
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&0u32.to_le_bytes());
+        payload[4..8].copy_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::CtxCreate, 8);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Push context
+        let push_payload = ctx.to_le_bytes();
+        let hdr = req(MessageType::CtxPushCurrent, 8);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &push_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Pop context
+        let hdr = req(MessageType::CtxPopCurrent, 0);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &[], &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let popped = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(popped, ctx);
+    }
+
+    #[test]
+    fn test_ctx_push_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxPushCurrent, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_ctx_pop_empty_stack() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxPopCurrent, 0);
+        let (_, resp) = dispatch(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&resp), CuResult::InvalidContext);
+    }
+
+    // --- CtxGetApiVersion handler tests ---
+
+    #[test]
+    fn test_ctx_get_api_version_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create context
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&0u32.to_le_bytes());
+        payload[4..8].copy_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::CtxCreate, 8);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Get API version
+        let hdr = req(MessageType::CtxGetApiVersion, 8);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &ctx.to_le_bytes(), &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let ver = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(ver, 12000);
+    }
+
+    #[test]
+    fn test_ctx_get_api_version_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxGetApiVersion, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- CtxGetLimit / CtxSetLimit handler tests ---
+
+    #[test]
+    fn test_ctx_get_limit_handler() {
+        let gpu = StubGpuBackend::new();
+        // Get stack size (CU_LIMIT_STACK_SIZE = 0x00)
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::CtxGetLimit, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let value = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(value, 1024);
+    }
+
+    #[test]
+    fn test_ctx_set_limit_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Set stack size to 4096
+        let mut payload = [0u8; 12];
+        payload[..4].copy_from_slice(&0u32.to_le_bytes());     // CU_LIMIT_STACK_SIZE
+        payload[4..12].copy_from_slice(&4096u64.to_le_bytes());
+        let hdr = req(MessageType::CtxSetLimit, 12);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Verify it was set
+        let get_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::CtxGetLimit, 4);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &get_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let value = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(value, 4096);
+    }
+
+    #[test]
+    fn test_ctx_get_limit_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxGetLimit, 2);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 2]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_ctx_set_limit_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxSetLimit, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- CtxGetStreamPriorityRange handler tests ---
+
+    #[test]
+    fn test_ctx_get_stream_priority_range_handler() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxGetStreamPriorityRange, 0);
+        let (_, resp) = dispatch(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let least = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let greatest = i32::from_le_bytes(resp[8..12].try_into().unwrap());
+        assert_eq!(least, 0);
+        assert_eq!(greatest, -1);
+    }
+
+    // --- CtxGetFlags handler tests ---
+
+    #[test]
+    fn test_ctx_get_flags_handler() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxGetFlags, 0);
+        let (_, resp) = dispatch(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let flags = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(flags, 0);
     }
 }

@@ -51,7 +51,13 @@ type FnCuDeviceGetUuid = unsafe extern "C" fn(uuid: *mut CuUuidFfi, dev: i32) ->
 type FnCuCtxCreate = unsafe extern "C" fn(pctx: *mut usize, flags: u32, dev: i32) -> i32;
 type FnCuCtxDestroy = unsafe extern "C" fn(ctx: usize) -> i32;
 type FnCuCtxSetCurrent = unsafe extern "C" fn(ctx: usize) -> i32;
+type FnCuCtxPushCurrent = unsafe extern "C" fn(ctx: usize) -> i32;
+type FnCuCtxPopCurrent = unsafe extern "C" fn(pctx: *mut usize) -> i32;
 type FnCuCtxGetApiVersion = unsafe extern "C" fn(ctx: usize, version: *mut u32) -> i32;
+type FnCuCtxGetLimit = unsafe extern "C" fn(pvalue: *mut u64, limit: i32) -> i32;
+type FnCuCtxSetLimit = unsafe extern "C" fn(limit: i32, value: u64) -> i32;
+type FnCuCtxGetStreamPriorityRange = unsafe extern "C" fn(least: *mut i32, greatest: *mut i32) -> i32;
+type FnCuCtxGetFlags = unsafe extern "C" fn(flags: *mut u32) -> i32;
 type FnCuCtxSynchronize = unsafe extern "C" fn() -> i32;
 type FnCuCtxGetDevice = unsafe extern "C" fn(device: *mut i32) -> i32;
 
@@ -161,7 +167,13 @@ struct CudaApi {
     cu_ctx_create: Option<FnCuCtxCreate>,
     cu_ctx_destroy: Option<FnCuCtxDestroy>,
     cu_ctx_set_current: Option<FnCuCtxSetCurrent>,
+    cu_ctx_push_current: Option<FnCuCtxPushCurrent>,
+    cu_ctx_pop_current: Option<FnCuCtxPopCurrent>,
     cu_ctx_get_api_version: Option<FnCuCtxGetApiVersion>,
+    cu_ctx_get_limit: Option<FnCuCtxGetLimit>,
+    cu_ctx_set_limit: Option<FnCuCtxSetLimit>,
+    cu_ctx_get_stream_priority_range: Option<FnCuCtxGetStreamPriorityRange>,
+    cu_ctx_get_flags: Option<FnCuCtxGetFlags>,
     cu_ctx_synchronize: Option<FnCuCtxSynchronize>,
     cu_ctx_get_device: Option<FnCuCtxGetDevice>,
 
@@ -277,7 +289,13 @@ impl CudaApi {
             cu_ctx_create: load_sym!(lib, b"cuCtxCreate_v2\0", b"cuCtxCreate\0"),
             cu_ctx_destroy: load_sym!(lib, b"cuCtxDestroy_v2\0", b"cuCtxDestroy\0"),
             cu_ctx_set_current: load_sym!(lib, b"cuCtxSetCurrent\0"),
+            cu_ctx_push_current: load_sym!(lib, b"cuCtxPushCurrent_v2\0", b"cuCtxPushCurrent\0"),
+            cu_ctx_pop_current: load_sym!(lib, b"cuCtxPopCurrent_v2\0", b"cuCtxPopCurrent\0"),
             cu_ctx_get_api_version: load_sym!(lib, b"cuCtxGetApiVersion\0"),
+            cu_ctx_get_limit: load_sym!(lib, b"cuCtxGetLimit\0"),
+            cu_ctx_set_limit: load_sym!(lib, b"cuCtxSetLimit\0"),
+            cu_ctx_get_stream_priority_range: load_sym!(lib, b"cuCtxGetStreamPriorityRange\0"),
+            cu_ctx_get_flags: load_sym!(lib, b"cuCtxGetFlags\0"),
             cu_ctx_synchronize: load_sym!(lib, b"cuCtxSynchronize\0"),
             cu_ctx_get_device: load_sym!(lib, b"cuCtxGetDevice\0"),
 
@@ -1017,6 +1035,66 @@ impl GpuBackend for CudaGpuBackend {
             "CUDA kernel launched"
         );
         Ok(())
+    }
+
+    fn ctx_push_current(&self, ctx: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_ctx_push_current)?;
+        unsafe {
+            map_cuda_result(func(ctx as usize))
+        }
+    }
+
+    fn ctx_pop_current(&self) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_ctx_pop_current)?;
+        let mut ctx: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut ctx))?;
+        }
+        Ok(ctx as u64)
+    }
+
+    fn ctx_get_api_version(&self, ctx: u64) -> Result<u32, CuResult> {
+        let func = require_fn(&self.api.cu_ctx_get_api_version)?;
+        let mut version: u32 = 0;
+        unsafe {
+            map_cuda_result(func(ctx as usize, &mut version))?;
+        }
+        Ok(version)
+    }
+
+    fn ctx_get_limit(&self, limit: u32) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_ctx_get_limit)?;
+        let mut value: u64 = 0;
+        unsafe {
+            map_cuda_result(func(&mut value, limit as i32))?;
+        }
+        Ok(value)
+    }
+
+    fn ctx_set_limit(&self, limit: u32, value: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_ctx_set_limit)?;
+        unsafe {
+            map_cuda_result(func(limit as i32, value))
+        }
+    }
+
+    fn ctx_get_stream_priority_range(&self) -> Result<(i32, i32), CuResult> {
+        let func = require_fn(&self.api.cu_ctx_get_stream_priority_range)?;
+        let mut least: i32 = 0;
+        let mut greatest: i32 = 0;
+        unsafe {
+            map_cuda_result(func(&mut least, &mut greatest))?;
+        }
+        Ok((least, greatest))
+    }
+
+    fn ctx_get_flags(&self) -> Result<u32, CuResult> {
+        let func = require_fn(&self.api.cu_ctx_get_flags)?;
+        let mut flags: u32 = 0;
+        unsafe {
+            map_cuda_result(func(&mut flags))?;
+        }
+        Ok(flags)
     }
 
     fn shutdown(&self) {
