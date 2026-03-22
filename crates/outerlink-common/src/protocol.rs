@@ -73,6 +73,8 @@ pub enum MessageType {
     MemsetD32 = 0x003B,
     MemsetD8Async = 0x003C,
     MemsetD32Async = 0x003D,
+    MemsetD16 = 0x003E,
+    MemsetD16Async = 0x003F,
 
     // Module
     ModuleLoadData = 0x0040,
@@ -117,6 +119,8 @@ pub enum MessageType {
 
     // Memory (extended)
     MemGetAddressRange = 0x00B2,
+    Memcpy = 0x00B7,
+    MemcpyAsync = 0x00B8,
 
     // Context (extended)
     CtxGetStreamPriorityRange = 0x00A0,
@@ -177,6 +181,8 @@ impl MessageType {
             0x003B => Some(Self::MemsetD32),
             0x003C => Some(Self::MemsetD8Async),
             0x003D => Some(Self::MemsetD32Async),
+            0x003E => Some(Self::MemsetD16),
+            0x003F => Some(Self::MemsetD16Async),
             0x0040 => Some(Self::ModuleLoadData),
             0x0041 => Some(Self::ModuleUnload),
             0x0042 => Some(Self::ModuleGetFunction),
@@ -207,6 +213,8 @@ impl MessageType {
             0x0090 => Some(Self::CtxEnablePeerAccess),
             0x0091 => Some(Self::CtxDisablePeerAccess),
             0x00B2 => Some(Self::MemGetAddressRange),
+            0x00B7 => Some(Self::Memcpy),
+            0x00B8 => Some(Self::MemcpyAsync),
             0x00A0 => Some(Self::CtxGetStreamPriorityRange),
             0x00A1 => Some(Self::CtxGetFlags),
             0x00B0 => Some(Self::PointerGetAttribute),

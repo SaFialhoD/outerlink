@@ -146,8 +146,13 @@ static const hook_entry_t hook_table[] = {
     { "cuMemsetD8_v2",          (void *)hook_cuMemsetD8 },
     { "cuMemsetD32",             (void *)hook_cuMemsetD32 },
     { "cuMemsetD32_v2",         (void *)hook_cuMemsetD32 },
+    { "cuMemsetD16",             (void *)hook_cuMemsetD16 },
+    { "cuMemsetD16_v2",         (void *)hook_cuMemsetD16 },
     { "cuMemsetD8Async",         (void *)hook_cuMemsetD8Async },
     { "cuMemsetD32Async",        (void *)hook_cuMemsetD32Async },
+    { "cuMemsetD16Async",        (void *)hook_cuMemsetD16Async },
+    { "cuMemcpy",                (void *)hook_cuMemcpy },
+    { "cuMemcpyAsync",           (void *)hook_cuMemcpyAsync },
     { "cuMemGetInfo_v2",         (void *)hook_cuMemGetInfo_v2 },
 
     /* Error */
@@ -524,6 +529,28 @@ CUresult hook_cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int value, size_t
     ensure_init();
     return ol_cuMemsetD32Async((unsigned long long)dstDevice, value, count,
                                 (unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuMemsetD16(CUdeviceptr dstDevice, unsigned short value, size_t count) {
+    ensure_init();
+    return ol_cuMemsetD16((unsigned long long)dstDevice, value, count);
+}
+
+CUresult hook_cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short value, size_t count, CUstream hStream) {
+    ensure_init();
+    return ol_cuMemsetD16Async((unsigned long long)dstDevice, value, count,
+                                (unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount) {
+    ensure_init();
+    return ol_cuMemcpy((unsigned long long)dst, (unsigned long long)src, ByteCount);
+}
+
+CUresult hook_cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream) {
+    ensure_init();
+    return ol_cuMemcpyAsync((unsigned long long)dst, (unsigned long long)src, ByteCount,
+                             (unsigned long long)(uintptr_t)hStream);
 }
 
 /* -- Error -- */

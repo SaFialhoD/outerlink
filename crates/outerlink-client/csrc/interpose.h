@@ -77,8 +77,12 @@ extern CUresult ol_cuMemcpyHtoDAsync_v2(unsigned long long dstDevice, const void
 extern CUresult ol_cuMemcpyDtoHAsync_v2(void *dstHost, unsigned long long srcDevice, size_t ByteCount, unsigned long long hStream);
 extern CUresult ol_cuMemsetD8(unsigned long long dstDevice, unsigned char value, size_t count);
 extern CUresult ol_cuMemsetD32(unsigned long long dstDevice, unsigned int value, size_t count);
+extern CUresult ol_cuMemsetD16(unsigned long long dstDevice, unsigned short value, size_t count);
 extern CUresult ol_cuMemsetD8Async(unsigned long long dstDevice, unsigned char value, size_t count, unsigned long long hStream);
 extern CUresult ol_cuMemsetD32Async(unsigned long long dstDevice, unsigned int value, size_t count, unsigned long long hStream);
+extern CUresult ol_cuMemsetD16Async(unsigned long long dstDevice, unsigned short value, size_t count, unsigned long long hStream);
+extern CUresult ol_cuMemcpy(unsigned long long dst, unsigned long long src, size_t ByteCount);
+extern CUresult ol_cuMemcpyAsync(unsigned long long dst, unsigned long long src, size_t ByteCount, unsigned long long hStream);
 extern CUresult ol_cuMemGetInfo_v2(size_t *free, size_t *total);
 
 /* Error handling -- CUresult is an enum (int-sized) */
@@ -205,8 +209,12 @@ CUresult hook_cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice, const void *srcHost, s
 CUresult hook_cuMemcpyDtoHAsync_v2(void *dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream);
 CUresult hook_cuMemsetD8(CUdeviceptr dstDevice, unsigned char value, size_t count);
 CUresult hook_cuMemsetD32(CUdeviceptr dstDevice, unsigned int value, size_t count);
+CUresult hook_cuMemsetD16(CUdeviceptr dstDevice, unsigned short value, size_t count);
 CUresult hook_cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char value, size_t count, CUstream hStream);
 CUresult hook_cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int value, size_t count, CUstream hStream);
+CUresult hook_cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short value, size_t count, CUstream hStream);
+CUresult hook_cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount);
+CUresult hook_cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream);
 CUresult hook_cuMemGetInfo_v2(size_t *free, size_t *total);
 
 /* Error */

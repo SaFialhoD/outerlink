@@ -121,8 +121,18 @@ type FnCuMemsetD8Async =
 type FnCuMemsetD32Async =
     unsafe extern "C" fn(dst: u64, value: u32, count: usize, stream: usize) -> i32;
 
+// 16-bit memset
+type FnCuMemsetD16 = unsafe extern "C" fn(dst: u64, value: u16, count: usize) -> i32;
+type FnCuMemsetD16Async =
+    unsafe extern "C" fn(dst: u64, value: u16, count: usize, stream: usize) -> i32;
+
 // Device-to-device memory copy
 type FnCuMemcpyDtoD = unsafe extern "C" fn(dst: u64, src: u64, bytecount: usize) -> i32;
+
+// Generic direction-agnostic memory copy
+type FnCuMemcpy = unsafe extern "C" fn(dst: u64, src: u64, bytecount: usize) -> i32;
+type FnCuMemcpyAsync =
+    unsafe extern "C" fn(dst: u64, src: u64, bytecount: usize, stream: usize) -> i32;
 
 // Host pinned memory
 type FnCuMemAllocHost = unsafe extern "C" fn(pp: *mut *mut std::ffi::c_void, bytesize: usize) -> i32;
@@ -228,12 +238,16 @@ struct CudaApi {
     cu_memcpy_dtoh: Option<FnCuMemcpyDtoH>,
     cu_mem_get_info: Option<FnCuMemGetInfo>,
     cu_memcpy_dtod: Option<FnCuMemcpyDtoD>,
+    cu_memcpy: Option<FnCuMemcpy>,
+    cu_memcpy_async: Option<FnCuMemcpyAsync>,
     cu_memcpy_htod_async: Option<FnCuMemcpyHtoDAsync>,
     cu_memcpy_dtoh_async: Option<FnCuMemcpyDtoHAsync>,
     cu_memset_d8: Option<FnCuMemsetD8>,
     cu_memset_d32: Option<FnCuMemsetD32>,
     cu_memset_d8_async: Option<FnCuMemsetD8Async>,
     cu_memset_d32_async: Option<FnCuMemsetD32Async>,
+    cu_memset_d16: Option<FnCuMemsetD16>,
+    cu_memset_d16_async: Option<FnCuMemsetD16Async>,
     cu_mem_alloc_host: Option<FnCuMemAllocHost>,
     cu_mem_free_host: Option<FnCuMemFreeHost>,
 
@@ -369,12 +383,16 @@ impl CudaApi {
             cu_memcpy_dtoh: load_sym!(lib, b"cuMemcpyDtoH_v2\0", b"cuMemcpyDtoH\0"),
             cu_mem_get_info: load_sym!(lib, b"cuMemGetInfo_v2\0", b"cuMemGetInfo\0"),
             cu_memcpy_dtod: load_sym!(lib, b"cuMemcpyDtoD_v2\0", b"cuMemcpyDtoD\0"),
+            cu_memcpy: load_sym!(lib, b"cuMemcpy\0"),
+            cu_memcpy_async: load_sym!(lib, b"cuMemcpyAsync\0"),
             cu_memcpy_htod_async: load_sym!(lib, b"cuMemcpyHtoDAsync_v2\0", b"cuMemcpyHtoDAsync\0"),
             cu_memcpy_dtoh_async: load_sym!(lib, b"cuMemcpyDtoHAsync_v2\0", b"cuMemcpyDtoHAsync\0"),
             cu_memset_d8: load_sym!(lib, b"cuMemsetD8_v2\0", b"cuMemsetD8\0"),
             cu_memset_d32: load_sym!(lib, b"cuMemsetD32_v2\0", b"cuMemsetD32\0"),
             cu_memset_d8_async: load_sym!(lib, b"cuMemsetD8Async\0"),
             cu_memset_d32_async: load_sym!(lib, b"cuMemsetD32Async\0"),
+            cu_memset_d16: load_sym!(lib, b"cuMemsetD16_v2\0", b"cuMemsetD16\0"),
+            cu_memset_d16_async: load_sym!(lib, b"cuMemsetD16Async\0"),
             cu_mem_alloc_host: load_sym!(lib, b"cuMemAllocHost_v2\0", b"cuMemAllocHost\0"),
             cu_mem_free_host: load_sym!(lib, b"cuMemFreeHost\0"),
 
@@ -1163,6 +1181,22 @@ impl GpuBackend for CudaGpuBackend {
         Ok(())
     }
 
+    fn memcpy(&self, dst: u64, src: u64, size: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_memcpy)?;
+        unsafe {
+            map_cuda_result(func(dst, src, size as usize))?;
+        }
+        Ok(())
+    }
+
+    fn memcpy_async(&self, dst: u64, src: u64, size: u64, stream: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_memcpy_async)?;
+        unsafe {
+            map_cuda_result(func(dst, src, size as usize, stream as usize))?;
+        }
+        Ok(())
+    }
+
     // --- Async memory copy ---
 
     fn memcpy_htod_async(&self, dst: u64, data: &[u8], stream: u64) -> Result<(), CuResult> {
@@ -1210,6 +1244,22 @@ impl GpuBackend for CudaGpuBackend {
 
     fn memset_d32_async(&self, dst: u64, value: u32, count: usize, stream: u64) -> Result<(), CuResult> {
         let func = require_fn(&self.api.cu_memset_d32_async)?;
+        unsafe {
+            map_cuda_result(func(dst, value, count, stream as usize))?;
+        }
+        Ok(())
+    }
+
+    fn memset_d16(&self, dst: u64, value: u16, count: usize) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_memset_d16)?;
+        unsafe {
+            map_cuda_result(func(dst, value, count))?;
+        }
+        Ok(())
+    }
+
+    fn memset_d16_async(&self, dst: u64, value: u16, count: usize, stream: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_memset_d16_async)?;
         unsafe {
             map_cuda_result(func(dst, value, count, stream as usize))?;
         }

@@ -227,10 +227,22 @@ pub trait GpuBackend: Send + Sync {
     /// Async fill device memory with a u32 value.
     fn memset_d32_async(&self, dst: u64, value: u32, count: usize, stream: u64) -> Result<(), CuResult>;
 
+    /// Fill device memory with a u16 value.
+    fn memset_d16(&self, dst: u64, value: u16, count: usize) -> Result<(), CuResult>;
+
+    /// Async fill device memory with a u16 value.
+    fn memset_d16_async(&self, dst: u64, value: u16, count: usize, stream: u64) -> Result<(), CuResult>;
+
     // --- Memory: device-to-device ---
 
     /// Copy `size` bytes from one device pointer to another.
     fn memcpy_dtod(&self, dst: u64, src: u64, size: u64) -> Result<(), CuResult>;
+
+    /// Generic direction-agnostic memory copy (both pointers are device).
+    fn memcpy(&self, dst: u64, src: u64, size: u64) -> Result<(), CuResult>;
+
+    /// Generic direction-agnostic async memory copy (both pointers are device).
+    fn memcpy_async(&self, dst: u64, src: u64, size: u64, stream: u64) -> Result<(), CuResult>;
 
     // --- Kernel launch ---
 
@@ -1123,6 +1135,37 @@ impl GpuBackend for StubGpuBackend {
         self.memset_d32(dst, value, count)
     }
 
+    fn memset_d16(&self, dst: u64, value: u16, count: usize) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        match state.allocations.get_mut(&dst) {
+            Some(buf) => {
+                let byte_count = count * 2;
+                if byte_count > buf.len() {
+                    return Err(CuResult::InvalidValue);
+                }
+                let val_bytes = value.to_le_bytes();
+                for i in 0..count {
+                    let offset = i * 2;
+                    buf[offset..offset + 2].copy_from_slice(&val_bytes);
+                }
+                Ok(())
+            }
+            None => Err(CuResult::InvalidValue),
+        }
+    }
+
+    fn memset_d16_async(&self, dst: u64, value: u16, count: usize, stream: u64) -> Result<(), CuResult> {
+        {
+            let state = self.state.lock().unwrap();
+            // Validate stream (0 = default stream, always valid).
+            if stream != 0 && !state.streams.contains_key(&stream) {
+                return Err(CuResult::InvalidValue);
+            }
+        }
+        // Stub: async behaves same as sync.
+        self.memset_d16(dst, value, count)
+    }
+
     // --- Memory: device-to-device ---
 
     fn memcpy_dtod(&self, dst: u64, src: u64, size: u64) -> Result<(), CuResult> {
@@ -1140,6 +1183,23 @@ impl GpuBackend for StubGpuBackend {
         }
         dst_buf[..size as usize].copy_from_slice(&data);
         Ok(())
+    }
+
+    fn memcpy(&self, dst: u64, src: u64, size: u64) -> Result<(), CuResult> {
+        // Generic memcpy: in stub mode both pointers must be device pointers.
+        // Delegates to memcpy_dtod.
+        self.memcpy_dtod(dst, src, size)
+    }
+
+    fn memcpy_async(&self, dst: u64, src: u64, size: u64, stream: u64) -> Result<(), CuResult> {
+        {
+            let state = self.state.lock().unwrap();
+            if stream != 0 && !state.streams.contains_key(&stream) {
+                return Err(CuResult::InvalidValue);
+            }
+        }
+        // Stub: async behaves same as sync.
+        self.memcpy(dst, src, size)
     }
 
     // --- Kernel launch ---
@@ -2841,5 +2901,116 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let result = gpu.pointer_get_attributes(&[2], 0xDEAD);
         assert_eq!(result, Err(CuResult::InvalidValue));
+    }
+
+    // ----- MemsetD16 tests -----
+
+    #[test]
+    fn test_memset_d16() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(16).unwrap();
+        // 8 u16 elements = 16 bytes
+        assert!(gpu.memset_d16(ptr, 0xBEEF, 8).is_ok());
+        let out = gpu.memcpy_dtoh(ptr, 16).unwrap();
+        let val_bytes = 0xBEEFu16.to_le_bytes();
+        for i in 0..8 {
+            assert_eq!(&out[i * 2..i * 2 + 2], &val_bytes);
+        }
+    }
+
+    #[test]
+    fn test_memset_d16_overflow() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(8).unwrap();
+        // 5 u16 elements = 10 bytes, but only 8 allocated.
+        assert_eq!(gpu.memset_d16(ptr, 0xFF, 5), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_memset_d16_invalid_ptr() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.memset_d16(0xBAD, 0xFF, 4), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_memset_d16_async() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(16).unwrap();
+        let stream = gpu.stream_create(0).unwrap();
+        assert!(gpu.memset_d16_async(ptr, 0xCAFE, 8, stream).is_ok());
+        let out = gpu.memcpy_dtoh(ptr, 16).unwrap();
+        let val_bytes = 0xCAFEu16.to_le_bytes();
+        for i in 0..8 {
+            assert_eq!(&out[i * 2..i * 2 + 2], &val_bytes);
+        }
+    }
+
+    #[test]
+    fn test_memset_d16_async_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(16).unwrap();
+        assert_eq!(gpu.memset_d16_async(ptr, 0xFF, 8, 0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    // ----- Memcpy (generic) tests -----
+
+    #[test]
+    fn test_memcpy() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        let dst = gpu.mem_alloc(64).unwrap();
+        let data: Vec<u8> = (0..64).collect();
+        assert_eq!(gpu.memcpy_htod(src, &data), CuResult::Success);
+        assert!(gpu.memcpy(dst, src, 64).is_ok());
+        let out = gpu.memcpy_dtoh(dst, 64).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_memcpy_invalid_src() {
+        let gpu = StubGpuBackend::new();
+        let dst = gpu.mem_alloc(64).unwrap();
+        assert_eq!(gpu.memcpy(dst, 0xBAD, 64), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_memcpy_invalid_dst() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        assert_eq!(gpu.memcpy(0xBAD, src, 64), Err(CuResult::InvalidValue));
+    }
+
+    // ----- MemcpyAsync (generic) tests -----
+
+    #[test]
+    fn test_memcpy_async() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        let dst = gpu.mem_alloc(64).unwrap();
+        let stream = gpu.stream_create(0).unwrap();
+        let data: Vec<u8> = (0..64).collect();
+        assert_eq!(gpu.memcpy_htod(src, &data), CuResult::Success);
+        assert!(gpu.memcpy_async(dst, src, 64, stream).is_ok());
+        let out = gpu.memcpy_dtoh(dst, 64).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_memcpy_async_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        let dst = gpu.mem_alloc(64).unwrap();
+        assert_eq!(gpu.memcpy_async(dst, src, 64, 0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_memcpy_async_default_stream() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        let dst = gpu.mem_alloc(64).unwrap();
+        let data: Vec<u8> = (0..64).collect();
+        assert_eq!(gpu.memcpy_htod(src, &data), CuResult::Success);
+        // Stream 0 (default) should always be valid.
+        assert!(gpu.memcpy_async(dst, src, 64, 0).is_ok());
     }
 }

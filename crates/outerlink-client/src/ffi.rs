@@ -2904,6 +2904,168 @@ pub extern "C" fn ol_cuMemsetD32Async(dst_device: u64, value: u32, count: usize,
 }
 
 // ---------------------------------------------------------------------------
+// MemsetD16 / MemsetD16Async
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemsetD16(dst_device: u64, value: u16, count: usize) -> u32 {
+    let client = get_client();
+    if count == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: send to server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_dst = match client.handles.device_ptrs.to_remote(dst_device) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        // Payload: [8B dst][4B value(u32 zero-extended)][8B count] = 20B
+        let mut payload = [0u8; 20];
+        payload[0..8].copy_from_slice(&remote_dst.to_le_bytes());
+        payload[8..12].copy_from_slice(&(value as u32).to_le_bytes());
+        payload[12..20].copy_from_slice(&(count as u64).to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemsetD16, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle
+    if client.handles.device_ptrs.to_remote(dst_device).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemsetD16Async(dst_device: u64, value: u16, count: usize, stream: u64) -> u32 {
+    let client = get_client();
+    if count == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: send to server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_dst = match client.handles.device_ptrs.to_remote(dst_device) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        // Payload: [8B dst][4B value][8B count][8B stream] = 28B
+        let mut payload = [0u8; 28];
+        payload[0..8].copy_from_slice(&remote_dst.to_le_bytes());
+        payload[8..12].copy_from_slice(&(value as u32).to_le_bytes());
+        payload[12..20].copy_from_slice(&(count as u64).to_le_bytes());
+        payload[20..28].copy_from_slice(&remote_stream.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemsetD16Async, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handles
+    if client.handles.device_ptrs.to_remote(dst_device).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Memcpy (generic, direction-agnostic)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemcpy(dst: u64, src: u64, byte_count: usize) -> u32 {
+    let client = get_client();
+    if byte_count == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: translate both handles and send to server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_dst = match client.handles.device_ptrs.to_remote(dst) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_src = match client.handles.device_ptrs.to_remote(src) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        // Payload: [8B dst][8B src][8B size] = 24B
+        let mut payload = [0u8; 24];
+        payload[0..8].copy_from_slice(&remote_dst.to_le_bytes());
+        payload[8..16].copy_from_slice(&remote_src.to_le_bytes());
+        payload[16..24].copy_from_slice(&(byte_count as u64).to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::Memcpy, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate both handles exist
+    if client.handles.device_ptrs.to_remote(dst).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.handles.device_ptrs.to_remote(src).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemcpyAsync(dst: u64, src: u64, byte_count: usize, stream: u64) -> u32 {
+    let client = get_client();
+    if byte_count == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: translate all handles and send to server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_dst = match client.handles.device_ptrs.to_remote(dst) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_src = match client.handles.device_ptrs.to_remote(src) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        // Payload: [8B dst][8B src][8B size][8B stream] = 32B
+        let mut payload = [0u8; 32];
+        payload[0..8].copy_from_slice(&remote_dst.to_le_bytes());
+        payload[8..16].copy_from_slice(&remote_src.to_le_bytes());
+        payload[16..24].copy_from_slice(&(byte_count as u64).to_le_bytes());
+        payload[24..32].copy_from_slice(&remote_stream.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemcpyAsync, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate all handles
+    if client.handles.device_ptrs.to_remote(dst).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.handles.device_ptrs.to_remote(src).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // MemAllocHost / MemFreeHost
 // ---------------------------------------------------------------------------
 
@@ -5103,5 +5265,127 @@ mod tests {
         assert_eq!(result, CUDA_SUCCESS);
         assert_eq!(val, 1); // CU_MEMORYTYPE_HOST
         let _ = ol_cuMemFreeHost(ptr);
+    }
+
+    // -- MemsetD16 tests --
+
+    #[test]
+    fn test_ol_cu_memset_d16() {
+        let mut ptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut ptr, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemsetD16(ptr, 0xBEEF, 512), CUDA_SUCCESS);
+        let _ = ol_cuMemFree_v2(ptr);
+    }
+
+    #[test]
+    fn test_ol_cu_memset_d16_invalid_ptr() {
+        assert_eq!(ol_cuMemsetD16(0xBAAD, 0xFF, 16), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_memset_d16_zero_count() {
+        assert_eq!(ol_cuMemsetD16(0x1000, 0xFF, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_memset_d16_async() {
+        let mut ptr: u64 = 0;
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut ptr, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemsetD16Async(ptr, 0xCAFE, 512, stream), CUDA_SUCCESS);
+        let _ = ol_cuStreamDestroy(stream);
+        let _ = ol_cuMemFree_v2(ptr);
+    }
+
+    #[test]
+    fn test_ol_cu_memset_d16_async_invalid_stream() {
+        let mut ptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut ptr, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemsetD16Async(ptr, 0xFF, 512, 0xBAD), CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuMemFree_v2(ptr);
+    }
+
+    #[test]
+    fn test_ol_cu_memset_d16_async_zero_count() {
+        assert_eq!(ol_cuMemsetD16Async(0x1000, 0xFF, 0, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- Memcpy (generic) tests --
+
+    #[test]
+    fn test_ol_cu_memcpy() {
+        let mut src: u64 = 0;
+        let mut dst: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut src, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemAlloc_v2(&mut dst, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpy(dst, src, 512), CUDA_SUCCESS);
+        let _ = ol_cuMemFree_v2(src);
+        let _ = ol_cuMemFree_v2(dst);
+    }
+
+    #[test]
+    fn test_ol_cu_memcpy_invalid_dst() {
+        let mut src: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut src, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpy(0xBAAD, src, 512), CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuMemFree_v2(src);
+    }
+
+    #[test]
+    fn test_ol_cu_memcpy_invalid_src() {
+        let mut dst: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dst, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpy(dst, 0xBAAD, 512), CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuMemFree_v2(dst);
+    }
+
+    #[test]
+    fn test_ol_cu_memcpy_zero_size() {
+        assert_eq!(ol_cuMemcpy(0x1000, 0x2000, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- MemcpyAsync (generic) tests --
+
+    #[test]
+    fn test_ol_cu_memcpy_async() {
+        let mut src: u64 = 0;
+        let mut dst: u64 = 0;
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut src, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemAlloc_v2(&mut dst, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpyAsync(dst, src, 512, stream), CUDA_SUCCESS);
+        let _ = ol_cuStreamDestroy(stream);
+        let _ = ol_cuMemFree_v2(src);
+        let _ = ol_cuMemFree_v2(dst);
+    }
+
+    #[test]
+    fn test_ol_cu_memcpy_async_invalid_stream() {
+        let mut src: u64 = 0;
+        let mut dst: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut src, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemAlloc_v2(&mut dst, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpyAsync(dst, src, 512, 0xBAD), CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuMemFree_v2(src);
+        let _ = ol_cuMemFree_v2(dst);
+    }
+
+    #[test]
+    fn test_ol_cu_memcpy_async_zero_size() {
+        assert_eq!(ol_cuMemcpyAsync(0x1000, 0x2000, 0, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_memcpy_async_default_stream() {
+        let mut src: u64 = 0;
+        let mut dst: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut src, 1024), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemAlloc_v2(&mut dst, 1024), CUDA_SUCCESS);
+        // Stream 0 = default, always valid.
+        assert_eq!(ol_cuMemcpyAsync(dst, src, 512, 0), CUDA_SUCCESS);
+        let _ = ol_cuMemFree_v2(src);
+        let _ = ol_cuMemFree_v2(dst);
     }
 }
