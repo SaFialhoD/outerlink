@@ -60,7 +60,9 @@ pub struct OuterLinkClient {
     /// to prevent concurrent initialization.
     callback_connection: std::sync::Mutex<Option<Arc<TcpTransportConnection>>>,
     /// Handle for the callback listener thread. Kept to detect if it's running.
-    callback_listener_running: AtomicBool,
+    /// Wrapped in Arc so the spawned listener task can safely reference it
+    /// without relying on the 'static lifetime invariant of OnceLock.
+    callback_listener_running: Arc<AtomicBool>,
 }
 
 impl OuterLinkClient {
@@ -85,7 +87,7 @@ impl OuterLinkClient {
             session_id: AtomicU64::new(0),
             callback_registry: Arc::new(CallbackRegistry::new()),
             callback_connection: std::sync::Mutex::new(None),
-            callback_listener_running: AtomicBool::new(false),
+            callback_listener_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -110,7 +112,7 @@ impl OuterLinkClient {
             session_id: AtomicU64::new(0),
             callback_registry: Arc::new(CallbackRegistry::new()),
             callback_connection: std::sync::Mutex::new(None),
-            callback_listener_running: AtomicBool::new(false),
+            callback_listener_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -595,9 +597,7 @@ impl OuterLinkClient {
         // Spawn background listener thread
         let registry = Arc::clone(&self.callback_registry);
         let cb_conn = Arc::clone(&conn);
-        let running_flag = &self.callback_listener_running as *const AtomicBool;
-        // SAFETY: The AtomicBool lives in OuterLinkClient which is 'static (OnceLock).
-        let running_flag = unsafe { &*running_flag };
+        let running_flag = Arc::clone(&self.callback_listener_running);
         running_flag.store(true, Ordering::Release);
 
         self.runtime.spawn(async move {

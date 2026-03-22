@@ -116,11 +116,9 @@ impl CallbackRegistry {
             inner.entries.remove(&callback_id);
             data
         };
-        // Mutex is released here. Notify waiters BEFORE invoking callback
-        // so StreamSynchronize can proceed even if callback is slow.
-        self.completed_cond.notify_all();
-
-        // Invoke the callback outside the lock.
+        // Mutex is released here. Invoke callback BEFORE notifying waiters
+        // so StreamSynchronize blocks until the callback has fully returned,
+        // matching CUDA semantics ("all preceding work is complete").
         match kind {
             CallbackKind::StreamAddCallback => {
                 // CUstreamCallback signature: void(CUstream, CUresult, void*)
@@ -140,6 +138,8 @@ impl CallbackRegistry {
                 }
             }
         }
+        // Notify AFTER callback returns so StreamSynchronize blocks until done.
+        self.completed_cond.notify_all();
     }
 
     /// Check if there are any pending (not yet completed) callbacks for a
