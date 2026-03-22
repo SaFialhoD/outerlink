@@ -8168,4 +8168,241 @@ mod tests {
 
         let _ = ol_cuModuleUnload(module);
     }
+
+    // ----- cuMemcpyDtoDAsync_v2 tests -----
+
+    #[test]
+    fn test_memcpy_dtod_async_stub_basic() {
+        // Allocate src and dst
+        let mut src: u64 = 0;
+        let mut dst: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut src, 512), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemAlloc_v2(&mut dst, 512), CUDA_SUCCESS);
+        // Async DtoD with default stream
+        assert_eq!(ol_cuMemcpyDtoDAsync_v2(dst, src, 512, 0), CUDA_SUCCESS);
+        let _ = ol_cuMemFree_v2(src);
+        let _ = ol_cuMemFree_v2(dst);
+    }
+
+    #[test]
+    fn test_memcpy_dtod_async_zero_size() {
+        assert_eq!(ol_cuMemcpyDtoDAsync_v2(0x1000, 0x2000, 0, 0), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_memcpy_dtod_async_invalid_dst() {
+        let mut src: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut src, 64), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpyDtoDAsync_v2(0xBAD, src, 64, 0), CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuMemFree_v2(src);
+    }
+
+    #[test]
+    fn test_memcpy_dtod_async_invalid_src() {
+        let mut dst: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dst, 64), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpyDtoDAsync_v2(dst, 0xBAD, 64, 0), CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuMemFree_v2(dst);
+    }
+
+    #[test]
+    fn test_memcpy_dtod_async_invalid_stream() {
+        let mut src: u64 = 0;
+        let mut dst: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut src, 64), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemAlloc_v2(&mut dst, 64), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpyDtoDAsync_v2(dst, src, 64, 0xBAD0000), CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuMemFree_v2(src);
+        let _ = ol_cuMemFree_v2(dst);
+    }
+
+    #[test]
+    fn test_memcpy_dtod_async_with_stream() {
+        let mut src: u64 = 0;
+        let mut dst: u64 = 0;
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut src, 256), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemAlloc_v2(&mut dst, 256), CUDA_SUCCESS);
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuMemcpyDtoDAsync_v2(dst, src, 256, stream), CUDA_SUCCESS);
+        let _ = ol_cuStreamDestroy(stream);
+        let _ = ol_cuMemFree_v2(src);
+        let _ = ol_cuMemFree_v2(dst);
+    }
+
+    // ----- cuMemHostAlloc tests -----
+
+    #[test]
+    fn test_mem_host_alloc_stub_basic() {
+        let mut pp: *mut u8 = ptr::null_mut();
+        assert_eq!(ol_cuMemHostAlloc(&mut pp, 4096, 0), CUDA_SUCCESS);
+        assert!(!pp.is_null());
+        assert_eq!(ol_cuMemFreeHost(pp), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_mem_host_alloc_with_flags() {
+        let mut pp: *mut u8 = ptr::null_mut();
+        // CU_MEMHOSTALLOC_PORTABLE=1 | CU_MEMHOSTALLOC_DEVICEMAP=2
+        assert_eq!(ol_cuMemHostAlloc(&mut pp, 1024, 3), CUDA_SUCCESS);
+        assert!(!pp.is_null());
+        assert_eq!(ol_cuMemFreeHost(pp), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_mem_host_alloc_null_pp() {
+        assert_eq!(ol_cuMemHostAlloc(ptr::null_mut(), 4096, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_mem_host_alloc_zero_size() {
+        let mut pp: *mut u8 = ptr::null_mut();
+        assert_eq!(ol_cuMemHostAlloc(&mut pp, 0, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // ----- cuMemAllocPitch_v2 tests -----
+
+    #[test]
+    fn test_mem_alloc_pitch_stub_basic() {
+        let mut dptr: u64 = 0;
+        let mut pitch: usize = 0;
+        assert_eq!(ol_cuMemAllocPitch_v2(&mut dptr, &mut pitch, 100, 50, 4), CUDA_SUCCESS);
+        assert_ne!(dptr, 0);
+        assert_eq!(pitch, 512); // 100 rounded to 512
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_mem_alloc_pitch_exact_512() {
+        let mut dptr: u64 = 0;
+        let mut pitch: usize = 0;
+        assert_eq!(ol_cuMemAllocPitch_v2(&mut dptr, &mut pitch, 512, 10, 4), CUDA_SUCCESS);
+        assert_eq!(pitch, 512);
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_mem_alloc_pitch_null_dptr() {
+        let mut pitch: usize = 0;
+        assert_eq!(ol_cuMemAllocPitch_v2(ptr::null_mut(), &mut pitch, 100, 50, 4), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_mem_alloc_pitch_null_pitch() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAllocPitch_v2(&mut dptr, ptr::null_mut(), 100, 50, 4), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_mem_alloc_pitch_zero_width() {
+        let mut dptr: u64 = 0;
+        let mut pitch: usize = 0;
+        assert_eq!(ol_cuMemAllocPitch_v2(&mut dptr, &mut pitch, 0, 50, 4), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_mem_alloc_pitch_zero_height() {
+        let mut dptr: u64 = 0;
+        let mut pitch: usize = 0;
+        assert_eq!(ol_cuMemAllocPitch_v2(&mut dptr, &mut pitch, 100, 0, 4), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // ----- cuModuleLoad / cuModuleLoadFatBinary tests -----
+
+    #[test]
+    fn test_module_load_stub() {
+        let mut module: u64 = 0;
+        let path = std::ffi::CString::new("/path/to/module.cubin").unwrap();
+        assert_eq!(ol_cuModuleLoad(&mut module, path.as_ptr() as *const u8), CUDA_SUCCESS);
+        assert_ne!(module, 0);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_module_load_null_module() {
+        let path = std::ffi::CString::new("/path").unwrap();
+        assert_eq!(ol_cuModuleLoad(ptr::null_mut(), path.as_ptr() as *const u8), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_module_load_null_fname() {
+        let mut module: u64 = 0;
+        assert_eq!(ol_cuModuleLoad(&mut module, ptr::null()), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_module_load_fat_binary_stub() {
+        let mut module: u64 = 0;
+        let data = [0u8; 64]; // fake fat binary
+        assert_eq!(ol_cuModuleLoadFatBinary(&mut module, data.as_ptr()), CUDA_SUCCESS);
+        assert_ne!(module, 0);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_module_load_fat_binary_null_module() {
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadFatBinary(ptr::null_mut(), data.as_ptr()), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_module_load_fat_binary_null_data() {
+        let mut module: u64 = 0;
+        assert_eq!(ol_cuModuleLoadFatBinary(&mut module, ptr::null()), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // ----- cuDeviceGetMemPool / cuDeviceSetMemPool tests -----
+
+    #[test]
+    fn test_device_get_mem_pool_stub() {
+        let mut pool: u64 = 0;
+        assert_eq!(ol_cuDeviceGetMemPool(&mut pool, 0), CUDA_SUCCESS);
+        assert_ne!(pool, 0);
+    }
+
+    #[test]
+    fn test_device_get_mem_pool_null_pool() {
+        assert_eq!(ol_cuDeviceGetMemPool(ptr::null_mut(), 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_device_get_mem_pool_invalid_device() {
+        let mut pool: u64 = 0;
+        assert_eq!(ol_cuDeviceGetMemPool(&mut pool, 99), CUDA_ERROR_INVALID_DEVICE);
+    }
+
+    #[test]
+    fn test_device_set_mem_pool_stub() {
+        // Get the default pool first
+        let mut pool: u64 = 0;
+        assert_eq!(ol_cuDeviceGetDefaultMemPool(&mut pool, 0), CUDA_SUCCESS);
+        // Set it as the current pool
+        assert_eq!(ol_cuDeviceSetMemPool(0, pool), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_device_set_mem_pool_invalid_device() {
+        let mut pool: u64 = 0;
+        assert_eq!(ol_cuDeviceGetDefaultMemPool(&mut pool, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuDeviceSetMemPool(99, pool), CUDA_ERROR_INVALID_DEVICE);
+    }
+
+    #[test]
+    fn test_device_set_mem_pool_invalid_pool() {
+        assert_eq!(ol_cuDeviceSetMemPool(0, 0xBAD0000), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // ----- cuMemGetAllocationGranularity tests -----
+
+    #[test]
+    fn test_mem_get_allocation_granularity_stub() {
+        let mut granularity: usize = 0;
+        assert_eq!(ol_cuMemGetAllocationGranularity(&mut granularity, ptr::null(), 0), CUDA_SUCCESS);
+        assert_eq!(granularity, 512);
+    }
+
+    #[test]
+    fn test_mem_get_allocation_granularity_null_output() {
+        assert_eq!(ol_cuMemGetAllocationGranularity(ptr::null_mut(), ptr::null(), 0), CUDA_ERROR_INVALID_VALUE);
+    }
 }
