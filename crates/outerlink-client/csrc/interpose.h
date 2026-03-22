@@ -93,6 +93,8 @@ extern CUresult ol_cuModuleUnload(unsigned long long module);
 extern CUresult ol_cuModuleGetFunction(unsigned long long *func, unsigned long long module, const char *name);
 extern CUresult ol_cuModuleGetGlobal(unsigned long long *dptr, size_t *size, unsigned long long module, const unsigned char *name, size_t name_len);
 extern CUresult ol_cuFuncGetAttribute(int *pi, int attrib, unsigned long long func);
+extern CUresult ol_cuFuncSetAttribute(unsigned long long func, int attrib, int value);
+extern CUresult ol_cuMemGetAddressRange_v2(unsigned long long *pbase, size_t *psize, unsigned long long dptr);
 
 /* Occupancy */
 extern CUresult ol_cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, unsigned long long func, int blockSize, unsigned long long dynamicSMemSize);

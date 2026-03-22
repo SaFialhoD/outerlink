@@ -1451,6 +1451,95 @@ pub extern "C" fn ol_cuFuncGetAttribute(pi: *mut i32, attrib: i32, func: u64) ->
 }
 
 // ---------------------------------------------------------------------------
+// Function attribute set
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuFuncSetAttribute(func: u64, attrib: i32, value: i32) -> u32 {
+    let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = [0u8; 16];
+        payload[0..8].copy_from_slice(&remote_func.to_le_bytes());
+        payload[8..12].copy_from_slice(&attrib.to_le_bytes());
+        payload[12..16].copy_from_slice(&value.to_le_bytes());
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::FuncSetAttribute, &payload)
+        {
+            return parse_result(&resp);
+        }
+    }
+    // Stub fallback: validate function handle exists
+    if client.handles.functions.to_remote(func).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Only settable attributes: 8 (MAX_DYNAMIC_SHARED_SIZE_BYTES), 9 (PREFERRED_SHARED_MEMORY_CARVEOUT)
+    match attrib {
+        8 | 9 => CUDA_SUCCESS,
+        _ => CUDA_ERROR_INVALID_VALUE,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory address range query
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemGetAddressRange_v2(
+    pbase: *mut u64,
+    psize: *mut usize,
+    dptr: u64,
+) -> u32 {
+    let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_dptr = match client.handles.device_ptrs.to_remote(dptr) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_dptr.to_le_bytes();
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::MemGetAddressRange, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 20 {
+                // base is the remote pointer; we map it back to local as `dptr`
+                // since for exact-match allocations base == remote_dptr.
+                let _remote_base = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let size = u64::from_le_bytes(resp[12..20].try_into().unwrap()) as usize;
+                if !pbase.is_null() {
+                    unsafe { *pbase = dptr };
+                }
+                if !psize.is_null() {
+                    unsafe { *psize = size };
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback: validate the device pointer exists in our handle table
+    if client.handles.device_ptrs.to_remote(dptr).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // In stub mode we don't know the allocation size, return the pointer
+    // itself as the base with size 0.
+    if !pbase.is_null() {
+        unsafe { *pbase = dptr };
+    }
+    if !psize.is_null() {
+        unsafe { *psize = 0 };
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // Occupancy
 // ---------------------------------------------------------------------------
 
@@ -4523,5 +4612,112 @@ mod tests {
         assert_eq!(result, CUDA_SUCCESS);
         assert_eq!(block_sz, 256);
         assert!(min_grid > 0);
+    }
+
+    // -- FuncSetAttribute tests --
+
+    #[test]
+    fn test_ol_cu_func_set_attribute_max_dynamic_shared() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"kern\0";
+        assert_eq!(ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8), CUDA_SUCCESS);
+
+        // attrib 8 = MAX_DYNAMIC_SHARED_SIZE_BYTES
+        let result = ol_cuFuncSetAttribute(func, 8, 65536);
+        assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_ol_cu_func_set_attribute_read_only_rejected() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"kern\0";
+        assert_eq!(ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8), CUDA_SUCCESS);
+
+        // attrib 0 = MAX_THREADS_PER_BLOCK (read-only)
+        let result = ol_cuFuncSetAttribute(func, 0, 512);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_ol_cu_func_set_attribute_invalid_func() {
+        let result = ol_cuFuncSetAttribute(0xDEAD, 8, 100);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_func_set_attribute_invalid_attrib() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"kern\0";
+        assert_eq!(ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8), CUDA_SUCCESS);
+
+        let result = ol_cuFuncSetAttribute(func, 9999, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    // -- MemGetAddressRange tests --
+
+    #[test]
+    fn test_ol_cu_mem_get_address_range_basic() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 4096), CUDA_SUCCESS);
+        assert_ne!(dptr, 0);
+
+        let mut base: u64 = 0;
+        let mut size: usize = 0;
+        let result = ol_cuMemGetAddressRange_v2(&mut base, &mut size, dptr);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(base, dptr);
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_get_address_range_null_pbase() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 1024), CUDA_SUCCESS);
+
+        let mut size: usize = 0;
+        let result = ol_cuMemGetAddressRange_v2(ptr::null_mut(), &mut size, dptr);
+        assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_get_address_range_null_psize() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 1024), CUDA_SUCCESS);
+
+        let mut base: u64 = 0;
+        let result = ol_cuMemGetAddressRange_v2(&mut base, ptr::null_mut(), dptr);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(base, dptr);
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_get_address_range_both_null() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 1024), CUDA_SUCCESS);
+
+        let result = ol_cuMemGetAddressRange_v2(ptr::null_mut(), ptr::null_mut(), dptr);
+        assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_get_address_range_invalid_ptr() {
+        let result = ol_cuMemGetAddressRange_v2(ptr::null_mut(), ptr::null_mut(), 0xDEAD);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
     }
 }

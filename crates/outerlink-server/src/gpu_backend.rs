@@ -108,6 +108,17 @@ pub trait GpuBackend: Send + Sync {
     /// Returns the attribute value on success.
     fn func_get_attribute(&self, attrib: i32, func: u64) -> Result<i32, CuResult>;
 
+    /// Set an attribute of a kernel function.
+    ///
+    /// `attrib` is the raw `CUfunction_attribute` enum value.
+    /// The most important attribute is `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` (8).
+    fn func_set_attribute(&self, func: u64, attrib: i32, value: i32) -> Result<(), CuResult>;
+
+    /// Get the base address and size of the allocation that contains `dptr`.
+    ///
+    /// Returns `(base, size)` on success.
+    fn mem_get_address_range(&self, dptr: u64) -> Result<(u64, usize), CuResult>;
+
     // --- Occupancy operations ---
 
     /// Compute max active blocks per SM for a given function and block size.
@@ -339,6 +350,8 @@ struct StubModule {
 struct StubFunction {
     module_id: u64,
     name: String,
+    /// Settable attributes (e.g. MAX_DYNAMIC_SHARED_SIZE_BYTES).
+    attributes: HashMap<i32, i32>,
 }
 
 /// Metadata for a stub CUDA stream.
@@ -663,6 +676,7 @@ impl GpuBackend for StubGpuBackend {
         state.functions.insert(id, StubFunction {
             module_id: module,
             name: name.to_string(),
+            attributes: HashMap::new(),
         });
         Ok(id)
     }
@@ -681,10 +695,16 @@ impl GpuBackend for StubGpuBackend {
 
     fn func_get_attribute(&self, attrib: i32, func: u64) -> Result<i32, CuResult> {
         let state = self.state.lock().unwrap();
-        if !state.functions.contains_key(&func) {
-            return Err(CuResult::InvalidValue);
+        let stub_fn = match state.functions.get(&func) {
+            Some(f) => f,
+            None => return Err(CuResult::InvalidValue),
+        };
+        // Check if this attribute was explicitly set via func_set_attribute.
+        // Settable attributes: 8 (MAX_DYNAMIC_SHARED_SIZE_BYTES), 9 (PREFERRED_SHARED_MEMORY_CARVEOUT).
+        if let Some(&stored) = stub_fn.attributes.get(&attrib) {
+            return Ok(stored);
         }
-        // Return plausible values for a Compute Capability 8.6 kernel.
+        // Return plausible defaults for a Compute Capability 8.6 kernel.
         let val = match attrib {
             0 => 1024,  // CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK
             1 => 0,     // CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES (static)
@@ -705,6 +725,35 @@ impl GpuBackend for StubGpuBackend {
             _ => return Err(CuResult::InvalidValue),
         };
         Ok(val)
+    }
+
+    fn func_set_attribute(&self, func: u64, attrib: i32, value: i32) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        let stub_fn = match state.functions.get_mut(&func) {
+            Some(f) => f,
+            None => return Err(CuResult::InvalidValue),
+        };
+        // Only settable attributes: 8 (MAX_DYNAMIC_SHARED_SIZE_BYTES),
+        // 9 (PREFERRED_SHARED_MEMORY_CARVEOUT).
+        match attrib {
+            8 | 9 => {
+                stub_fn.attributes.insert(attrib, value);
+                Ok(())
+            }
+            // Valid read-only attributes -- not settable
+            0..=7 | 10..=15 => Err(CuResult::InvalidValue),
+            _ => Err(CuResult::InvalidValue),
+        }
+    }
+
+    fn mem_get_address_range(&self, dptr: u64) -> Result<(u64, usize), CuResult> {
+        let state = self.state.lock().unwrap();
+        // Exact match: dptr is the base of an allocation.
+        if let Some(buf) = state.allocations.get(&dptr) {
+            return Ok((dptr, buf.len()));
+        }
+        // In the stub we don't support interior pointer lookup.
+        Err(CuResult::InvalidValue)
     }
 
     // --- Occupancy operations ---
@@ -2558,5 +2607,93 @@ mod tests {
         gpu.ctx_enable_peer_access(ctx, 0).unwrap();
         gpu.ctx_disable_peer_access(ctx).unwrap();
         assert_eq!(gpu.ctx_disable_peer_access(ctx), Err(CuResult::PeerAccessNotEnabled));
+    }
+
+    // --- func_set_attribute tests ---
+
+    #[test]
+    fn test_func_set_attribute_max_dynamic_shared_mem() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        // attrib 8 = MAX_DYNAMIC_SHARED_SIZE_BYTES
+        assert!(gpu.func_set_attribute(func, 8, 65536).is_ok());
+        // Verify it's readable back
+        assert_eq!(gpu.func_get_attribute(8, func).unwrap(), 65536);
+    }
+
+    #[test]
+    fn test_func_set_attribute_preferred_carveout() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        // attrib 9 = PREFERRED_SHARED_MEMORY_CARVEOUT
+        assert!(gpu.func_set_attribute(func, 9, 50).is_ok());
+        assert_eq!(gpu.func_get_attribute(9, func).unwrap(), 50);
+    }
+
+    #[test]
+    fn test_func_set_attribute_read_only_rejected() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        // attrib 0 = MAX_THREADS_PER_BLOCK (read-only)
+        assert_eq!(gpu.func_set_attribute(func, 0, 512), Err(CuResult::InvalidValue));
+        // attrib 4 = NUM_REGS (read-only)
+        assert_eq!(gpu.func_set_attribute(func, 4, 16), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_func_set_attribute_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.func_set_attribute(0xDEAD, 8, 100), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_func_set_attribute_invalid_attrib() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        assert_eq!(gpu.func_set_attribute(func, 9999, 0), Err(CuResult::InvalidValue));
+        assert_eq!(gpu.func_set_attribute(func, -1, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_func_set_attribute_overwrite() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        gpu.func_set_attribute(func, 8, 1024).unwrap();
+        assert_eq!(gpu.func_get_attribute(8, func).unwrap(), 1024);
+        gpu.func_set_attribute(func, 8, 2048).unwrap();
+        assert_eq!(gpu.func_get_attribute(8, func).unwrap(), 2048);
+    }
+
+    // --- mem_get_address_range tests ---
+
+    #[test]
+    fn test_mem_get_address_range_exact_match() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(4096).unwrap();
+        let (base, size) = gpu.mem_get_address_range(ptr).unwrap();
+        assert_eq!(base, ptr);
+        assert_eq!(size, 4096);
+    }
+
+    #[test]
+    fn test_mem_get_address_range_unknown_ptr() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_get_address_range(0xDEAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_get_address_range_after_free() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(1024).unwrap();
+        gpu.mem_free(ptr).unwrap();
+        assert_eq!(gpu.mem_get_address_range(ptr), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_get_address_range_interior_ptr_fails() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(4096).unwrap();
+        // Interior pointer (ptr + 100) is not the base, stub doesn't support this
+        assert_eq!(gpu.mem_get_address_range(ptr + 100), Err(CuResult::InvalidValue));
     }
 }

@@ -83,6 +83,10 @@ type FnCuModuleGetFunction =
 type FnCuModuleGetGlobal =
     unsafe extern "C" fn(dptr: *mut u64, size: *mut usize, module: usize, name: *const u8) -> i32;
 type FnCuFuncGetAttribute = unsafe extern "C" fn(pi: *mut i32, attrib: i32, hfunc: usize) -> i32;
+type FnCuFuncSetAttribute = unsafe extern "C" fn(hfunc: usize, attrib: i32, value: i32) -> i32;
+
+// Memory address range query
+type FnCuMemGetAddressRange = unsafe extern "C" fn(pbase: *mut u64, psize: *mut usize, dptr: u64) -> i32;
 
 // Stream operations
 type FnCuStreamCreate = unsafe extern "C" fn(stream: *mut usize, flags: u32) -> i32;
@@ -233,6 +237,8 @@ struct CudaApi {
     cu_module_get_function: Option<FnCuModuleGetFunction>,
     cu_module_get_global: Option<FnCuModuleGetGlobal>,
     cu_func_get_attribute: Option<FnCuFuncGetAttribute>,
+    cu_func_set_attribute: Option<FnCuFuncSetAttribute>,
+    cu_mem_get_address_range: Option<FnCuMemGetAddressRange>,
 
     cu_stream_create: Option<FnCuStreamCreate>,
     cu_stream_create_with_priority: Option<FnCuStreamCreateWithPriority>,
@@ -369,6 +375,8 @@ impl CudaApi {
             cu_module_get_function: load_sym!(lib, b"cuModuleGetFunction\0"),
             cu_module_get_global: load_sym!(lib, b"cuModuleGetGlobal_v2\0", b"cuModuleGetGlobal\0"),
             cu_func_get_attribute: load_sym!(lib, b"cuFuncGetAttribute\0"),
+            cu_func_set_attribute: load_sym!(lib, b"cuFuncSetAttribute\0"),
+            cu_mem_get_address_range: load_sym!(lib, b"cuMemGetAddressRange_v2\0", b"cuMemGetAddressRange\0"),
 
             cu_stream_create: load_sym!(lib, b"cuStreamCreate\0"),
             cu_stream_create_with_priority: load_sym!(lib, b"cuStreamCreateWithPriority\0"),
@@ -842,6 +850,26 @@ impl GpuBackend for CudaGpuBackend {
         }
         tracing::trace!(attrib, func, value, "CUDA func attribute queried");
         Ok(value)
+    }
+
+    fn func_set_attribute(&self, func: u64, attrib: i32, value: i32) -> Result<(), CuResult> {
+        let f = require_fn(&self.api.cu_func_set_attribute)?;
+        unsafe {
+            map_cuda_result(f(func as usize, attrib, value))?;
+        }
+        tracing::trace!(func, attrib, value, "CUDA func attribute set");
+        Ok(())
+    }
+
+    fn mem_get_address_range(&self, dptr: u64) -> Result<(u64, usize), CuResult> {
+        let f = require_fn(&self.api.cu_mem_get_address_range)?;
+        let mut base: u64 = 0;
+        let mut size: usize = 0;
+        unsafe {
+            map_cuda_result(f(&mut base, &mut size, dptr))?;
+        }
+        tracing::trace!(dptr, base, size, "CUDA mem address range queried");
+        Ok((base, size))
     }
 
     // --- Occupancy operations ---
