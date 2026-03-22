@@ -70,6 +70,13 @@ static STUB_HANDLE_COUNTER: std::sync::atomic::AtomicU64 =
 /// Tracks which peer contexts have been enabled via `cuCtxEnablePeerAccess` in
 /// stub mode. Used to return correct error codes on double-enable and
 /// disable-without-enable.
+// Track device allocation sizes for cuMemGetAddressRange stub
+static DEVICE_ALLOC_SIZES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, usize>>> =
+    std::sync::OnceLock::new();
+fn device_alloc_sizes() -> &'static std::sync::Mutex<std::collections::HashMap<u64, usize>> {
+    DEVICE_ALLOC_SIZES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 static STUB_PEER_ACCESS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
     std::sync::OnceLock::new();
 
@@ -898,6 +905,7 @@ pub extern "C" fn ol_cuMemAlloc_v2(dptr: *mut u64, size: usize) -> u32 {
             if resp.len() >= 12 {
                 let remote_devptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
                 let synthetic = client.handles.device_ptrs.insert(remote_devptr);
+                device_alloc_sizes().lock().unwrap().insert(synthetic, size);
                 unsafe { *dptr = synthetic };
                 return CUDA_SUCCESS;
             }
@@ -907,6 +915,7 @@ pub extern "C" fn ol_cuMemAlloc_v2(dptr: *mut u64, size: usize) -> u32 {
     // Stub: generate a local-only handle
     let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let synthetic = client.handles.device_ptrs.insert(stub_remote);
+    device_alloc_sizes().lock().unwrap().insert(synthetic, size);
     unsafe { *dptr = synthetic };
     CUDA_SUCCESS
 }
@@ -929,6 +938,7 @@ pub extern "C" fn ol_cuMemFree_v2(dptr: u64) -> u32 {
             let result = parse_result(&resp);
             // CUDA contract: handle is invalidated on free regardless of server errors
             client.handles.device_ptrs.remove_by_local(dptr);
+            device_alloc_sizes().lock().unwrap().remove(&dptr);
             return result;
         }
         // Transport error -- fall through to stub
@@ -937,6 +947,7 @@ pub extern "C" fn ol_cuMemFree_v2(dptr: u64) -> u32 {
     if client.handles.device_ptrs.remove_by_local(dptr).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    device_alloc_sizes().lock().unwrap().remove(&dptr);
     CUDA_SUCCESS
 }
 
@@ -1528,13 +1539,12 @@ pub extern "C" fn ol_cuMemGetAddressRange_v2(
     if client.handles.device_ptrs.to_remote(dptr).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // In stub mode we don't know the allocation size, return the pointer
-    // itself as the base with size 0.
+    let size = device_alloc_sizes().lock().unwrap().get(&dptr).copied().unwrap_or(0);
     if !pbase.is_null() {
         unsafe { *pbase = dptr };
     }
     if !psize.is_null() {
-        unsafe { *psize = 0 };
+        unsafe { *psize = size };
     }
     CUDA_SUCCESS
 }
