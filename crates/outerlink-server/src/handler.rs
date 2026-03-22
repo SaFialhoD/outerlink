@@ -399,8 +399,20 @@ pub fn handle_request(
             }
             let image_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
             let num_options = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
-            let options_size = num_options * 12;
-            let expected_len = 8 + options_size + image_len;
+            // CUDA JIT has ~30 defined options; 256 is extremely generous.
+            // Reject before allocating to prevent a crafted client from
+            // causing a huge Vec::with_capacity allocation.
+            if num_options > 256 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let options_size = match num_options.checked_mul(12) {
+                Some(v) => v,
+                None => return error_response(rid, CuResult::InvalidValue),
+            };
+            let expected_len = match (8usize).checked_add(options_size).and_then(|v| v.checked_add(image_len)) {
+                Some(v) => v,
+                None => return error_response(rid, CuResult::InvalidValue),
+            };
             if payload.len() < expected_len || image_len == 0 {
                 return error_response(rid, CuResult::InvalidValue);
             }
@@ -2541,6 +2553,52 @@ mod tests {
         let payload = [0u8; 6]; // need 12, sending 6
         let hdr = req(MessageType::FuncGetAttribute, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- ModuleLoadDataEx: num_options cap (fix #5) ---
+
+    #[test]
+    fn test_module_load_data_ex_num_options_too_large() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&4u32.to_le_bytes());         // image_len=4
+        payload.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // num_options=max u32
+        // Don't need to provide full payload -- should reject before reading options
+        let hdr = req(MessageType::ModuleLoadDataEx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_module_load_data_ex_num_options_at_cap() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&4u32.to_le_bytes());     // image_len=4
+        payload.extend_from_slice(&257u32.to_le_bytes());   // num_options=257 (over 256 cap)
+        let hdr = req(MessageType::ModuleLoadDataEx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- ModuleLoadDataEx: overflow in options_size (fix #6) ---
+
+    #[test]
+    fn test_module_load_data_ex_options_size_overflow() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&4u32.to_le_bytes());     // image_len=4
+        // 256 options is within cap but 256*12 = 3072 which is fine.
+        // We need to test that checked arithmetic doesn't panic.
+        // With the cap at 256, overflow via num_options*12 is impossible,
+        // but we test that image_len + options_size doesn't overflow.
+        // Use image_len = u32::MAX and num_options = 200.
+        let mut payload2 = Vec::new();
+        payload2.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // image_len = max
+        payload2.extend_from_slice(&200u32.to_le_bytes());          // num_options = 200
+        let hdr = req(MessageType::ModuleLoadDataEx, payload2.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload2);
+        // Should reject (not panic) due to payload length mismatch
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }

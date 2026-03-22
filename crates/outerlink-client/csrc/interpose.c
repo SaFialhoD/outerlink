@@ -453,14 +453,21 @@ CUresult hook_cuModuleLoadData(CUmodule *module, const void *image) {
         if (p[0] >= 0x20 && p[0] < 0x7F) {
             /* PTX text — null-terminated string */
             data_len = strlen((const char *)image) + 1;
-        } else if (p[0] == 0x7F && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') {
+        } else if (p[0] == 0x7F && p[1] == 'E' && p[2] == 'L' && p[3] == 'F'
+                   && p[4] == 2     /* EI_CLASS = ELFCLASS64 */
+                   && p[5] == 1     /* EI_DATA  = ELFDATA2LSB */) {
             /* ELF cubin — compute a lower-bound estimate of the image size
              * from the section header table (e_shoff + e_shnum * e_shentsize).
              * This is NOT the exact file size but it covers all section headers,
-             * which is sufficient for the server to load the module. */
+             * which is sufficient for the server to load the module.
+             *
+             * ELF64 header is 64 bytes; we read at offsets 0x28, 0x3A, 0x3C.
+             * The EI_CLASS=2 and EI_DATA=1 checks above serve as a guard:
+             * a truncated buffer (< 64 bytes) would have garbage at bytes 4-5,
+             * making it extremely unlikely to pass both checks. A valid CUDA
+             * cubin is always 64-bit little-endian ELF. */
             unsigned long long e_shoff = 0;
             unsigned short e_shnum = 0, e_shentsize = 0;
-            /* ELF64 header is 64 bytes; reject anything smaller. */
             memcpy(&e_shoff, p + 0x28, 8);
             memcpy(&e_shentsize, p + 0x3A, 2);
             memcpy(&e_shnum, p + 0x3C, 2);
@@ -493,8 +500,10 @@ CUresult hook_cuModuleLoadDataEx(CUmodule *module, const void *image,
         if (p[0] >= 0x20 && p[0] < 0x7F) {
             /* PTX text — null-terminated string */
             data_len = strlen((const char *)image) + 1;
-        } else if (p[0] == 0x7F && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') {
-            /* ELF cubin */
+        } else if (p[0] == 0x7F && p[1] == 'E' && p[2] == 'L' && p[3] == 'F'
+                   && p[4] == 2     /* EI_CLASS = ELFCLASS64 */
+                   && p[5] == 1     /* EI_DATA  = ELFDATA2LSB */) {
+            /* ELF cubin — same guard as hook_cuModuleLoadData. */
             unsigned long long e_shoff = 0;
             unsigned short e_shnum = 0, e_shentsize = 0;
             memcpy(&e_shoff, p + 0x28, 8);

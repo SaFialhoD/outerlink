@@ -690,10 +690,7 @@ impl GpuBackend for StubGpuBackend {
         if !start_ev.recorded || !end_ev.recorded {
             return Err(CuResult::NotReady);
         }
-        if end_ev.timestamp_ns < start_ev.timestamp_ns {
-            return Err(CuResult::InvalidValue);
-        }
-        // Convert nanosecond difference to milliseconds.
+        // Real CUDA returns negative elapsed time when end < start (no error).
         let diff_ns = end_ev.timestamp_ns as f64 - start_ev.timestamp_ns as f64;
         Ok((diff_ns / 1_000_000.0) as f32)
     }
@@ -1376,8 +1373,9 @@ mod tests {
         gpu.event_record(e1, 0).unwrap();
         gpu.event_record(e2, 0).unwrap();
         // Passing them in reverse order (start=e2, end=e1) produces negative time.
-        // Real CUDA returns an error for this.
-        assert_eq!(gpu.event_elapsed_time(e2, e1), Err(CuResult::InvalidValue));
+        // Real CUDA returns a negative elapsed time, not an error.
+        let ms = gpu.event_elapsed_time(e2, e1).unwrap();
+        assert!(ms < 0.0, "reversed event order should produce negative elapsed time");
     }
 
     #[test]
