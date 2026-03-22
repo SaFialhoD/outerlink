@@ -403,6 +403,29 @@ pub trait GpuBackend: Send + Sync {
     /// In stub mode, delegates to `mem_alloc` (pool and stream are ignored).
     fn mem_alloc_from_pool_async(&self, size: usize, pool: u64, stream: u64) -> Result<u64, CuResult>;
 
+    // --- JIT Linker operations ---
+
+    /// Create a JIT linker state object (cuLinkCreate).
+    /// `options` are `(CUjit_option, value)` pairs.
+    /// Returns a linker state handle.
+    fn link_create(&self, options: &[(i32, u64)]) -> Result<u64, CuResult>;
+
+    /// Add PTX/cubin data to an existing linker state (cuLinkAddData).
+    /// `jit_type` is the CUjitInputType enum value.
+    fn link_add_data(&self, state: u64, jit_type: i32, data: &[u8], name: &str, options: &[(i32, u64)]) -> Result<(), CuResult>;
+
+    /// Add a file to an existing linker state (cuLinkAddFile).
+    /// In stub mode returns `CuResult::NotFound` (no filesystem access).
+    fn link_add_file(&self, state: u64, jit_type: i32, path: &str, options: &[(i32, u64)]) -> Result<(), CuResult>;
+
+    /// Complete linking and return the linked cubin data (cuLinkComplete).
+    /// Returns `(cubin_pointer, cubin_bytes)` where the pointer is a synthetic
+    /// address the caller can use as a reference.
+    fn link_complete(&self, state: u64) -> Result<(u64, Vec<u8>), CuResult>;
+
+    /// Destroy a linker state object (cuLinkDestroy).
+    fn link_destroy(&self, state: u64) -> Result<(), CuResult>;
+
     // --- Callback operations ---
 
     /// Register a stream callback (cuStreamAddCallback).
@@ -493,6 +516,18 @@ struct StubStream {
     ctx: u64,
 }
 
+/// State for a stub JIT linker.
+struct StubLinkState {
+    /// Accumulated data entries (type, name, data).
+    entries: Vec<(i32, String, Vec<u8>)>,
+    /// Options passed at creation.
+    _options: Vec<(i32, u64)>,
+    /// Whether link_complete has been called.
+    completed: bool,
+    /// The linked cubin data (set after link_complete).
+    cubin: Option<Vec<u8>>,
+}
+
 /// Metadata for a stub CUDA event.
 struct StubEvent {
     flags: u32,
@@ -562,6 +597,10 @@ struct StubState {
     mem_pools: HashMap<u64, MemPoolState>,
     /// Counter for generating memory pool handles.
     next_pool_id: u64,
+    /// JIT linker states: handle -> linker state.
+    link_states: HashMap<u64, StubLinkState>,
+    /// Counter for generating linker state handles.
+    next_link_id: u64,
     /// Peer contexts currently enabled for P2P access.
     peer_access: HashSet<u64>,
     /// Preferred cache configuration (CU_FUNC_CACHE_PREFER_*).
@@ -622,6 +661,8 @@ impl StubGpuBackend {
                     m.insert(0x02, 8_388_608);   // CU_LIMIT_MALLOC_HEAP_SIZE
                     m
                 },
+                link_states: HashMap::new(),
+                next_link_id: 0x4C00_0000_0000_0001, // 'L' prefix
                 peer_access: HashSet::new(),
                 cache_config: 0,        // CU_FUNC_CACHE_PREFER_NONE
                 shared_mem_config: 0,    // CU_SHARED_MEM_CONFIG_DEFAULT_BANK_SIZE
@@ -1587,6 +1628,92 @@ impl GpuBackend for StubGpuBackend {
         Ok(())
     }
 
+    fn link_create(&self, options: &[(i32, u64)]) -> Result<u64, CuResult> {
+        let mut state = self.state.lock().unwrap();
+        let id = state.next_link_id;
+        state.next_link_id += 1;
+        state.link_states.insert(
+            id,
+            StubLinkState {
+                entries: Vec::new(),
+                _options: options.to_vec(),
+                completed: false,
+                cubin: None,
+            },
+        );
+        Ok(id)
+    }
+
+    fn link_add_data(
+        &self,
+        handle: u64,
+        jit_type: i32,
+        data: &[u8],
+        name: &str,
+        _options: &[(i32, u64)],
+    ) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        let link = state
+            .link_states
+            .get_mut(&handle)
+            .ok_or(CuResult::InvalidValue)?;
+        if link.completed {
+            return Err(CuResult::InvalidValue);
+        }
+        link.entries
+            .push((jit_type, name.to_string(), data.to_vec()));
+        Ok(())
+    }
+
+    fn link_add_file(
+        &self,
+        handle: u64,
+        _jit_type: i32,
+        _path: &str,
+        _options: &[(i32, u64)],
+    ) -> Result<(), CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.link_states.contains_key(&handle) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Stub has no filesystem -- return file-not-found.
+        Err(CuResult::NotFound)
+    }
+
+    fn link_complete(&self, handle: u64) -> Result<(u64, Vec<u8>), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        let link = state
+            .link_states
+            .get_mut(&handle)
+            .ok_or(CuResult::InvalidValue)?;
+        if link.completed {
+            return Err(CuResult::InvalidValue);
+        }
+        // Build a minimal synthetic ELF cubin.
+        // Real CUDA returns a valid ELF; our stub returns a recognizable
+        // header that module_load_data can accept.
+        let mut cubin = Vec::new();
+        // ELF magic
+        cubin.extend_from_slice(&[0x7f, b'E', b'L', b'F']);
+        // Padding to 64 bytes (minimal ELF header size)
+        cubin.resize(64, 0);
+        // Append a marker so tests can verify content
+        cubin.extend_from_slice(b"OLNK_STUB_CUBIN");
+
+        let cubin_ptr = cubin.as_ptr() as u64;
+        link.completed = true;
+        link.cubin = Some(cubin.clone());
+        Ok((cubin_ptr, cubin))
+    }
+
+    fn link_destroy(&self, handle: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if state.link_states.remove(&handle).is_none() {
+            return Err(CuResult::InvalidValue);
+        }
+        Ok(())
+    }
+
     fn stream_add_callback(&self, stream: u64, _callback_id: u64, _flags: u32) -> Result<(), CuResult> {
         // Stub: validate stream exists, callback fires immediately (handler sends CallbackReady).
         let state = self.state.lock().unwrap();
@@ -1628,6 +1755,7 @@ impl GpuBackend for StubGpuBackend {
         state.primary_contexts.clear();
         state.context_stack.clear();
         state.context_limits.clear();
+        state.link_states.clear();
     }
 
     fn primary_ctx_retain(&self, device: i32) -> Result<u64, CuResult> {
@@ -3930,5 +4058,168 @@ mod tests {
             gpu.launch_host_func(stream, 1),
             Err(CuResult::InvalidValue)
         );
+    }
+
+    // ----- JIT Linker operation tests -----
+
+    #[test]
+    fn test_link_create_returns_unique_handles() {
+        let gpu = StubGpuBackend::new();
+        let h1 = gpu.link_create(&[]).unwrap();
+        let h2 = gpu.link_create(&[]).unwrap();
+        assert_ne!(h1, h2);
+        assert_ne!(h1, 0);
+    }
+
+    #[test]
+    fn test_link_create_with_options() {
+        let gpu = StubGpuBackend::new();
+        let opts = vec![(0, 100u64), (1, 200u64)];
+        let h = gpu.link_create(&opts).unwrap();
+        assert_ne!(h, 0);
+    }
+
+    #[test]
+    fn test_link_add_data_valid() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        let ptx = b".version 7.0\n.target sm_80\n";
+        assert!(gpu.link_add_data(h, 0, ptx, "test.ptx", &[]).is_ok());
+    }
+
+    #[test]
+    fn test_link_add_data_invalid_handle() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.link_add_data(0xBAD, 0, b"data", "name", &[]),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_link_add_data_after_complete() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        gpu.link_complete(h).unwrap();
+        assert_eq!(
+            gpu.link_add_data(h, 0, b"data", "name", &[]),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_link_add_data_multiple_entries() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        assert!(gpu.link_add_data(h, 0, b"ptx1", "a.ptx", &[]).is_ok());
+        assert!(gpu.link_add_data(h, 0, b"ptx2", "b.ptx", &[]).is_ok());
+        assert!(gpu.link_add_data(h, 1, b"cubin", "c.cubin", &[]).is_ok());
+    }
+
+    #[test]
+    fn test_link_add_file_returns_not_found() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        assert_eq!(
+            gpu.link_add_file(h, 0, "/nonexistent.ptx", &[]),
+            Err(CuResult::NotFound)
+        );
+    }
+
+    #[test]
+    fn test_link_add_file_invalid_handle() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.link_add_file(0xBAD, 0, "/path", &[]),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_link_complete_returns_cubin() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        gpu.link_add_data(h, 0, b"ptx data", "test.ptx", &[]).unwrap();
+        let (ptr, cubin) = gpu.link_complete(h).unwrap();
+        assert_ne!(ptr, 0);
+        assert!(!cubin.is_empty());
+        // Verify ELF magic
+        assert_eq!(&cubin[0..4], &[0x7f, b'E', b'L', b'F']);
+        // Verify stub marker
+        assert!(cubin.windows(15).any(|w| w == b"OLNK_STUB_CUBIN"));
+    }
+
+    #[test]
+    fn test_link_complete_invalid_handle() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.link_complete(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_link_complete_double_call() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        gpu.link_complete(h).unwrap();
+        // Second call should fail
+        assert_eq!(gpu.link_complete(h), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_link_destroy_valid() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        assert!(gpu.link_destroy(h).is_ok());
+    }
+
+    #[test]
+    fn test_link_destroy_invalid_handle() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.link_destroy(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_link_destroy_double_destroy() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        assert!(gpu.link_destroy(h).is_ok());
+        assert_eq!(gpu.link_destroy(h), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_link_full_lifecycle() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        gpu.link_add_data(h, 0, b".version 7.0", "kern.ptx", &[]).unwrap();
+        let (_ptr, cubin) = gpu.link_complete(h).unwrap();
+        assert!(!cubin.is_empty());
+        gpu.link_destroy(h).unwrap();
+    }
+
+    #[test]
+    fn test_link_add_data_after_destroy() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        gpu.link_destroy(h).unwrap();
+        assert_eq!(
+            gpu.link_add_data(h, 0, b"ptx", "a.ptx", &[]),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_link_complete_after_destroy() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        gpu.link_destroy(h).unwrap();
+        assert_eq!(gpu.link_complete(h), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_link_shutdown_clears_states() {
+        let gpu = StubGpuBackend::new();
+        let h = gpu.link_create(&[]).unwrap();
+        gpu.shutdown();
+        // After shutdown, the handle is invalid
+        assert_eq!(gpu.link_destroy(h), Err(CuResult::InvalidValue));
     }
 }

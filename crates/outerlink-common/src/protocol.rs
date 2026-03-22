@@ -157,6 +157,13 @@ pub enum MessageType {
     PointerGetAttribute = 0x00B0,
     PointerGetAttributes = 0x00B1,
 
+    // JIT Linker
+    LinkCreate = 0x00E0,
+    LinkAddData = 0x00E1,
+    LinkAddFile = 0x00E2,
+    LinkComplete = 0x00E3,
+    LinkDestroy = 0x00E4,
+
     // Callback (client <-> server)
     StreamAddCallback = 0x00D0,
     LaunchHostFunc = 0x00D1,
@@ -276,6 +283,11 @@ impl MessageType {
             0x00A5 => Some(Self::CtxSetSharedMemConfig),
             0x00B0 => Some(Self::PointerGetAttribute),
             0x00B1 => Some(Self::PointerGetAttributes),
+            0x00E0 => Some(Self::LinkCreate),
+            0x00E1 => Some(Self::LinkAddData),
+            0x00E2 => Some(Self::LinkAddFile),
+            0x00E3 => Some(Self::LinkComplete),
+            0x00E4 => Some(Self::LinkDestroy),
             0x00D0 => Some(Self::StreamAddCallback),
             0x00D1 => Some(Self::LaunchHostFunc),
             0x00D2 => Some(Self::CallbackReady),

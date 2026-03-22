@@ -237,6 +237,16 @@ static const hook_entry_t hook_table[] = {
     { "cuLaunchKernel",          (void *)hook_cuLaunchKernel },
     { "cuLaunchCooperativeKernel", (void *)hook_cuLaunchCooperativeKernel },
 
+    /* JIT Linker */
+    { "cuLinkCreate",            (void *)hook_cuLinkCreate },
+    { "cuLinkCreate_v2",         (void *)hook_cuLinkCreate_v2 },
+    { "cuLinkAddData",           (void *)hook_cuLinkAddData },
+    { "cuLinkAddData_v2",        (void *)hook_cuLinkAddData_v2 },
+    { "cuLinkAddFile",           (void *)hook_cuLinkAddFile },
+    { "cuLinkAddFile_v2",        (void *)hook_cuLinkAddFile_v2 },
+    { "cuLinkComplete",          (void *)hook_cuLinkComplete },
+    { "cuLinkDestroy",           (void *)hook_cuLinkDestroy },
+
     /* Export table -- passthrough to real libcuda.so (in-process vtables) */
     { "cuGetExportTable",        (void *)hook_cuGetExportTable },
 
@@ -723,6 +733,92 @@ CUresult hook_cuMemAllocFromPoolAsync(CUdeviceptr *dptr, size_t bytesize,
     return ol_cuMemAllocFromPoolAsync((unsigned long long *)dptr, bytesize,
                                        (unsigned long long)(uintptr_t)pool,
                                        (unsigned long long)(uintptr_t)hStream);
+}
+
+/* -- JIT Linker -- */
+
+CUresult hook_cuLinkCreate_v2(unsigned int numOptions, int *options,
+                               void **optionValues, void **stateOut) {
+    ensure_init();
+    unsigned long long state_u64 = 0;
+    CUresult r = ol_cuLinkCreate_v2(
+        numOptions,
+        options,
+        (unsigned long long *)optionValues,
+        &state_u64
+    );
+    if (r == CUDA_SUCCESS && stateOut) {
+        *stateOut = (void *)(uintptr_t)state_u64;
+    }
+    return r;
+}
+
+CUresult hook_cuLinkCreate(unsigned int numOptions, int *options,
+                            void **optionValues, void **stateOut) {
+    return hook_cuLinkCreate_v2(numOptions, options, optionValues, stateOut);
+}
+
+CUresult hook_cuLinkAddData_v2(void *state, int type, void *data, size_t size,
+                                const char *name, unsigned int numOptions,
+                                int *options, void **optionValues) {
+    ensure_init();
+    return ol_cuLinkAddData_v2(
+        (unsigned long long)(uintptr_t)state,
+        type,
+        (unsigned char *)data,
+        size,
+        name,
+        numOptions,
+        options,
+        (unsigned long long *)optionValues
+    );
+}
+
+CUresult hook_cuLinkAddData(void *state, int type, void *data, size_t size,
+                             const char *name, unsigned int numOptions,
+                             int *options, void **optionValues) {
+    return hook_cuLinkAddData_v2(state, type, data, size, name, numOptions, options, optionValues);
+}
+
+CUresult hook_cuLinkAddFile_v2(void *state, int type, const char *path,
+                                unsigned int numOptions, int *options,
+                                void **optionValues) {
+    ensure_init();
+    return ol_cuLinkAddFile_v2(
+        (unsigned long long)(uintptr_t)state,
+        type,
+        path,
+        numOptions,
+        options,
+        (unsigned long long *)optionValues
+    );
+}
+
+CUresult hook_cuLinkAddFile(void *state, int type, const char *path,
+                             unsigned int numOptions, int *options,
+                             void **optionValues) {
+    return hook_cuLinkAddFile_v2(state, type, path, numOptions, options, optionValues);
+}
+
+CUresult hook_cuLinkComplete(void *state, void **cubinOut, size_t *sizeOut) {
+    ensure_init();
+    const unsigned char *cubin_ptr = NULL;
+    size_t cubin_size = 0;
+    CUresult r = ol_cuLinkComplete(
+        (unsigned long long)(uintptr_t)state,
+        &cubin_ptr,
+        &cubin_size
+    );
+    if (r == CUDA_SUCCESS) {
+        if (cubinOut) *cubinOut = (void *)cubin_ptr;
+        if (sizeOut) *sizeOut = cubin_size;
+    }
+    return r;
+}
+
+CUresult hook_cuLinkDestroy(void *state) {
+    ensure_init();
+    return ol_cuLinkDestroy((unsigned long long)(uintptr_t)state);
 }
 
 /* -- Error -- */

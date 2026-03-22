@@ -1683,6 +1683,32 @@ impl GpuBackend for CudaGpuBackend {
         }
     }
 
+    fn link_create(&self, _options: &[(i32, u64)]) -> Result<u64, CuResult> {
+        // TODO: Wire to real cuLinkCreate_v2 via libloading.
+        tracing::warn!("CudaBackend::link_create not yet wired to real CUDA driver");
+        Err(CuResult::JitCompilerNotFound)
+    }
+
+    fn link_add_data(&self, _state: u64, _jit_type: i32, _data: &[u8], _name: &str, _options: &[(i32, u64)]) -> Result<(), CuResult> {
+        tracing::warn!("CudaBackend::link_add_data not yet wired to real CUDA driver");
+        Err(CuResult::JitCompilerNotFound)
+    }
+
+    fn link_add_file(&self, _state: u64, _jit_type: i32, _path: &str, _options: &[(i32, u64)]) -> Result<(), CuResult> {
+        tracing::warn!("CudaBackend::link_add_file not yet wired to real CUDA driver");
+        Err(CuResult::JitCompilerNotFound)
+    }
+
+    fn link_complete(&self, _state: u64) -> Result<(u64, Vec<u8>), CuResult> {
+        tracing::warn!("CudaBackend::link_complete not yet wired to real CUDA driver");
+        Err(CuResult::JitCompilerNotFound)
+    }
+
+    fn link_destroy(&self, _state: u64) -> Result<(), CuResult> {
+        tracing::warn!("CudaBackend::link_destroy not yet wired to real CUDA driver");
+        Err(CuResult::JitCompilerNotFound)
+    }
+
     fn stream_add_callback(&self, _stream: u64, _callback_id: u64, _flags: u32) -> Result<(), CuResult> {
         // In the real backend, we would use cuLaunchHostFunc to enqueue a
         // notification-sender on the real GPU stream. For now, callbacks fire

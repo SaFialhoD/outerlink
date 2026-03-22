@@ -2390,6 +2390,288 @@ pub extern "C" fn ol_cuMemAllocFromPoolAsync(dptr: *mut u64, size: usize, pool: 
 }
 
 // ---------------------------------------------------------------------------
+// JIT Linker
+// ---------------------------------------------------------------------------
+
+/// Stores cubin data per link state handle. cuLinkComplete stores the cubin
+/// here, cuLinkDestroy removes it. The cubin pointer returned to the app
+/// points into the Vec and is valid until cuLinkDestroy.
+static LINK_CUBINS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>>> =
+    std::sync::OnceLock::new();
+
+fn link_cubins() -> &'static std::sync::Mutex<std::collections::HashMap<u64, Vec<u8>>> {
+    LINK_CUBINS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Stub-only: link state tracker (set of valid handles).
+static STUB_LINK_STATES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+fn stub_link_states() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
+    STUB_LINK_STATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuLinkCreate_v2(
+    num_options: u32,
+    options: *const i32,
+    option_values: *const u64,
+    state_out: *mut u64,
+) -> u32 {
+    let client = get_client();
+    if state_out.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        // Serialize: 4B numOpts + N*(4B opt + 8B val)
+        let mut payload = Vec::with_capacity(4 + num_options as usize * 12);
+        payload.extend_from_slice(&num_options.to_le_bytes());
+        for i in 0..num_options as usize {
+            let opt = if options.is_null() { 0i32 } else { unsafe { *options.add(i) } };
+            let val = if option_values.is_null() { 0u64 } else { unsafe { *option_values.add(i) } };
+            payload.extend_from_slice(&opt.to_le_bytes());
+            payload.extend_from_slice(&val.to_le_bytes());
+        }
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::LinkCreate, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.link_states.insert(remote_handle);
+                unsafe { *state_out = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: generate a local-only handle
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.link_states.insert(stub_remote);
+    stub_link_states().lock().unwrap().insert(synthetic);
+    unsafe { *state_out = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuLinkCreate(
+    num_options: u32,
+    options: *const i32,
+    option_values: *const u64,
+    state_out: *mut u64,
+) -> u32 {
+    ol_cuLinkCreate_v2(num_options, options, option_values, state_out)
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuLinkAddData_v2(
+    state: u64,
+    jit_type: i32,
+    data: *const u8,
+    size: usize,
+    name: *const std::ffi::c_char,
+    num_options: u32,
+    options: *const i32,
+    option_values: *const u64,
+) -> u32 {
+    let client = get_client();
+    // Null data is invalid (unless size is 0, but CUDA requires data for PTX)
+    if data.is_null() || size == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let data_slice = unsafe { std::slice::from_raw_parts(data, size) };
+    let name_str = if name.is_null() {
+        ""
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(name) }.to_str().unwrap_or("")
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let remote_state = match client.handles.link_states.to_remote(state) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        // Payload: u64 state + 4B type + 4B name_len + 4B numOpts + N*(4B opt + 8B val) + name_bytes + data_bytes
+        let name_bytes = name_str.as_bytes();
+        let mut payload = Vec::with_capacity(20 + num_options as usize * 12 + name_bytes.len() + size);
+        payload.extend_from_slice(&remote_state.to_le_bytes());
+        payload.extend_from_slice(&jit_type.to_le_bytes());
+        payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&num_options.to_le_bytes());
+        for i in 0..num_options as usize {
+            let opt = if options.is_null() { 0i32 } else { unsafe { *options.add(i) } };
+            let val = if option_values.is_null() { 0u64 } else { unsafe { *option_values.add(i) } };
+            payload.extend_from_slice(&opt.to_le_bytes());
+            payload.extend_from_slice(&val.to_le_bytes());
+        }
+        payload.extend_from_slice(name_bytes);
+        payload.extend_from_slice(data_slice);
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::LinkAddData, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    // Stub: validate handle exists
+    if !stub_link_states().lock().unwrap().contains(&state) {
+        if client.handles.link_states.to_remote(state).is_none() {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuLinkAddData(
+    state: u64,
+    jit_type: i32,
+    data: *const u8,
+    size: usize,
+    name: *const std::ffi::c_char,
+    num_options: u32,
+    options: *const i32,
+    option_values: *const u64,
+) -> u32 {
+    ol_cuLinkAddData_v2(state, jit_type, data, size, name, num_options, options, option_values)
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuLinkAddFile_v2(
+    state: u64,
+    jit_type: i32,
+    path: *const std::ffi::c_char,
+    num_options: u32,
+    options: *const i32,
+    option_values: *const u64,
+) -> u32 {
+    let client = get_client();
+    if path.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let path_str = unsafe { std::ffi::CStr::from_ptr(path) }.to_str().unwrap_or("");
+    if client.connected.load(Ordering::Acquire) {
+        let remote_state = match client.handles.link_states.to_remote(state) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let path_bytes = path_str.as_bytes();
+        let mut payload = Vec::with_capacity(20 + num_options as usize * 12 + path_bytes.len());
+        payload.extend_from_slice(&remote_state.to_le_bytes());
+        payload.extend_from_slice(&jit_type.to_le_bytes());
+        payload.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&num_options.to_le_bytes());
+        for i in 0..num_options as usize {
+            let opt = if options.is_null() { 0i32 } else { unsafe { *options.add(i) } };
+            let val = if option_values.is_null() { 0u64 } else { unsafe { *option_values.add(i) } };
+            payload.extend_from_slice(&opt.to_le_bytes());
+            payload.extend_from_slice(&val.to_le_bytes());
+        }
+        payload.extend_from_slice(path_bytes);
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::LinkAddFile, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    // Stub: file operations are not supported
+    500 // CUDA_ERROR_FILE_NOT_FOUND = CUDA_ERROR_NOT_FOUND = 500
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuLinkAddFile(
+    state: u64,
+    jit_type: i32,
+    path: *const std::ffi::c_char,
+    num_options: u32,
+    options: *const i32,
+    option_values: *const u64,
+) -> u32 {
+    ol_cuLinkAddFile_v2(state, jit_type, path, num_options, options, option_values)
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuLinkComplete(
+    state: u64,
+    cubin_out: *mut *const u8,
+    size_out: *mut usize,
+) -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let remote_state = match client.handles.link_states.to_remote(state) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_state.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::LinkComplete, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            // Response: 4B result + 4B cubin_len + cubin_bytes
+            if resp.len() >= 8 {
+                let cubin_len = u32::from_le_bytes(resp[4..8].try_into().unwrap()) as usize;
+                if resp.len() >= 8 + cubin_len {
+                    let cubin_data = resp[8..8 + cubin_len].to_vec();
+                    // Store cubin data so the pointer remains valid until cuLinkDestroy
+                    let mut cubins = link_cubins().lock().unwrap();
+                    cubins.insert(state, cubin_data);
+                    let cubin_ref = cubins.get(&state).unwrap();
+                    if !cubin_out.is_null() {
+                        unsafe { *cubin_out = cubin_ref.as_ptr() };
+                    }
+                    if !size_out.is_null() {
+                        unsafe { *size_out = cubin_ref.len() };
+                    }
+                    return CUDA_SUCCESS;
+                }
+            }
+        }
+    }
+    // Stub: generate a minimal synthetic cubin
+    if !stub_link_states().lock().unwrap().contains(&state) {
+        if client.handles.link_states.to_remote(state).is_none() {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+    }
+    let mut cubin = Vec::new();
+    cubin.extend_from_slice(&[0x7f, b'E', b'L', b'F']);
+    cubin.resize(64, 0);
+    cubin.extend_from_slice(b"OLNK_STUB_CUBIN");
+    let mut cubins = link_cubins().lock().unwrap();
+    cubins.insert(state, cubin);
+    let cubin_ref = cubins.get(&state).unwrap();
+    if !cubin_out.is_null() {
+        unsafe { *cubin_out = cubin_ref.as_ptr() };
+    }
+    if !size_out.is_null() {
+        unsafe { *size_out = cubin_ref.len() };
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuLinkDestroy(state: u64) -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let remote_state = match client.handles.link_states.to_remote(state) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_state.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::LinkDestroy, &payload) {
+            let result = parse_result(&resp);
+            client.handles.link_states.remove_by_local(state);
+            link_cubins().lock().unwrap().remove(&state);
+            stub_link_states().lock().unwrap().remove(&state);
+            return result;
+        }
+    }
+    // Stub: remove from local tracking
+    client.handles.link_states.remove_by_local(state);
+    link_cubins().lock().unwrap().remove(&state);
+    if stub_link_states().lock().unwrap().remove(&state) {
+        CUDA_SUCCESS
+    } else {
+        CUDA_ERROR_INVALID_VALUE
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stream management
 // ---------------------------------------------------------------------------
 
@@ -6975,5 +7257,169 @@ mod tests {
         assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
         assert_eq!(ol_cuStreamSynchronize(stream), CUDA_SUCCESS);
         let _ = ol_cuStreamDestroy(stream);
+    }
+
+    // ----- JIT Linker stub tests -----
+
+    #[test]
+    fn test_ol_cu_link_create_v2() {
+        let mut state: u64 = 0;
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), &mut state), CUDA_SUCCESS);
+        assert_ne!(state, 0);
+        assert_eq!(ol_cuLinkDestroy(state), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_link_create_null_output() {
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), ptr::null_mut()), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_link_create_alias() {
+        let mut state: u64 = 0;
+        assert_eq!(ol_cuLinkCreate(0, ptr::null(), ptr::null(), &mut state), CUDA_SUCCESS);
+        assert_ne!(state, 0);
+        let _ = ol_cuLinkDestroy(state);
+    }
+
+    #[test]
+    fn test_ol_cu_link_add_data_v2() {
+        let mut state: u64 = 0;
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), &mut state), CUDA_SUCCESS);
+
+        let ptx = b".version 7.0\n.target sm_80\n";
+        let name = std::ffi::CString::new("test.ptx").unwrap();
+        assert_eq!(
+            ol_cuLinkAddData_v2(state, 0, ptx.as_ptr(), ptx.len(), name.as_ptr(), 0, ptr::null(), ptr::null()),
+            CUDA_SUCCESS
+        );
+        let _ = ol_cuLinkDestroy(state);
+    }
+
+    #[test]
+    fn test_ol_cu_link_add_data_null_data() {
+        let mut state: u64 = 0;
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), &mut state), CUDA_SUCCESS);
+        assert_eq!(
+            ol_cuLinkAddData_v2(state, 0, ptr::null(), 0, ptr::null(), 0, ptr::null(), ptr::null()),
+            CUDA_ERROR_INVALID_VALUE
+        );
+        let _ = ol_cuLinkDestroy(state);
+    }
+
+    #[test]
+    fn test_ol_cu_link_add_file_returns_not_found() {
+        let mut state: u64 = 0;
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), &mut state), CUDA_SUCCESS);
+
+        let path = std::ffi::CString::new("/nonexistent.ptx").unwrap();
+        // Stub returns CUDA_ERROR_NOT_FOUND = 500
+        assert_eq!(
+            ol_cuLinkAddFile_v2(state, 0, path.as_ptr(), 0, ptr::null(), ptr::null()),
+            500
+        );
+        let _ = ol_cuLinkDestroy(state);
+    }
+
+    #[test]
+    fn test_ol_cu_link_complete() {
+        let mut state: u64 = 0;
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), &mut state), CUDA_SUCCESS);
+
+        // Add some data
+        let ptx = b".version 7.0\n";
+        let name = std::ffi::CString::new("kern.ptx").unwrap();
+        assert_eq!(
+            ol_cuLinkAddData_v2(state, 0, ptx.as_ptr(), ptx.len(), name.as_ptr(), 0, ptr::null(), ptr::null()),
+            CUDA_SUCCESS
+        );
+
+        // Complete
+        let mut cubin_ptr: *const u8 = ptr::null();
+        let mut cubin_size: usize = 0;
+        assert_eq!(ol_cuLinkComplete(state, &mut cubin_ptr, &mut cubin_size), CUDA_SUCCESS);
+        assert!(!cubin_ptr.is_null());
+        assert!(cubin_size > 0);
+
+        // Verify ELF magic
+        let cubin = unsafe { std::slice::from_raw_parts(cubin_ptr, cubin_size) };
+        assert_eq!(&cubin[0..4], &[0x7f, b'E', b'L', b'F']);
+
+        let _ = ol_cuLinkDestroy(state);
+    }
+
+    #[test]
+    fn test_ol_cu_link_complete_null_outputs() {
+        let mut state: u64 = 0;
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), &mut state), CUDA_SUCCESS);
+
+        // Complete with null output pointers should still succeed
+        assert_eq!(ol_cuLinkComplete(state, ptr::null_mut(), ptr::null_mut()), CUDA_SUCCESS);
+        let _ = ol_cuLinkDestroy(state);
+    }
+
+    #[test]
+    fn test_ol_cu_link_destroy() {
+        let mut state: u64 = 0;
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), &mut state), CUDA_SUCCESS);
+        assert_eq!(ol_cuLinkDestroy(state), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_link_destroy_invalid() {
+        assert_eq!(ol_cuLinkDestroy(0xDEAD_BEEF), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_link_full_lifecycle() {
+        let mut state: u64 = 0;
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), &mut state), CUDA_SUCCESS);
+
+        let ptx = b".version 7.0\n.target sm_80\n.address_size 64\n";
+        let name = std::ffi::CString::new("kernel.ptx").unwrap();
+        assert_eq!(
+            ol_cuLinkAddData_v2(state, 0, ptx.as_ptr(), ptx.len(), name.as_ptr(), 0, ptr::null(), ptr::null()),
+            CUDA_SUCCESS
+        );
+
+        let mut cubin_ptr: *const u8 = ptr::null();
+        let mut cubin_size: usize = 0;
+        assert_eq!(ol_cuLinkComplete(state, &mut cubin_ptr, &mut cubin_size), CUDA_SUCCESS);
+        assert!(!cubin_ptr.is_null());
+        assert!(cubin_size > 0);
+
+        // Cubin pointer should remain valid until destroy
+        let cubin = unsafe { std::slice::from_raw_parts(cubin_ptr, cubin_size) };
+        assert_eq!(&cubin[0..4], &[0x7f, b'E', b'L', b'F']);
+
+        assert_eq!(ol_cuLinkDestroy(state), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_link_destroy_cleans_cubin() {
+        let mut state: u64 = 0;
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), &mut state), CUDA_SUCCESS);
+
+        let mut cubin_ptr: *const u8 = ptr::null();
+        let mut cubin_size: usize = 0;
+        assert_eq!(ol_cuLinkComplete(state, &mut cubin_ptr, &mut cubin_size), CUDA_SUCCESS);
+
+        // Destroy should clean up cubin
+        assert_eq!(ol_cuLinkDestroy(state), CUDA_SUCCESS);
+
+        // After destroy, the cubin entry should be gone from LINK_CUBINS
+        let cubins = link_cubins().lock().unwrap();
+        assert!(!cubins.contains_key(&state));
+    }
+
+    #[test]
+    fn test_ol_cu_link_create_unique_handles() {
+        let mut s1: u64 = 0;
+        let mut s2: u64 = 0;
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), &mut s1), CUDA_SUCCESS);
+        assert_eq!(ol_cuLinkCreate_v2(0, ptr::null(), ptr::null(), &mut s2), CUDA_SUCCESS);
+        assert_ne!(s1, s2);
+        let _ = ol_cuLinkDestroy(s1);
+        let _ = ol_cuLinkDestroy(s2);
     }
 }

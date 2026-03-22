@@ -1643,6 +1643,127 @@ pub fn handle_request_full(
             }
         }
 
+        // --- JIT Linker operations ---
+
+        MessageType::LinkCreate => {
+            // Payload: 4B numOpts + N*(4B opt + 8B val)
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let num_opts = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+            let opts_size = num_opts * 12; // 4B opt + 8B val each
+            if payload.len() < 4 + opts_size {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let mut options = Vec::with_capacity(num_opts);
+            let mut off = 4;
+            for _ in 0..num_opts {
+                let opt = i32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+                let val = u64::from_le_bytes(payload[off + 4..off + 12].try_into().unwrap());
+                options.push((opt, val));
+                off += 12;
+            }
+            match backend.link_create(&options) {
+                Ok(handle) => {
+                    session.track_link_state(handle);
+                    success_with(rid, &handle.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::LinkAddData => {
+            // Payload: u64 state + 4B type + 4B name_len + 4B numOpts + N*(4B opt + 8B val) + name_bytes + data_bytes
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let state_handle = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let jit_type = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let name_len = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as usize;
+            let num_opts = u32::from_le_bytes(payload[16..20].try_into().unwrap()) as usize;
+            let opts_size = num_opts * 12;
+            let header_size = 20 + opts_size;
+            if payload.len() < header_size + name_len {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let mut options = Vec::with_capacity(num_opts);
+            let mut off = 20;
+            for _ in 0..num_opts {
+                let opt = i32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+                let val = u64::from_le_bytes(payload[off + 4..off + 12].try_into().unwrap());
+                options.push((opt, val));
+                off += 12;
+            }
+            let name = std::str::from_utf8(&payload[off..off + name_len]).unwrap_or("");
+            off += name_len;
+            let data = &payload[off..];
+            match backend.link_add_data(state_handle, jit_type, data, name, &options) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::LinkAddFile => {
+            // Payload: u64 state + 4B type + 4B path_len + 4B numOpts + N*(4B opt + 8B val) + path_bytes
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let state_handle = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let jit_type = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let path_len = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as usize;
+            let num_opts = u32::from_le_bytes(payload[16..20].try_into().unwrap()) as usize;
+            let opts_size = num_opts * 12;
+            let header_size = 20 + opts_size;
+            if payload.len() < header_size + path_len {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let mut options = Vec::with_capacity(num_opts);
+            let mut off = 20;
+            for _ in 0..num_opts {
+                let opt = i32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+                let val = u64::from_le_bytes(payload[off + 4..off + 12].try_into().unwrap());
+                options.push((opt, val));
+                off += 12;
+            }
+            let path = std::str::from_utf8(&payload[off..off + path_len]).unwrap_or("");
+            match backend.link_add_file(state_handle, jit_type, path, &options) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::LinkComplete => {
+            // Payload: u64 state = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let state_handle = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.link_complete(state_handle) {
+                Ok((_cubin_ptr, cubin_data)) => {
+                    // Response: 4B result + 4B cubin_len + cubin_bytes
+                    let mut data = (cubin_data.len() as u32).to_le_bytes().to_vec();
+                    data.extend_from_slice(&cubin_data);
+                    success_with(rid, &data)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::LinkDestroy => {
+            // Payload: u64 state = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let state_handle = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.link_destroy(state_handle) {
+                Ok(()) => {
+                    session.untrack_link_state(state_handle);
+                    result_only(rid, CuResult::Success)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         // CallbackReady, CallbackChannelInit, CallbackChannelAck are not
         // valid client->server request types on the main connection.
         // They are handled in the accept loop (server.rs).
@@ -5306,5 +5427,224 @@ mod tests {
         let (_, resp) = handle_request(&gpu, &hdr, &payload, &mut session);
         // Should still return Success (callback notification is dropped by wrapper)
         assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    // ----- JIT Linker handler tests -----
+
+    #[test]
+    fn test_link_create_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // No options
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::LinkCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert!(resp.len() >= 12);
+        let handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(handle, 0);
+        assert_eq!(session.link_state_count(), 1);
+    }
+
+    #[test]
+    fn test_link_create_with_options() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // 2 options: (opt=0, val=100), (opt=1, val=200)
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u32.to_le_bytes()); // num_opts
+        payload.extend_from_slice(&0i32.to_le_bytes()); // opt 0
+        payload.extend_from_slice(&100u64.to_le_bytes()); // val 0
+        payload.extend_from_slice(&1i32.to_le_bytes()); // opt 1
+        payload.extend_from_slice(&200u64.to_le_bytes()); // val 1
+
+        let hdr = req(MessageType::LinkCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_link_create_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let (_, resp) = dispatch(&gpu, &req(MessageType::LinkCreate, 2), &[0; 2]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_link_add_data_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create a link state first
+        let create_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::LinkCreate, create_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &create_payload, &mut session);
+        let state_handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Add data: state + type + name_len + numOpts + name_bytes + data_bytes
+        let name = b"test.ptx";
+        let data = b".version 7.0\n.target sm_80\n";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&state_handle.to_le_bytes()); // u64 state
+        payload.extend_from_slice(&0i32.to_le_bytes()); // jit_type = PTX
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes()); // name_len
+        payload.extend_from_slice(&0u32.to_le_bytes()); // numOpts = 0
+        payload.extend_from_slice(name); // name bytes
+        payload.extend_from_slice(data); // data bytes
+
+        let hdr = req(MessageType::LinkAddData, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_link_add_data_invalid_handle() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0xBADu64.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes()); // name_len=0
+        payload.extend_from_slice(&0u32.to_le_bytes()); // numOpts=0
+
+        let hdr = req(MessageType::LinkAddData, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_link_add_file_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create a link state
+        let create_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::LinkCreate, create_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &create_payload, &mut session);
+        let state_handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Add file
+        let path = b"/nonexistent.ptx";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&state_handle.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes()); // jit_type
+        payload.extend_from_slice(&(path.len() as u32).to_le_bytes()); // path_len
+        payload.extend_from_slice(&0u32.to_le_bytes()); // numOpts
+        payload.extend_from_slice(path);
+
+        let hdr = req(MessageType::LinkAddFile, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        // Stub returns NotFound (500)
+        assert_eq!(response_result(&resp), CuResult::NotFound);
+    }
+
+    #[test]
+    fn test_link_complete_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create + add data + complete
+        let create_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::LinkCreate, create_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &create_payload, &mut session);
+        let state_handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Add some data
+        let mut add_payload = Vec::new();
+        add_payload.extend_from_slice(&state_handle.to_le_bytes());
+        add_payload.extend_from_slice(&0i32.to_le_bytes());
+        add_payload.extend_from_slice(&0u32.to_le_bytes()); // name_len=0
+        add_payload.extend_from_slice(&0u32.to_le_bytes()); // numOpts=0
+        let hdr = req(MessageType::LinkAddData, add_payload.len() as u32);
+        dispatch_with(&gpu, &hdr, &add_payload, &mut session);
+
+        // Complete
+        let complete_payload = state_handle.to_le_bytes();
+        let hdr = req(MessageType::LinkComplete, complete_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &complete_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        // Response should contain: 4B result + 4B cubin_len + cubin_bytes
+        assert!(resp.len() >= 8);
+        let cubin_len = u32::from_le_bytes(resp[4..8].try_into().unwrap()) as usize;
+        assert!(cubin_len > 0);
+        assert_eq!(resp.len(), 8 + cubin_len);
+        // Verify ELF magic in cubin
+        assert_eq!(&resp[8..12], &[0x7f, b'E', b'L', b'F']);
+    }
+
+    #[test]
+    fn test_link_complete_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let (_, resp) = dispatch(&gpu, &req(MessageType::LinkComplete, 4), &[0; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_link_destroy_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create
+        let create_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::LinkCreate, create_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &create_payload, &mut session);
+        let state_handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(session.link_state_count(), 1);
+
+        // Destroy
+        let destroy_payload = state_handle.to_le_bytes();
+        let hdr = req(MessageType::LinkDestroy, destroy_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &destroy_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.link_state_count(), 0);
+    }
+
+    #[test]
+    fn test_link_destroy_invalid_handle() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xBADu64.to_le_bytes();
+        let (_, resp) = dispatch(&gpu, &req(MessageType::LinkDestroy, payload.len() as u32), &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_link_full_lifecycle_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create
+        let create_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::LinkCreate, create_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &create_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let state_handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Add data
+        let name = b"kernel.ptx";
+        let ptx_data = b".version 7.0\n.target sm_80\n.address_size 64\n";
+        let mut add_payload = Vec::new();
+        add_payload.extend_from_slice(&state_handle.to_le_bytes());
+        add_payload.extend_from_slice(&0i32.to_le_bytes());
+        add_payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        add_payload.extend_from_slice(&0u32.to_le_bytes());
+        add_payload.extend_from_slice(name);
+        add_payload.extend_from_slice(ptx_data);
+        let hdr = req(MessageType::LinkAddData, add_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &add_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Complete
+        let complete_payload = state_handle.to_le_bytes();
+        let hdr = req(MessageType::LinkComplete, complete_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &complete_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Destroy
+        let destroy_payload = state_handle.to_le_bytes();
+        let hdr = req(MessageType::LinkDestroy, destroy_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &destroy_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.link_state_count(), 0);
     }
 }

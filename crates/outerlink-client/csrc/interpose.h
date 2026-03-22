@@ -104,6 +104,36 @@ extern CUresult ol_cuMemPoolSetAttribute(unsigned long long pool, int attr, unsi
 extern CUresult ol_cuMemPoolTrimTo(unsigned long long pool, unsigned long long minBytesToKeep);
 extern CUresult ol_cuMemAllocFromPoolAsync(unsigned long long *dptr, size_t bytesize, unsigned long long pool, unsigned long long hStream);
 
+/* JIT Linker */
+extern CUresult ol_cuLinkCreate_v2(unsigned int numOptions, const int *options,
+                                    const unsigned long long *optionValues,
+                                    unsigned long long *stateOut);
+extern CUresult ol_cuLinkCreate(unsigned int numOptions, const int *options,
+                                 const unsigned long long *optionValues,
+                                 unsigned long long *stateOut);
+extern CUresult ol_cuLinkAddData_v2(unsigned long long state, int type,
+                                     const unsigned char *data, size_t size,
+                                     const char *name, unsigned int numOptions,
+                                     const int *options,
+                                     const unsigned long long *optionValues);
+extern CUresult ol_cuLinkAddData(unsigned long long state, int type,
+                                  const unsigned char *data, size_t size,
+                                  const char *name, unsigned int numOptions,
+                                  const int *options,
+                                  const unsigned long long *optionValues);
+extern CUresult ol_cuLinkAddFile_v2(unsigned long long state, int type,
+                                     const char *path, unsigned int numOptions,
+                                     const int *options,
+                                     const unsigned long long *optionValues);
+extern CUresult ol_cuLinkAddFile(unsigned long long state, int type,
+                                  const char *path, unsigned int numOptions,
+                                  const int *options,
+                                  const unsigned long long *optionValues);
+extern CUresult ol_cuLinkComplete(unsigned long long state,
+                                   const unsigned char **cubinOut,
+                                   size_t *sizeOut);
+extern CUresult ol_cuLinkDestroy(unsigned long long state);
+
 /* Error handling -- CUresult is an enum (int-sized) */
 extern CUresult ol_cuGetErrorName(unsigned int error, const char **pStr);
 extern CUresult ol_cuGetErrorString(unsigned int error, const char **pStr);

@@ -51,6 +51,8 @@ pub struct ConnectionSession {
     peer_access_ctxs: HashSet<u64>,
     /// Memory pools created by this session.
     mem_pools: HashSet<u64>,
+    /// JIT linker states created by this session.
+    link_states: HashSet<u64>,
     /// Dedicated callback channel connection (set when client connects
     /// a second TCP stream with CallbackChannelInit).
     callback_channel: Option<Arc<TcpTransportConnection>>,
@@ -77,6 +79,7 @@ impl ConnectionSession {
             registered_host: HashSet::new(),
             peer_access_ctxs: HashSet::new(),
             mem_pools: HashSet::new(),
+            link_states: HashSet::new(),
             callback_channel: None,
         }
     }
@@ -257,6 +260,21 @@ impl ConnectionSession {
         self.mem_pools.len()
     }
 
+    /// Record that this session created a JIT linker state with handle `state`.
+    pub fn track_link_state(&mut self, state: u64) {
+        self.link_states.insert(state);
+    }
+
+    /// Remove `state` from this session's tracked JIT linker states.
+    pub fn untrack_link_state(&mut self, state: u64) {
+        self.link_states.remove(&state);
+    }
+
+    /// Number of JIT linker states tracked by this session.
+    pub fn link_state_count(&self) -> usize {
+        self.link_states.len()
+    }
+
     // --- Resource queries ---
 
     /// Number of device memory allocations tracked by this session.
@@ -300,6 +318,7 @@ impl ConnectionSession {
             + self.events.len()
             + self.peer_access_ctxs.len()
             + self.mem_pools.len()
+            + self.link_states.len()
     }
 
     // --- Cleanup ---
@@ -320,7 +339,21 @@ impl ConnectionSession {
     pub fn cleanup(&mut self, backend: &dyn GpuBackend) -> CleanupReport {
         let mut report = CleanupReport::default();
 
-        // 0. Memory pools (destroy before other resources so pool-allocated memory
+        // 0a. JIT linker states (destroy before modules, as they may reference module data)
+        for state in self.link_states.drain() {
+            match backend.link_destroy(state) {
+                Ok(()) => {
+                    tracing::debug!(handle = state, "session cleanup: destroyed link state");
+                    report.succeeded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(handle = state, error = ?e, "session cleanup: failed to destroy link state");
+                    report.failed += 1;
+                }
+            }
+        }
+
+        // 0b. Memory pools (destroy before other resources so pool-allocated memory
         //    can be freed cleanly)
         for pool in self.mem_pools.drain() {
             match backend.mem_pool_destroy(pool) {
@@ -907,5 +940,67 @@ mod tests {
         // Primary ctx released (1 success) + regular ctx destroyed (1 success) = 2
         assert_eq!(report.succeeded, 2);
         assert_eq!(report.failed, 0);
+    }
+
+    // ----- JIT Linker session tracking tests -----
+
+    #[test]
+    fn test_track_and_untrack_link_state() {
+        let mut session = ConnectionSession::new();
+        assert_eq!(session.link_state_count(), 0);
+        session.track_link_state(0x4C00_0001);
+        assert_eq!(session.link_state_count(), 1);
+        session.track_link_state(0x4C00_0002);
+        assert_eq!(session.link_state_count(), 2);
+        session.untrack_link_state(0x4C00_0001);
+        assert_eq!(session.link_state_count(), 1);
+        session.untrack_link_state(0x4C00_0002);
+        assert_eq!(session.link_state_count(), 0);
+    }
+
+    #[test]
+    fn test_link_state_counted_in_total() {
+        let mut session = ConnectionSession::new();
+        session.track_link_state(0x4C00_0001);
+        assert_eq!(session.total_tracked_resources(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_destroys_link_states() {
+        let backend = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create link states via backend
+        let h1 = backend.link_create(&[]).unwrap();
+        let h2 = backend.link_create(&[]).unwrap();
+        session.track_link_state(h1);
+        session.track_link_state(h2);
+        assert_eq!(session.link_state_count(), 2);
+
+        let report = session.cleanup(&backend);
+        assert_eq!(session.link_state_count(), 0);
+        assert_eq!(report.succeeded, 2);
+        assert_eq!(report.failed, 0);
+
+        // Handles should be invalid after cleanup
+        assert_eq!(backend.link_destroy(h1), Err(CuResult::InvalidValue));
+        assert_eq!(backend.link_destroy(h2), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_cleanup_link_states_with_already_destroyed() {
+        let backend = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        let h = backend.link_create(&[]).unwrap();
+        session.track_link_state(h);
+
+        // Destroy before cleanup
+        backend.link_destroy(h).unwrap();
+
+        // Cleanup should report failure for the already-destroyed handle
+        let report = session.cleanup(&backend);
+        assert_eq!(session.link_state_count(), 0);
+        assert_eq!(report.failed, 1);
     }
 }
