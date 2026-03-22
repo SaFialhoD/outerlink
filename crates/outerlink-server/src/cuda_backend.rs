@@ -108,6 +108,7 @@ type FnCuStreamGetCtx = unsafe extern "C" fn(stream: usize, pctx: *mut usize) ->
 type FnCuEventCreate = unsafe extern "C" fn(event: *mut usize, flags: u32) -> i32;
 type FnCuEventDestroy = unsafe extern "C" fn(event: usize) -> i32;
 type FnCuEventRecord = unsafe extern "C" fn(event: usize, stream: usize) -> i32;
+type FnCuEventRecordWithFlags = unsafe extern "C" fn(event: usize, stream: usize, flags: u32) -> i32;
 type FnCuEventSynchronize = unsafe extern "C" fn(event: usize) -> i32;
 type FnCuEventElapsedTime =
     unsafe extern "C" fn(ms: *mut f32, start: usize, end: usize) -> i32;
@@ -195,6 +196,9 @@ type FnCuDevicePrimaryCtxGetState = unsafe extern "C" fn(dev: i32, flags: *mut u
 type FnCuDevicePrimaryCtxSetFlags = unsafe extern "C" fn(dev: i32, flags: u32) -> i32;
 type FnCuDevicePrimaryCtxReset = unsafe extern "C" fn(dev: i32) -> i32;
 
+type FnCuDeviceGetPCIBusId = unsafe extern "C" fn(pci_bus_id: *mut u8, len: i32, dev: i32) -> i32;
+type FnCuDeviceGetByPCIBusId = unsafe extern "C" fn(dev: *mut i32, pci_bus_id: *const u8) -> i32;
+
 // Kernel launch
 type FnCuLaunchKernel = unsafe extern "C" fn(
     f: usize,
@@ -208,6 +212,21 @@ type FnCuLaunchKernel = unsafe extern "C" fn(
     stream: usize,
     kernel_params: *mut *mut std::ffi::c_void,
     extra: *mut *mut std::ffi::c_void,
+) -> i32;
+
+// cuLaunchCooperativeKernel has identical signature minus the `extra` parameter,
+// but uses kernelParams only. We use the same type since the FFI signature matches.
+type FnCuLaunchCooperativeKernel = unsafe extern "C" fn(
+    f: usize,
+    grid_dim_x: u32,
+    grid_dim_y: u32,
+    grid_dim_z: u32,
+    block_dim_x: u32,
+    block_dim_y: u32,
+    block_dim_z: u32,
+    shared_mem_bytes: u32,
+    stream: usize,
+    kernel_params: *mut *mut std::ffi::c_void,
 ) -> i32;
 
 // ---------------------------------------------------------------------------
@@ -293,11 +312,15 @@ struct CudaApi {
     cu_event_create: Option<FnCuEventCreate>,
     cu_event_destroy: Option<FnCuEventDestroy>,
     cu_event_record: Option<FnCuEventRecord>,
+    cu_event_record_with_flags: Option<FnCuEventRecordWithFlags>,
     cu_event_synchronize: Option<FnCuEventSynchronize>,
     cu_event_elapsed_time: Option<FnCuEventElapsedTime>,
     cu_event_query: Option<FnCuEventQuery>,
 
     cu_launch_kernel: Option<FnCuLaunchKernel>,
+    cu_launch_cooperative_kernel: Option<FnCuLaunchCooperativeKernel>,
+    cu_device_get_pci_bus_id: Option<FnCuDeviceGetPCIBusId>,
+    cu_device_get_by_pci_bus_id: Option<FnCuDeviceGetByPCIBusId>,
 
     cu_occupancy_max_active_blocks: Option<FnCuOccupancyMaxActiveBlocksPerMultiprocessor>,
     cu_occupancy_max_active_blocks_with_flags: Option<FnCuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags>,
@@ -448,11 +471,15 @@ impl CudaApi {
             cu_event_create: load_sym!(lib, b"cuEventCreate\0"),
             cu_event_destroy: load_sym!(lib, b"cuEventDestroy_v2\0", b"cuEventDestroy\0"),
             cu_event_record: load_sym!(lib, b"cuEventRecord\0"),
+            cu_event_record_with_flags: load_sym!(lib, b"cuEventRecordWithFlags\0"),
             cu_event_synchronize: load_sym!(lib, b"cuEventSynchronize\0"),
             cu_event_elapsed_time: load_sym!(lib, b"cuEventElapsedTime\0"),
             cu_event_query: load_sym!(lib, b"cuEventQuery\0"),
 
             cu_launch_kernel: load_sym!(lib, b"cuLaunchKernel\0"),
+            cu_launch_cooperative_kernel: load_sym!(lib, b"cuLaunchCooperativeKernel\0"),
+            cu_device_get_pci_bus_id: load_sym!(lib, b"cuDeviceGetPCIBusId\0"),
+            cu_device_get_by_pci_bus_id: load_sym!(lib, b"cuDeviceGetByPCIBusId\0"),
 
             cu_occupancy_max_active_blocks: load_sym!(lib, b"cuOccupancyMaxActiveBlocksPerMultiprocessor\0"),
             cu_occupancy_max_active_blocks_with_flags: load_sym!(lib, b"cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags\0"),
@@ -1190,6 +1217,14 @@ impl GpuBackend for CudaGpuBackend {
         Ok(())
     }
 
+    fn event_record_with_flags(&self, event: u64, stream: u64, flags: u32) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_event_record_with_flags)?;
+        unsafe {
+            map_cuda_result(func(event as usize, stream as usize, flags))?;
+        }
+        Ok(())
+    }
+
     fn event_synchronize(&self, event: u64) -> Result<(), CuResult> {
         let func = require_fn(&self.api.cu_event_synchronize)?;
         unsafe {
@@ -1444,6 +1479,66 @@ impl GpuBackend for CudaGpuBackend {
             "CUDA kernel launched"
         );
         Ok(())
+    }
+
+    fn launch_cooperative_kernel(
+        &self,
+        func: u64,
+        grid_dim: [u32; 3],
+        block_dim: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        params: &[u8],
+    ) -> Result<(), CuResult> {
+        let launch_fn = require_fn(&self.api.cu_launch_cooperative_kernel)?;
+        let param_values = deserialize_kernel_params(params)?;
+        let mut param_ptrs: Vec<*mut std::ffi::c_void> = param_values
+            .iter()
+            .map(|v| v.as_ptr() as *mut std::ffi::c_void)
+            .collect();
+        let params_ptr = if param_ptrs.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            param_ptrs.as_mut_ptr()
+        };
+
+        unsafe {
+            map_cuda_result(launch_fn(
+                func as usize,
+                grid_dim[0],
+                grid_dim[1],
+                grid_dim[2],
+                block_dim[0],
+                block_dim[1],
+                block_dim[2],
+                shared_mem,
+                stream as usize,
+                params_ptr,
+            ))?;
+        }
+        tracing::trace!(func, grid = ?grid_dim, block = ?block_dim, shared_mem, stream, "CUDA cooperative kernel launched");
+        Ok(())
+    }
+
+    fn device_get_pci_bus_id(&self, device: i32) -> Result<String, CuResult> {
+        let func = require_fn(&self.api.cu_device_get_pci_bus_id)?;
+        let mut buf = vec![0u8; 64];
+        unsafe {
+            map_cuda_result(func(buf.as_mut_ptr(), buf.len() as i32, device))?;
+        }
+        let nul_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let s = String::from_utf8_lossy(&buf[..nul_pos]).into_owned();
+        Ok(s)
+    }
+
+    fn device_get_by_pci_bus_id(&self, pci_bus_id: &str) -> Result<i32, CuResult> {
+        let func = require_fn(&self.api.cu_device_get_by_pci_bus_id)?;
+        let c_str = CString::new(pci_bus_id).map_err(|_| CuResult::InvalidValue)?;
+        let mut dev: i32 = 0;
+        unsafe {
+            map_cuda_result(func(&mut dev, c_str.as_ptr() as *const u8))?;
+        }
+        Ok(dev)
     }
 
     fn ctx_push_current(&self, ctx: u64) -> Result<(), CuResult> {

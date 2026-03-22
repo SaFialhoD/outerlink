@@ -39,6 +39,8 @@ pub enum MessageType {
     DeviceGetUuid = 0x0017,
     DeviceCanAccessPeer = 0x0018,
     DeviceGetP2PAttribute = 0x0019,
+    DeviceGetPCIBusId = 0x001A,
+    DeviceGetByPCIBusId = 0x001B,
 
     // Context
     CtxCreate = 0x0020,
@@ -87,6 +89,7 @@ pub enum MessageType {
 
     // Execution
     LaunchKernel = 0x0050,
+    LaunchCooperativeKernel = 0x0055,
 
     // Stream
     StreamCreate = 0x0060,
@@ -106,6 +109,7 @@ pub enum MessageType {
     EventSynchronize = 0x0073,
     EventElapsedTime = 0x0074,
     EventQuery = 0x0075,
+    EventRecordWithFlags = 0x0078,
 
     // Occupancy
     OccupancyMaxActiveBlocksPerMultiprocessor = 0x0080,
@@ -163,6 +167,8 @@ impl MessageType {
             0x0017 => Some(Self::DeviceGetUuid),
             0x0018 => Some(Self::DeviceCanAccessPeer),
             0x0019 => Some(Self::DeviceGetP2PAttribute),
+            0x001A => Some(Self::DeviceGetPCIBusId),
+            0x001B => Some(Self::DeviceGetByPCIBusId),
             0x0020 => Some(Self::CtxCreate),
             0x0021 => Some(Self::CtxDestroy),
             0x0022 => Some(Self::CtxSetCurrent),
@@ -203,6 +209,7 @@ impl MessageType {
             0x0045 => Some(Self::FuncGetAttribute),
             0x0046 => Some(Self::FuncSetAttribute),
             0x0050 => Some(Self::LaunchKernel),
+            0x0055 => Some(Self::LaunchCooperativeKernel),
             0x0060 => Some(Self::StreamCreate),
             0x0061 => Some(Self::StreamDestroy),
             0x0062 => Some(Self::StreamSynchronize),
@@ -218,6 +225,7 @@ impl MessageType {
             0x0073 => Some(Self::EventSynchronize),
             0x0074 => Some(Self::EventElapsedTime),
             0x0075 => Some(Self::EventQuery),
+            0x0078 => Some(Self::EventRecordWithFlags),
             0x0080 => Some(Self::OccupancyMaxActiveBlocksPerMultiprocessor),
             0x0081 => Some(Self::OccupancyMaxActiveBlocksPerMultiprocessorWithFlags),
             0x0082 => Some(Self::OccupancyMaxPotentialBlockSize),
