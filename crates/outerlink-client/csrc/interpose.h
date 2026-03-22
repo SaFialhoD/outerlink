@@ -74,6 +74,8 @@ extern CUresult ol_cuGetErrorString(unsigned int error, const char **pStr);
 
 /* Module management -- handles passed as u64 (unsigned long long) */
 extern CUresult ol_cuModuleLoadData(unsigned long long *module, const void *data, size_t data_len);
+extern CUresult ol_cuModuleLoadDataEx(unsigned long long *module, const void *data, size_t data_len,
+                                       unsigned int numOptions, const int *options, const unsigned long long *optionValues);
 extern CUresult ol_cuModuleUnload(unsigned long long module);
 extern CUresult ol_cuModuleGetFunction(unsigned long long *func, unsigned long long module, const char *name);
 extern CUresult ol_cuModuleGetGlobal(unsigned long long *dptr, size_t *size, unsigned long long module, const unsigned char *name, size_t name_len);
@@ -170,6 +172,8 @@ CUresult hook_cuGetErrorString(CUresult error, const char **pStr);
 
 /* Module */
 CUresult hook_cuModuleLoadData(CUmodule *module, const void *image);
+CUresult hook_cuModuleLoadDataEx(CUmodule *module, const void *image,
+                                  unsigned int numOptions, void *options, void **optionValues);
 CUresult hook_cuModuleUnload(CUmodule hmod);
 CUresult hook_cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name);
 CUresult hook_cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name);

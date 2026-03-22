@@ -64,6 +64,13 @@ type FnCuMemGetInfo = unsafe extern "C" fn(free: *mut usize, total: *mut usize) 
 
 // Module operations
 type FnCuModuleLoadData = unsafe extern "C" fn(module: *mut usize, image: *const u8) -> i32;
+type FnCuModuleLoadDataEx = unsafe extern "C" fn(
+    module: *mut usize,
+    image: *const u8,
+    num_options: u32,
+    options: *const i32,
+    option_values: *mut *mut std::ffi::c_void,
+) -> i32;
 type FnCuModuleUnload = unsafe extern "C" fn(module: usize) -> i32;
 type FnCuModuleGetFunction =
     unsafe extern "C" fn(hfunc: *mut usize, module: usize, name: *const u8) -> i32;
@@ -173,6 +180,7 @@ struct CudaApi {
     cu_mem_free_host: Option<FnCuMemFreeHost>,
 
     cu_module_load_data: Option<FnCuModuleLoadData>,
+    cu_module_load_data_ex: Option<FnCuModuleLoadDataEx>,
     cu_module_unload: Option<FnCuModuleUnload>,
     cu_module_get_function: Option<FnCuModuleGetFunction>,
     cu_module_get_global: Option<FnCuModuleGetGlobal>,
@@ -287,6 +295,7 @@ impl CudaApi {
             cu_mem_free_host: load_sym!(lib, b"cuMemFreeHost\0"),
 
             cu_module_load_data: load_sym!(lib, b"cuModuleLoadData\0"),
+            cu_module_load_data_ex: load_sym!(lib, b"cuModuleLoadDataEx\0"),
             cu_module_unload: load_sym!(lib, b"cuModuleUnload\0"),
             cu_module_get_function: load_sym!(lib, b"cuModuleGetFunction\0"),
             cu_module_get_global: load_sym!(lib, b"cuModuleGetGlobal_v2\0", b"cuModuleGetGlobal\0"),
@@ -669,6 +678,38 @@ impl GpuBackend for CudaGpuBackend {
             map_cuda_result(func(&mut module, data.as_ptr()))?;
         }
         tracing::debug!(module, data_len = data.len(), "CUDA module loaded");
+        Ok(module as u64)
+    }
+
+    fn module_load_data_ex(&self, data: &[u8], options: &[(i32, u64)]) -> Result<u64, CuResult> {
+        if data.is_empty() {
+            return Err(CuResult::InvalidValue);
+        }
+        let func = require_fn(&self.api.cu_module_load_data_ex)?;
+        let mut module: usize = 0;
+
+        // Build the CUjit_option and optionValues arrays for the real CUDA call.
+        let num_options = options.len() as u32;
+        let mut jit_options: Vec<i32> = options.iter().map(|&(opt, _)| opt).collect();
+        // optionValues is an array of void* — we cast each u64 value to a pointer.
+        let mut jit_values: Vec<*mut std::ffi::c_void> =
+            options.iter().map(|&(_, val)| val as *mut std::ffi::c_void).collect();
+
+        unsafe {
+            map_cuda_result(func(
+                &mut module,
+                data.as_ptr(),
+                num_options,
+                jit_options.as_mut_ptr(),
+                jit_values.as_mut_ptr(),
+            ))?;
+        }
+        tracing::debug!(
+            module,
+            data_len = data.len(),
+            num_options,
+            "CUDA module loaded with JIT options"
+        );
         Ok(module as u64)
     }
 

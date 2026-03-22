@@ -1055,6 +1055,62 @@ pub extern "C" fn ol_cuModuleLoadData(module: *mut u64, data: *const u8, data_le
 }
 
 #[no_mangle]
+pub extern "C" fn ol_cuModuleLoadDataEx(
+    module: *mut u64,
+    data: *const u8,
+    data_len: usize,
+    num_options: u32,
+    options: *const i32,
+    option_values: *const u64,
+) -> u32 {
+    let client = get_client();
+    if module.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: serialize image + options into wire format and send
+    if client.connected.load(Ordering::Acquire) {
+        if !data.is_null() && data_len > 0 {
+            let image = unsafe { std::slice::from_raw_parts(data, data_len) };
+            // Build wire payload: 4B image_len + 4B num_options + options + image
+            let n = num_options as usize;
+            let mut payload = Vec::with_capacity(8 + n * 12 + data_len);
+            payload.extend_from_slice(&(data_len as u32).to_le_bytes());
+            payload.extend_from_slice(&num_options.to_le_bytes());
+            if n > 0 && !options.is_null() && !option_values.is_null() {
+                let opts = unsafe { std::slice::from_raw_parts(options, n) };
+                let vals = unsafe { std::slice::from_raw_parts(option_values, n) };
+                for i in 0..n {
+                    payload.extend_from_slice(&opts[i].to_le_bytes());
+                    payload.extend_from_slice(&vals[i].to_le_bytes());
+                }
+            }
+            payload.extend_from_slice(image);
+            if let Ok((_hdr, resp)) =
+                client.send_request(MessageType::ModuleLoadDataEx, &payload)
+            {
+                let result = parse_result(&resp);
+                if result != CUDA_SUCCESS {
+                    return result;
+                }
+                if resp.len() >= 12 {
+                    let remote_module =
+                        u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                    let synthetic = client.handles.modules.insert(remote_module);
+                    unsafe { *module = synthetic };
+                    return CUDA_SUCCESS;
+                }
+            }
+        }
+        // Transport error or null data -- fall through to stub
+    }
+    // Stub: generate a local-only handle (ignore options)
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.modules.insert(stub_remote);
+    unsafe { *module = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
 pub extern "C" fn ol_cuModuleUnload(module: u64) -> u32 {
     let client = get_client();
     // Connected: ask the server
@@ -2395,6 +2451,62 @@ mod tests {
         let data = [0u8; 16];
         let result = ol_cuModuleLoadData(ptr::null_mut(), data.as_ptr(), data.len());
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_module_load_data_ex_stub() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        let options: [i32; 2] = [0, 7]; // CU_JIT_MAX_REGISTERS, CU_JIT_OPTIMIZATION_LEVEL
+        let values: [u64; 2] = [32, 4];
+        let result = ol_cuModuleLoadDataEx(
+            &mut module,
+            data.as_ptr(),
+            data.len(),
+            2,
+            options.as_ptr(),
+            values.as_ptr(),
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(module, 0);
+        // Clean up
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_ol_cu_module_load_data_ex_null_module() {
+        let data = [0u8; 16];
+        let result = ol_cuModuleLoadDataEx(
+            ptr::null_mut(),
+            data.as_ptr(),
+            data.len(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_module_load_data_ex_no_options() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        let result = ol_cuModuleLoadDataEx(
+            &mut module,
+            data.as_ptr(),
+            data.len(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(module, 0);
+        // Module should be usable
+        let mut func: u64 = 0;
+        let name = b"test_kern\0";
+        let r = ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8);
+        assert_eq!(r, CUDA_SUCCESS);
+        let _ = ol_cuModuleUnload(module);
     }
 
     #[test]

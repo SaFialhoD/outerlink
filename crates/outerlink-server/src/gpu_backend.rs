@@ -75,6 +75,12 @@ pub trait GpuBackend: Send + Sync {
     /// Load a module from raw data (e.g. PTX or cubin).
     fn module_load_data(&self, data: &[u8]) -> Result<u64, CuResult>;
 
+    /// Load a module from raw data with JIT compiler options.
+    ///
+    /// Options are `(CUjit_option, value)` pairs. In stub mode the options
+    /// are ignored and this delegates to [`module_load_data`].
+    fn module_load_data_ex(&self, data: &[u8], options: &[(i32, u64)]) -> Result<u64, CuResult>;
+
     /// Unload a previously loaded module.
     fn module_unload(&self, module: u64) -> Result<(), CuResult>;
 
@@ -516,6 +522,11 @@ impl GpuBackend for StubGpuBackend {
         state.next_module_id += 1;
         state.modules.insert(id, StubModule { data_len: data.len() });
         Ok(id)
+    }
+
+    fn module_load_data_ex(&self, data: &[u8], _options: &[(i32, u64)]) -> Result<u64, CuResult> {
+        // Stub ignores JIT options — they only matter for real CUDA compilation.
+        self.module_load_data(data)
     }
 
     fn module_unload(&self, module: u64) -> Result<(), CuResult> {
@@ -1132,6 +1143,34 @@ mod tests {
     fn test_module_load_empty_data() {
         let gpu = StubGpuBackend::new();
         assert_eq!(gpu.module_load_data(b""), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_module_load_data_ex_empty_options() {
+        let gpu = StubGpuBackend::new();
+        let handle = gpu.module_load_data_ex(b"fake ptx", &[]).unwrap();
+        assert_ne!(handle, 0);
+        // Module should be usable for get_function just like a normal load
+        let func = gpu.module_get_function(handle, "kern").unwrap();
+        assert_ne!(func, 0);
+    }
+
+    #[test]
+    fn test_module_load_data_ex_with_options() {
+        let gpu = StubGpuBackend::new();
+        // Options are ignored in stub mode but should not cause errors
+        let options = vec![
+            (0, 32),   // CU_JIT_MAX_REGISTERS = 32
+            (7, 4),    // CU_JIT_OPTIMIZATION_LEVEL = 4
+        ];
+        let handle = gpu.module_load_data_ex(b"ptx code", &options).unwrap();
+        assert_ne!(handle, 0);
+    }
+
+    #[test]
+    fn test_module_load_data_ex_empty_data() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.module_load_data_ex(b"", &[]), Err(CuResult::InvalidValue));
     }
 
     #[test]

@@ -387,6 +387,40 @@ pub fn handle_request(
             }
         }
 
+        MessageType::ModuleLoadDataEx => {
+            // Wire format:
+            //   4B image_len (u32 LE)
+            //   4B num_options (u32 LE)
+            //   num_options * 12B (4B option i32 LE + 8B value u64 LE)
+            //   image_len bytes of image data
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let image_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+            let num_options = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+            let options_size = num_options * 12;
+            let expected_len = 8 + options_size + image_len;
+            if payload.len() < expected_len || image_len == 0 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            // Parse options
+            let mut options = Vec::with_capacity(num_options);
+            for i in 0..num_options {
+                let base = 8 + i * 12;
+                let opt_id = i32::from_le_bytes(payload[base..base + 4].try_into().unwrap());
+                let opt_val = u64::from_le_bytes(payload[base + 4..base + 12].try_into().unwrap());
+                options.push((opt_id, opt_val));
+            }
+            let image = &payload[8 + options_size..8 + options_size + image_len];
+            match backend.module_load_data_ex(image, &options) {
+                Ok(handle) => {
+                    session.track_module(handle);
+                    success_with(rid, &handle.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         MessageType::ModuleUnload => {
             if payload.len() < 8 {
                 return error_response(rid, CuResult::InvalidValue);
@@ -1133,6 +1167,97 @@ mod tests {
         let hdr = req(MessageType::ModuleLoadData, 0);
         let (_, resp) = dispatch(&gpu, &hdr,&[]);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_module_load_data_ex() {
+        let gpu = StubGpuBackend::new();
+        // Build wire payload: 4B image_len + 4B num_options + options + image
+        let image = b"fake ptx data";
+        let options: Vec<(i32, u64)> = vec![(0, 32), (7, 4)]; // MAX_REGISTERS=32, OPT_LEVEL=4
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(image.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&(options.len() as u32).to_le_bytes());
+        for &(opt, val) in &options {
+            payload.extend_from_slice(&opt.to_le_bytes());
+            payload.extend_from_slice(&val.to_le_bytes());
+        }
+        payload.extend_from_slice(image);
+        let hdr = req(MessageType::ModuleLoadDataEx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(handle, 0);
+    }
+
+    #[test]
+    fn test_module_load_data_ex_no_options() {
+        let gpu = StubGpuBackend::new();
+        let image = b"ptx code";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(image.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes()); // 0 options
+        payload.extend_from_slice(image);
+        let hdr = req(MessageType::ModuleLoadDataEx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(handle, 0);
+    }
+
+    #[test]
+    fn test_module_load_data_ex_empty_image() {
+        let gpu = StubGpuBackend::new();
+        // image_len=0, num_options=0 => should fail
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::ModuleLoadDataEx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_module_load_data_ex_truncated_header() {
+        let gpu = StubGpuBackend::new();
+        // Only 4 bytes, needs at least 8
+        let payload = [1u8, 0, 0, 0];
+        let hdr = req(MessageType::ModuleLoadDataEx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_module_load_data_ex_truncated_options() {
+        let gpu = StubGpuBackend::new();
+        // Claims 1 option but payload too short
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&4u32.to_le_bytes());  // image_len=4
+        payload.extend_from_slice(&1u32.to_le_bytes());  // num_options=1
+        // Missing 12B of option data and 4B of image
+        let hdr = req(MessageType::ModuleLoadDataEx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_module_load_data_ex_tracked_in_session() {
+        let gpu = StubGpuBackend::new();
+        let image = b"ptx";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(image.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(image);
+        let hdr = req(MessageType::ModuleLoadDataEx, payload.len() as u32);
+        let mut session = ConnectionSession::new();
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        // Module should be tracked — unload via session should work
+        let unload_payload = handle.to_le_bytes();
+        let hdr2 = req(MessageType::ModuleUnload, unload_payload.len() as u32);
+        let (_, resp2) = dispatch_with(&gpu, &hdr2, &unload_payload, &mut session);
+        assert_eq!(response_result(&resp2), CuResult::Success);
     }
 
     #[test]

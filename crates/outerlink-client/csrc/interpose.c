@@ -141,6 +141,7 @@ static const hook_entry_t hook_table[] = {
 
     /* Module */
     { "cuModuleLoadData",        (void *)hook_cuModuleLoadData },
+    { "cuModuleLoadDataEx",      (void *)hook_cuModuleLoadDataEx },
     { "cuModuleUnload",          (void *)hook_cuModuleUnload },
     { "cuModuleGetFunction",     (void *)hook_cuModuleGetFunction },
     { "cuModuleGetGlobal_v2",    (void *)hook_cuModuleGetGlobal },
@@ -473,6 +474,66 @@ CUresult hook_cuModuleLoadData(CUmodule *module, const void *image) {
         }
     }
     CUresult r = ol_cuModuleLoadData(&mod_u64, image, data_len);
+    if (r == CUDA_SUCCESS && module) {
+        *module = (CUmodule)(uintptr_t)mod_u64;
+    }
+    return r;
+}
+
+CUresult hook_cuModuleLoadDataEx(CUmodule *module, const void *image,
+                                  unsigned int numOptions, void *options,
+                                  void **optionValues) {
+    ensure_init();
+    unsigned long long mod_u64 = 0;
+    /* Determine image size — same PTX/ELF logic as hook_cuModuleLoadData. */
+    size_t data_len = 0;
+    if (image) {
+        const unsigned char *p = (const unsigned char *)image;
+        if (p[0] >= 0x20 && p[0] < 0x7F) {
+            /* PTX text — null-terminated string */
+            data_len = strlen((const char *)image) + 1;
+        } else if (p[0] == 0x7F && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') {
+            /* ELF cubin */
+            unsigned long long e_shoff = 0;
+            unsigned short e_shnum = 0, e_shentsize = 0;
+            memcpy(&e_shoff, p + 0x28, 8);
+            memcpy(&e_shentsize, p + 0x3A, 2);
+            memcpy(&e_shnum, p + 0x3C, 2);
+            unsigned long long sh_table_size = (unsigned long long)e_shnum * e_shentsize;
+            if (e_shoff <= SIZE_MAX - sh_table_size) {
+                data_len = (size_t)(e_shoff + sh_table_size);
+            }
+        }
+    }
+
+    /* Serialize CUjit_option enum values (int-sized) and their void* values
+     * as (i32, u64) pairs for the Rust FFI. */
+    int *opts_i32 = NULL;
+    unsigned long long *vals_u64 = NULL;
+    if (numOptions > 0 && options && optionValues) {
+        opts_i32 = (int *)malloc(numOptions * sizeof(int));
+        vals_u64 = (unsigned long long *)malloc(numOptions * sizeof(unsigned long long));
+        if (opts_i32 && vals_u64) {
+            const int *src_opts = (const int *)options;
+            for (unsigned int i = 0; i < numOptions; i++) {
+                opts_i32[i] = src_opts[i];
+                vals_u64[i] = (unsigned long long)(uintptr_t)optionValues[i];
+            }
+        } else {
+            /* Allocation failed — fall through with 0 options */
+            free(opts_i32);
+            free(vals_u64);
+            opts_i32 = NULL;
+            vals_u64 = NULL;
+            numOptions = 0;
+        }
+    }
+
+    CUresult r = ol_cuModuleLoadDataEx(&mod_u64, image, data_len,
+                                        numOptions, opts_i32, vals_u64);
+    free(opts_i32);
+    free(vals_u64);
+
     if (r == CUDA_SUCCESS && module) {
         *module = (CUmodule)(uintptr_t)mod_u64;
     }
