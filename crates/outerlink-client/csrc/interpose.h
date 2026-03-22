@@ -79,6 +79,7 @@ extern CUresult ol_cuModuleLoadDataEx(unsigned long long *module, const void *da
 extern CUresult ol_cuModuleUnload(unsigned long long module);
 extern CUresult ol_cuModuleGetFunction(unsigned long long *func, unsigned long long module, const char *name);
 extern CUresult ol_cuModuleGetGlobal(unsigned long long *dptr, size_t *size, unsigned long long module, const unsigned char *name, size_t name_len);
+extern CUresult ol_cuFuncGetAttribute(int *pi, int attrib, unsigned long long func);
 
 /* Stream management */
 extern CUresult ol_cuStreamCreate(unsigned long long *stream, unsigned int flags);
@@ -177,6 +178,7 @@ CUresult hook_cuModuleLoadDataEx(CUmodule *module, const void *image,
 CUresult hook_cuModuleUnload(CUmodule hmod);
 CUresult hook_cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name);
 CUresult hook_cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name);
+CUresult hook_cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc);
 
 /* Stream */
 CUresult hook_cuStreamCreate(CUstream *phStream, unsigned int Flags);

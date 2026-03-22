@@ -145,6 +145,7 @@ static const hook_entry_t hook_table[] = {
     { "cuModuleUnload",          (void *)hook_cuModuleUnload },
     { "cuModuleGetFunction",     (void *)hook_cuModuleGetFunction },
     { "cuModuleGetGlobal_v2",    (void *)hook_cuModuleGetGlobal },
+    { "cuFuncGetAttribute",      (void *)hook_cuFuncGetAttribute },
 
     /* Stream */
     { "cuStreamCreate",          (void *)hook_cuStreamCreate },
@@ -570,6 +571,11 @@ CUresult hook_cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod,
         if (bytes) *bytes = size_out;
     }
     return r;
+}
+
+CUresult hook_cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc) {
+    ensure_init();
+    return ol_cuFuncGetAttribute(pi, (int)attrib, (unsigned long long)(uintptr_t)hfunc);
 }
 
 /* -- Stream -- */

@@ -73,6 +73,7 @@ pub enum MessageType {
     ModuleGetFunction = 0x0042,
     ModuleGetGlobal = 0x0043,
     ModuleLoadDataEx = 0x0044,
+    FuncGetAttribute = 0x0045,
 
     // Execution
     LaunchKernel = 0x0050,
@@ -141,6 +142,7 @@ impl MessageType {
             0x0042 => Some(Self::ModuleGetFunction),
             0x0043 => Some(Self::ModuleGetGlobal),
             0x0044 => Some(Self::ModuleLoadDataEx),
+            0x0045 => Some(Self::FuncGetAttribute),
             0x0050 => Some(Self::LaunchKernel),
             0x0060 => Some(Self::StreamCreate),
             0x0061 => Some(Self::StreamDestroy),

@@ -1184,6 +1184,67 @@ pub extern "C" fn ol_cuModuleGetFunction(func: *mut u64, module: u64, name: *con
 }
 
 // ---------------------------------------------------------------------------
+// Function attribute query
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuFuncGetAttribute(pi: *mut i32, attrib: i32, func: u64) -> u32 {
+    let client = get_client();
+    if pi.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = [0u8; 12];
+        payload[0..4].copy_from_slice(&attrib.to_le_bytes());
+        payload[4..12].copy_from_slice(&remote_func.to_le_bytes());
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::FuncGetAttribute, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe {
+                    *pi = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback: validate function handle exists
+    if client.handles.functions.to_remote(func).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let value = match attrib {
+        0 => 1024,  // MAX_THREADS_PER_BLOCK
+        1 => 0,     // SHARED_SIZE_BYTES
+        2 => 0,     // CONST_SIZE_BYTES
+        3 => 0,     // LOCAL_SIZE_BYTES
+        4 => 32,    // NUM_REGS
+        5 => 80,    // PTX_VERSION
+        6 => 80,    // BINARY_VERSION
+        7 => 0,     // CACHE_MODE_CA
+        8 => 0,     // MAX_DYNAMIC_SHARED_SIZE_BYTES
+        9 => 0,     // PREFERRED_SHARED_MEMORY_CARVEOUT
+        10 => 0,    // CLUSTER_SIZE_REQUESTED
+        11 => 0,    // REQUIRED_CLUSTER_WIDTH
+        12 => 0,    // REQUIRED_CLUSTER_HEIGHT
+        13 => 0,    // REQUIRED_CLUSTER_DEPTH
+        14 => 0,    // NON_PORTABLE_CLUSTER_SIZE_ALLOWED
+        15 => 0,    // CLUSTER_SCHEDULING_POLICY_PREFERENCE
+        _ => return CUDA_ERROR_INVALID_VALUE,
+    };
+    unsafe { *pi = value };
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // Stream management
 // ---------------------------------------------------------------------------
 
@@ -3097,5 +3158,67 @@ mod tests {
     #[test]
     fn test_ol_cu_primary_ctx_reset_invalid_device() {
         assert_eq!(ol_cuDevicePrimaryCtxReset(99), CUDA_ERROR_INVALID_DEVICE);
+    }
+
+    // -- FuncGetAttribute tests --
+
+    #[test]
+    fn test_ol_cu_func_get_attribute_max_threads() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"kern\0";
+        assert_eq!(ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8), CUDA_SUCCESS);
+
+        let mut val: i32 = -1;
+        let result = ol_cuFuncGetAttribute(&mut val, 0, func); // MAX_THREADS_PER_BLOCK
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(val, 1024);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_ol_cu_func_get_attribute_num_regs() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"kern\0";
+        assert_eq!(ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8), CUDA_SUCCESS);
+
+        let mut val: i32 = -1;
+        let result = ol_cuFuncGetAttribute(&mut val, 4, func); // NUM_REGS
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(val, 32);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_ol_cu_func_get_attribute_null_ptr() {
+        let result = ol_cuFuncGetAttribute(ptr::null_mut(), 0, 1);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_func_get_attribute_invalid_func() {
+        let mut val: i32 = -1;
+        let result = ol_cuFuncGetAttribute(&mut val, 0, 0xDEAD);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_func_get_attribute_invalid_attrib() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"kern\0";
+        assert_eq!(ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8), CUDA_SUCCESS);
+
+        let mut val: i32 = -1;
+        let result = ol_cuFuncGetAttribute(&mut val, 9999, func);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuModuleUnload(module);
     }
 }

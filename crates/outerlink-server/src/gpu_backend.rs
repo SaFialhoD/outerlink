@@ -91,6 +91,12 @@ pub trait GpuBackend: Send + Sync {
     /// Returns `(device_pointer, size_in_bytes)`.
     fn module_get_global(&self, module: u64, name: &str) -> Result<(u64, usize), CuResult>;
 
+    /// Query an integer attribute of a kernel function.
+    ///
+    /// `attrib` is the raw `CUfunction_attribute` enum value.
+    /// Returns the attribute value on success.
+    fn func_get_attribute(&self, attrib: i32, func: u64) -> Result<i32, CuResult>;
+
     // --- Stream operations ---
 
     /// Create a new CUDA stream with the given flags.
@@ -563,6 +569,34 @@ impl GpuBackend for StubGpuBackend {
         state.next_ptr += 256;
         state.allocations.insert(ptr, vec![0u8; 256]);
         Ok((ptr, 256))
+    }
+
+    fn func_get_attribute(&self, attrib: i32, func: u64) -> Result<i32, CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.functions.contains_key(&func) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Return plausible values for a Compute Capability 8.6 kernel.
+        let val = match attrib {
+            0 => 1024,  // CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK
+            1 => 0,     // CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES (static)
+            2 => 0,     // CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES
+            3 => 0,     // CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES
+            4 => 32,    // CU_FUNC_ATTRIBUTE_NUM_REGS
+            5 => 80,    // CU_FUNC_ATTRIBUTE_PTX_VERSION
+            6 => 80,    // CU_FUNC_ATTRIBUTE_BINARY_VERSION
+            7 => 0,     // CU_FUNC_ATTRIBUTE_CACHE_MODE_CA
+            8 => 0,     // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+            9 => 0,     // CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT
+            10 => 0,    // CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_REQUESTED
+            11 => 0,    // CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH
+            12 => 0,    // CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT
+            13 => 0,    // CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH
+            14 => 0,    // CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED
+            15 => 0,    // CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE
+            _ => return Err(CuResult::InvalidValue),
+        };
+        Ok(val)
     }
 
     // --- Stream operations ---
@@ -1812,5 +1846,74 @@ mod tests {
         let h2 = gpu.primary_ctx_retain(0).unwrap();
         assert_ne!(h1, h2, "new handle should be allocated after reset");
         let _ = gpu.primary_ctx_release(0);
+    }
+
+    // --- func_get_attribute tests ---
+
+    /// Helper: create a module + function in the stub and return the func handle.
+    fn setup_stub_function(gpu: &StubGpuBackend) -> u64 {
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        gpu.module_get_function(module, "my_kernel").unwrap()
+    }
+
+    #[test]
+    fn test_func_get_attribute_max_threads() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        assert_eq!(gpu.func_get_attribute(0, func).unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_func_get_attribute_num_regs() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        assert_eq!(gpu.func_get_attribute(4, func).unwrap(), 32);
+    }
+
+    #[test]
+    fn test_func_get_attribute_ptx_version() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        assert_eq!(gpu.func_get_attribute(5, func).unwrap(), 80);
+    }
+
+    #[test]
+    fn test_func_get_attribute_binary_version() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        assert_eq!(gpu.func_get_attribute(6, func).unwrap(), 80);
+    }
+
+    #[test]
+    fn test_func_get_attribute_shared_size() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        assert_eq!(gpu.func_get_attribute(1, func).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_func_get_attribute_all_valid_attribs() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        // All attribs 0..=15 should succeed
+        for attrib in 0..=15 {
+            assert!(gpu.func_get_attribute(attrib, func).is_ok(),
+                "attrib {} should be valid", attrib);
+        }
+    }
+
+    #[test]
+    fn test_func_get_attribute_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.func_get_attribute(0, 0xDEAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_func_get_attribute_invalid_attrib() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_stub_function(&gpu);
+        assert_eq!(gpu.func_get_attribute(9999, func), Err(CuResult::InvalidValue));
+        assert_eq!(gpu.func_get_attribute(-1, func), Err(CuResult::InvalidValue));
+        assert_eq!(gpu.func_get_attribute(16, func), Err(CuResult::InvalidValue));
     }
 }

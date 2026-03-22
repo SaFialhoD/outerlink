@@ -71,6 +71,7 @@ fn error_response(request_id: u64, err: CuResult) -> (MessageHeader, Vec<u8>) {
 /// | DevicePrimaryCtxGetState| i32 device           | u32 flags, i32 active                 |
 /// | DevicePrimaryCtxSetFlags| i32 device, u32 flags| (empty)                               |
 /// | DevicePrimaryCtxReset   | i32 device           | (empty)                               |
+/// | FuncGetAttribute        | i32 attrib, u64 func | i32 value                             |
 pub fn handle_request(
     backend: &dyn GpuBackend,
     header: &MessageHeader,
@@ -475,6 +476,19 @@ pub fn handle_request(
                     data.extend_from_slice(&(size as u64).to_le_bytes());
                     success_with(rid, &data)
                 }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::FuncGetAttribute => {
+            // Payload: 4B attrib (i32 LE) + 8B func handle (u64 LE) = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let attrib = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            let func = u64::from_le_bytes(payload[4..12].try_into().unwrap());
+            match backend.func_get_attribute(attrib, func) {
+                Ok(val) => success_with(rid, &val.to_le_bytes()),
                 Err(e) => error_response(rid, e),
             }
         }
@@ -2432,6 +2446,100 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let payload = [0u8; 2]; // too short
         let hdr = req(MessageType::DevicePrimaryCtxRetain, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- FuncGetAttribute tests ---
+
+    /// Helper: load a module + get a function handle, returning the func u64.
+    fn setup_function(gpu: &StubGpuBackend) -> u64 {
+        let load_payload = b"ptx";
+        let hdr = req(MessageType::ModuleLoadData, load_payload.len() as u32);
+        let (_, resp) = dispatch(gpu, &hdr, load_payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        let name = b"my_kernel";
+        let mut payload = module.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name);
+        let hdr = req(MessageType::ModuleGetFunction, payload.len() as u32);
+        let (_, resp) = dispatch(gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        u64::from_le_bytes(resp[4..12].try_into().unwrap())
+    }
+
+    #[test]
+    fn test_func_get_attribute_max_threads() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // attrib 0 = MAX_THREADS_PER_BLOCK
+        let mut payload = 0i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&func.to_le_bytes());
+        let hdr = req(MessageType::FuncGetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let val = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(val, 1024);
+    }
+
+    #[test]
+    fn test_func_get_attribute_num_regs() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // attrib 4 = NUM_REGS
+        let mut payload = 4i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&func.to_le_bytes());
+        let hdr = req(MessageType::FuncGetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let val = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(val, 32);
+    }
+
+    #[test]
+    fn test_func_get_attribute_ptx_version() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // attrib 5 = PTX_VERSION
+        let mut payload = 5i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&func.to_le_bytes());
+        let hdr = req(MessageType::FuncGetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let val = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(val, 80);
+    }
+
+    #[test]
+    fn test_func_get_attribute_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        // Use a function handle that does not exist
+        let mut payload = 0i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0xDEADu64.to_le_bytes());
+        let hdr = req(MessageType::FuncGetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_func_get_attribute_invalid_attrib() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // attrib 9999 = unknown
+        let mut payload = 9999i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&func.to_le_bytes());
+        let hdr = req(MessageType::FuncGetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_func_get_attribute_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 6]; // need 12, sending 6
+        let hdr = req(MessageType::FuncGetAttribute, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr, &payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }

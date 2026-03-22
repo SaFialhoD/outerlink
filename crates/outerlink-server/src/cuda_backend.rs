@@ -76,6 +76,7 @@ type FnCuModuleGetFunction =
     unsafe extern "C" fn(hfunc: *mut usize, module: usize, name: *const u8) -> i32;
 type FnCuModuleGetGlobal =
     unsafe extern "C" fn(dptr: *mut u64, size: *mut usize, module: usize, name: *const u8) -> i32;
+type FnCuFuncGetAttribute = unsafe extern "C" fn(pi: *mut i32, attrib: i32, hfunc: usize) -> i32;
 
 // Stream operations
 type FnCuStreamCreate = unsafe extern "C" fn(stream: *mut usize, flags: u32) -> i32;
@@ -184,6 +185,7 @@ struct CudaApi {
     cu_module_unload: Option<FnCuModuleUnload>,
     cu_module_get_function: Option<FnCuModuleGetFunction>,
     cu_module_get_global: Option<FnCuModuleGetGlobal>,
+    cu_func_get_attribute: Option<FnCuFuncGetAttribute>,
 
     cu_stream_create: Option<FnCuStreamCreate>,
     cu_stream_destroy: Option<FnCuStreamDestroy>,
@@ -299,6 +301,7 @@ impl CudaApi {
             cu_module_unload: load_sym!(lib, b"cuModuleUnload\0"),
             cu_module_get_function: load_sym!(lib, b"cuModuleGetFunction\0"),
             cu_module_get_global: load_sym!(lib, b"cuModuleGetGlobal_v2\0", b"cuModuleGetGlobal\0"),
+            cu_func_get_attribute: load_sym!(lib, b"cuFuncGetAttribute\0"),
 
             cu_stream_create: load_sym!(lib, b"cuStreamCreate\0"),
             cu_stream_destroy: load_sym!(lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0"),
@@ -748,6 +751,16 @@ impl GpuBackend for CudaGpuBackend {
         }
         tracing::debug!(module, name, ptr = dptr, size, "CUDA global resolved");
         Ok((dptr, size))
+    }
+
+    fn func_get_attribute(&self, attrib: i32, func: u64) -> Result<i32, CuResult> {
+        let f = require_fn(&self.api.cu_func_get_attribute)?;
+        let mut value: i32 = 0;
+        unsafe {
+            map_cuda_result(f(&mut value, attrib, func as usize))?;
+        }
+        tracing::trace!(attrib, func, value, "CUDA func attribute queried");
+        Ok(value)
     }
 
     // --- Stream operations ---
