@@ -312,10 +312,10 @@ pub extern "C" fn ol_cuDeviceGetAttribute(pi: *mut i32, attrib: i32, dev: i32) -
         5 => 2147483647, // MAX_GRID_DIM_X
         6 => 65535,  // MAX_GRID_DIM_Y
         7 => 65535,  // MAX_GRID_DIM_Z
-        16 => 80,    // MULTIPROCESSOR_COUNT
+        16 => 82,    // MULTIPROCESSOR_COUNT
         75 => 8,     // COMPUTE_CAPABILITY_MAJOR
-        76 => 9,     // COMPUTE_CAPABILITY_MINOR
-        81 => 166912, // MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
+        76 => 6,     // COMPUTE_CAPABILITY_MINOR
+        81 => 102400, // MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
         _ => 0,      // Unknown attributes return 0
     };
     unsafe { *pi = value };
@@ -1094,7 +1094,11 @@ pub extern "C" fn ol_cuMemcpyHtoD_v2(
     byte_count: usize,
 ) -> u32 {
     let client = get_client();
-    if src_host.is_null() || byte_count == 0 {
+    // CUDA: zero-size memcpy is a successful no-op
+    if byte_count == 0 {
+        return CUDA_SUCCESS;
+    }
+    if src_host.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
     // Phase 1 limit: inline transfer must fit in protocol payload
@@ -1132,7 +1136,11 @@ pub extern "C" fn ol_cuMemcpyDtoH_v2(
     byte_count: usize,
 ) -> u32 {
     let client = get_client();
-    if dst_host.is_null() || byte_count == 0 {
+    // CUDA: zero-size memcpy is a successful no-op
+    if byte_count == 0 {
+        return CUDA_SUCCESS;
+    }
+    if dst_host.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
     // Connected: fetch data from the server
@@ -2741,8 +2749,9 @@ pub extern "C" fn ol_cuLaunchKernel(
 #[no_mangle]
 pub extern "C" fn ol_cuMemcpyDtoD(dst: u64, src: u64, byte_count: usize) -> u32 {
     let client = get_client();
+    // CUDA: zero-size memcpy is a successful no-op
     if byte_count == 0 {
-        return CUDA_ERROR_INVALID_VALUE;
+        return CUDA_SUCCESS;
     }
     // Connected: translate both handles and send to server
     if client.connected.load(Ordering::Acquire) {
@@ -2786,7 +2795,11 @@ pub extern "C" fn ol_cuMemcpyHtoDAsync_v2(
     stream: u64,
 ) -> u32 {
     let client = get_client();
-    if src_host.is_null() || byte_count == 0 {
+    // CUDA: zero-size memcpy is a successful no-op
+    if byte_count == 0 {
+        return CUDA_SUCCESS;
+    }
+    if src_host.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
     // Phase 1 limit: inline transfer must fit in protocol payload
@@ -2839,7 +2852,11 @@ pub extern "C" fn ol_cuMemcpyDtoHAsync_v2(
     stream: u64,
 ) -> u32 {
     let client = get_client();
-    if dst_host.is_null() || byte_count == 0 {
+    // CUDA: zero-size memcpy is a successful no-op
+    if byte_count == 0 {
+        return CUDA_SUCCESS;
+    }
+    if dst_host.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
     // Connected: fetch data from the server
@@ -2902,8 +2919,9 @@ pub extern "C" fn ol_cuMemcpyDtoHAsync_v2(
 #[no_mangle]
 pub extern "C" fn ol_cuMemsetD8(dst_device: u64, value: u8, count: usize) -> u32 {
     let client = get_client();
+    // CUDA: zero-count memset is a successful no-op
     if count == 0 {
-        return CUDA_ERROR_INVALID_VALUE;
+        return CUDA_SUCCESS;
     }
     // Connected: send to server
     if client.connected.load(Ordering::Acquire) {
@@ -2931,8 +2949,9 @@ pub extern "C" fn ol_cuMemsetD8(dst_device: u64, value: u8, count: usize) -> u32
 #[no_mangle]
 pub extern "C" fn ol_cuMemsetD32(dst_device: u64, value: u32, count: usize) -> u32 {
     let client = get_client();
+    // CUDA: zero-count memset is a successful no-op
     if count == 0 {
-        return CUDA_ERROR_INVALID_VALUE;
+        return CUDA_SUCCESS;
     }
     // Connected: send to server
     if client.connected.load(Ordering::Acquire) {
@@ -2960,8 +2979,9 @@ pub extern "C" fn ol_cuMemsetD32(dst_device: u64, value: u32, count: usize) -> u
 #[no_mangle]
 pub extern "C" fn ol_cuMemsetD8Async(dst_device: u64, value: u8, count: usize, stream: u64) -> u32 {
     let client = get_client();
+    // CUDA: zero-count memset is a successful no-op
     if count == 0 {
-        return CUDA_ERROR_INVALID_VALUE;
+        return CUDA_SUCCESS;
     }
     // Connected: send to server
     if client.connected.load(Ordering::Acquire) {
@@ -3001,8 +3021,9 @@ pub extern "C" fn ol_cuMemsetD8Async(dst_device: u64, value: u8, count: usize, s
 #[no_mangle]
 pub extern "C" fn ol_cuMemsetD32Async(dst_device: u64, value: u32, count: usize, stream: u64) -> u32 {
     let client = get_client();
+    // CUDA: zero-count memset is a successful no-op
     if count == 0 {
-        return CUDA_ERROR_INVALID_VALUE;
+        return CUDA_SUCCESS;
     }
     // Connected: send to server
     if client.connected.load(Ordering::Acquire) {
@@ -4542,7 +4563,8 @@ mod tests {
 
     #[test]
     fn test_ol_cu_memcpy_dtod_zero_size() {
-        assert_eq!(ol_cuMemcpyDtoD(0x1000, 0x2000, 0), CUDA_ERROR_INVALID_VALUE);
+        // CUDA: zero-size memcpy is a successful no-op
+        assert_eq!(ol_cuMemcpyDtoD(0x1000, 0x2000, 0), CUDA_SUCCESS);
     }
 
     // -- MemAllocHost / MemFreeHost tests --

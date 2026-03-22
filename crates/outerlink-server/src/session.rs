@@ -251,6 +251,7 @@ impl ConnectionSession {
             + self.modules.len()
             + self.streams.len()
             + self.events.len()
+            + self.peer_access_ctxs.len()
     }
 
     // --- Cleanup ---
