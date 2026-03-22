@@ -93,6 +93,17 @@ extern CUresult ol_cuMemcpy(unsigned long long dst, unsigned long long src, size
 extern CUresult ol_cuMemcpyAsync(unsigned long long dst, unsigned long long src, size_t ByteCount, unsigned long long hStream);
 extern CUresult ol_cuMemGetInfo_v2(size_t *free, size_t *total);
 
+/* Stream-ordered memory / pool (CUDA 11.2+) */
+extern CUresult ol_cuMemAllocAsync(unsigned long long *dptr, size_t bytesize, unsigned long long hStream);
+extern CUresult ol_cuMemFreeAsync(unsigned long long dptr, unsigned long long hStream);
+extern CUresult ol_cuDeviceGetDefaultMemPool(unsigned long long *pool, int dev);
+extern CUresult ol_cuMemPoolCreate(unsigned long long *pool, int alloc_type, int loc_type, int loc_id);
+extern CUresult ol_cuMemPoolDestroy(unsigned long long pool);
+extern CUresult ol_cuMemPoolGetAttribute(unsigned long long pool, int attr, unsigned long long *value);
+extern CUresult ol_cuMemPoolSetAttribute(unsigned long long pool, int attr, unsigned long long value);
+extern CUresult ol_cuMemPoolTrimTo(unsigned long long pool, unsigned long long minBytesToKeep);
+extern CUresult ol_cuMemAllocFromPoolAsync(unsigned long long *dptr, size_t bytesize, unsigned long long pool, unsigned long long hStream);
+
 /* Error handling -- CUresult is an enum (int-sized) */
 extern CUresult ol_cuGetErrorName(unsigned int error, const char **pStr);
 extern CUresult ol_cuGetErrorString(unsigned int error, const char **pStr);
@@ -245,6 +256,17 @@ CUresult hook_cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short value, size
 CUresult hook_cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount);
 CUresult hook_cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream);
 CUresult hook_cuMemGetInfo_v2(size_t *free, size_t *total);
+
+/* Memory pool (CUDA 11.2+) */
+CUresult hook_cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream hStream);
+CUresult hook_cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream);
+CUresult hook_cuDeviceGetDefaultMemPool(CUmemoryPool *pool_out, CUdevice dev);
+CUresult hook_cuMemPoolCreate(CUmemoryPool *pool, const void *poolProps);
+CUresult hook_cuMemPoolDestroy(CUmemoryPool pool);
+CUresult hook_cuMemPoolGetAttribute(CUmemoryPool pool, int attr, void *value);
+CUresult hook_cuMemPoolSetAttribute(CUmemoryPool pool, int attr, void *value);
+CUresult hook_cuMemPoolTrimTo(CUmemoryPool pool, size_t minBytesToKeep);
+CUresult hook_cuMemAllocFromPoolAsync(CUdeviceptr *dptr, size_t bytesize, CUmemoryPool pool, CUstream hStream);
 
 /* Error */
 CUresult hook_cuGetErrorName(CUresult error, const char **pStr);

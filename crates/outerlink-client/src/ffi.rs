@@ -2116,6 +2116,280 @@ pub extern "C" fn ol_cuPointerGetAttributes(
 }
 
 // ---------------------------------------------------------------------------
+// Stream-ordered memory / pool operations
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemAllocAsync(dptr: *mut u64, size: usize, stream: u64) -> u32 {
+    let client = get_client();
+    if dptr.is_null() || size == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = Vec::with_capacity(16);
+        payload.extend_from_slice(&(size as u64).to_le_bytes());
+        let remote_stream = if stream == 0 { 0u64 } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        payload.extend_from_slice(&remote_stream.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemAllocAsync, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_devptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.device_ptrs.insert(remote_devptr);
+                device_alloc_sizes().lock().unwrap().insert(synthetic, size);
+                unsafe { *dptr = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: generate a local-only handle (same as cuMemAlloc stub)
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.device_ptrs.insert(stub_remote);
+    device_alloc_sizes().lock().unwrap().insert(synthetic, size);
+    unsafe { *dptr = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemFreeAsync(dptr: u64, stream: u64) -> u32 {
+    let client = get_client();
+    if dptr == 0 {
+        return CUDA_SUCCESS; // Freeing null is a no-op
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_devptr = match client.handles.device_ptrs.to_remote(dptr) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_stream = if stream == 0 { 0u64 } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        let mut payload = Vec::with_capacity(16);
+        payload.extend_from_slice(&remote_devptr.to_le_bytes());
+        payload.extend_from_slice(&remote_stream.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemFreeAsync, &payload) {
+            let result = parse_result(&resp);
+            client.handles.device_ptrs.remove_by_local(dptr);
+            device_alloc_sizes().lock().unwrap().remove(&dptr);
+            return result;
+        }
+    }
+    // Stub: just remove from local handles
+    if client.handles.device_ptrs.remove_by_local(dptr).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    device_alloc_sizes().lock().unwrap().remove(&dptr);
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuDeviceGetDefaultMemPool(pool: *mut u64, dev: i32) -> u32 {
+    let client = get_client();
+    if pool.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let payload = dev.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DeviceGetDefaultMemPool, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_pool = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.mem_pools.insert_or_get(remote_pool);
+                unsafe { *pool = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: deterministic handle per device
+    if dev < 0 || dev >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    let stub_remote = 0xDEFA_0000_u64 | (dev as u64);
+    let synthetic = client.handles.mem_pools.insert_or_get(stub_remote);
+    unsafe { *pool = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemPoolCreate(pool: *mut u64, alloc_type: i32, loc_type: i32, loc_id: i32) -> u32 {
+    let client = get_client();
+    if pool.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = Vec::with_capacity(16);
+        payload.extend_from_slice(&alloc_type.to_le_bytes());
+        payload.extend_from_slice(&loc_type.to_le_bytes());
+        payload.extend_from_slice(&loc_id.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemPoolCreate, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_pool = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.mem_pools.insert(remote_pool);
+                unsafe { *pool = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: generate a local-only handle
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.mem_pools.insert(stub_remote);
+    unsafe { *pool = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemPoolDestroy(pool: u64) -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let remote_pool = match client.handles.mem_pools.to_remote(pool) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_pool.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemPoolDestroy, &payload) {
+            let result = parse_result(&resp);
+            client.handles.mem_pools.remove_by_local(pool);
+            return result;
+        }
+    }
+    // Stub: just remove from local handles
+    if client.handles.mem_pools.remove_by_local(pool).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemPoolGetAttribute(pool: u64, attr: i32, value: *mut u64) -> u32 {
+    let client = get_client();
+    if value.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_pool = match client.handles.mem_pools.to_remote(pool) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&remote_pool.to_le_bytes());
+        payload.extend_from_slice(&attr.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemPoolGetAttribute, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                unsafe { *value = u64::from_le_bytes(resp[4..12].try_into().unwrap()) };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: return 0 (default attribute value)
+    unsafe { *value = 0 };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemPoolSetAttribute(pool: u64, attr: i32, value: u64) -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let remote_pool = match client.handles.mem_pools.to_remote(pool) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = Vec::with_capacity(20);
+        payload.extend_from_slice(&remote_pool.to_le_bytes());
+        payload.extend_from_slice(&attr.to_le_bytes());
+        payload.extend_from_slice(&value.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemPoolSetAttribute, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    // Stub: no-op (pretend it succeeded)
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemPoolTrimTo(pool: u64, min_bytes: u64) -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let remote_pool = match client.handles.mem_pools.to_remote(pool) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = Vec::with_capacity(16);
+        payload.extend_from_slice(&remote_pool.to_le_bytes());
+        payload.extend_from_slice(&min_bytes.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemPoolTrimTo, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    // Stub: no-op
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemAllocFromPoolAsync(dptr: *mut u64, size: usize, pool: u64, stream: u64) -> u32 {
+    let client = get_client();
+    if dptr.is_null() || size == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_pool = match client.handles.mem_pools.to_remote(pool) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_stream = if stream == 0 { 0u64 } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        let mut payload = Vec::with_capacity(24);
+        payload.extend_from_slice(&(size as u64).to_le_bytes());
+        payload.extend_from_slice(&remote_pool.to_le_bytes());
+        payload.extend_from_slice(&remote_stream.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemAllocFromPoolAsync, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_devptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.device_ptrs.insert(remote_devptr);
+                device_alloc_sizes().lock().unwrap().insert(synthetic, size);
+                unsafe { *dptr = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: generate a local-only handle (same as cuMemAlloc stub)
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.device_ptrs.insert(stub_remote);
+    device_alloc_sizes().lock().unwrap().insert(synthetic, size);
+    unsafe { *dptr = synthetic };
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // Stream management
 // ---------------------------------------------------------------------------
 
@@ -6269,6 +6543,145 @@ mod tests {
     fn test_ol_cu_device_get_by_pci_bus_id_null() {
         let mut dev: i32 = -1;
         let result = ol_cuDeviceGetByPCIBusId(&mut dev, std::ptr::null());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // --- Stream-ordered memory / pool tests ---
+
+    #[test]
+    fn test_ol_cu_mem_alloc_async() {
+        let mut dptr: u64 = 0;
+        let result = ol_cuMemAllocAsync(&mut dptr, 1024, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(dptr, 0);
+        assert_eq!(ol_cuMemFreeAsync(dptr, 0), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_alloc_async_null_ptr() {
+        let result = ol_cuMemAllocAsync(ptr::null_mut(), 1024, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_alloc_async_zero_size() {
+        let mut dptr: u64 = 0;
+        let result = ol_cuMemAllocAsync(&mut dptr, 0, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_free_async_null() {
+        // Freeing null is a no-op
+        assert_eq!(ol_cuMemFreeAsync(0, 0), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_default_mem_pool() {
+        let mut pool: u64 = 0;
+        let result = ol_cuDeviceGetDefaultMemPool(&mut pool, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(pool, 0);
+        // Second call returns same handle
+        let mut pool2: u64 = 0;
+        assert_eq!(ol_cuDeviceGetDefaultMemPool(&mut pool2, 0), CUDA_SUCCESS);
+        assert_eq!(pool, pool2);
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_default_mem_pool_null() {
+        let result = ol_cuDeviceGetDefaultMemPool(ptr::null_mut(), 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_default_mem_pool_invalid_device() {
+        let mut pool: u64 = 0;
+        let result = ol_cuDeviceGetDefaultMemPool(&mut pool, 5);
+        assert_eq!(result, CUDA_ERROR_INVALID_DEVICE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_pool_create_destroy() {
+        let mut pool: u64 = 0;
+        let result = ol_cuMemPoolCreate(&mut pool, 1, 1, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(pool, 0);
+        assert_eq!(ol_cuMemPoolDestroy(pool), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_pool_create_null() {
+        let result = ol_cuMemPoolCreate(ptr::null_mut(), 1, 1, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_pool_destroy_invalid() {
+        let result = ol_cuMemPoolDestroy(0xDEAD);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_pool_get_attribute() {
+        let mut pool: u64 = 0;
+        assert_eq!(ol_cuMemPoolCreate(&mut pool, 1, 1, 0), CUDA_SUCCESS);
+        let mut value: u64 = 0xFF;
+        let result = ol_cuMemPoolGetAttribute(pool, 1, &mut value);
+        assert_eq!(result, CUDA_SUCCESS);
+        // Stub returns 0 for unset attributes
+        assert_eq!(value, 0);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_pool_get_attribute_null() {
+        let mut pool: u64 = 0;
+        assert_eq!(ol_cuMemPoolCreate(&mut pool, 1, 1, 0), CUDA_SUCCESS);
+        let result = ol_cuMemPoolGetAttribute(pool, 1, ptr::null_mut());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_pool_set_attribute() {
+        let mut pool: u64 = 0;
+        assert_eq!(ol_cuMemPoolCreate(&mut pool, 1, 1, 0), CUDA_SUCCESS);
+        let result = ol_cuMemPoolSetAttribute(pool, 1, 42);
+        assert_eq!(result, CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_pool_trim_to() {
+        let mut pool: u64 = 0;
+        assert_eq!(ol_cuMemPoolCreate(&mut pool, 1, 1, 0), CUDA_SUCCESS);
+        let result = ol_cuMemPoolTrimTo(pool, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_alloc_from_pool_async() {
+        let mut pool: u64 = 0;
+        assert_eq!(ol_cuMemPoolCreate(&mut pool, 1, 1, 0), CUDA_SUCCESS);
+        let mut dptr: u64 = 0;
+        let result = ol_cuMemAllocFromPoolAsync(&mut dptr, 256, pool, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(dptr, 0);
+        assert_eq!(ol_cuMemFreeAsync(dptr, 0), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_alloc_from_pool_async_null() {
+        let mut pool: u64 = 0;
+        assert_eq!(ol_cuMemPoolCreate(&mut pool, 1, 1, 0), CUDA_SUCCESS);
+        let result = ol_cuMemAllocFromPoolAsync(ptr::null_mut(), 256, pool, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_alloc_from_pool_async_zero_size() {
+        let mut pool: u64 = 0;
+        assert_eq!(ol_cuMemPoolCreate(&mut pool, 1, 1, 0), CUDA_SUCCESS);
+        let mut dptr: u64 = 0;
+        let result = ol_cuMemAllocFromPoolAsync(&mut dptr, 0, pool, 0);
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
     }
 }

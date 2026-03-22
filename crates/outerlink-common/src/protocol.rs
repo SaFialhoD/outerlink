@@ -121,6 +121,17 @@ pub enum MessageType {
     CtxEnablePeerAccess = 0x0090,
     CtxDisablePeerAccess = 0x0091,
 
+    // Memory (stream-ordered / pool)
+    MemAllocAsync = 0x00C0,
+    MemFreeAsync = 0x00C1,
+    DeviceGetDefaultMemPool = 0x00C2,
+    MemPoolCreate = 0x00C3,
+    MemPoolDestroy = 0x00C4,
+    MemPoolGetAttribute = 0x00C5,
+    MemPoolSetAttribute = 0x00C6,
+    MemPoolTrimTo = 0x00C7,
+    MemAllocFromPoolAsync = 0x00C8,
+
     // Memory (extended)
     MemHostGetDevicePointer = 0x00B3,
     MemHostGetFlags = 0x00B4,
@@ -232,6 +243,15 @@ impl MessageType {
             0x0083 => Some(Self::OccupancyMaxPotentialBlockSizeWithFlags),
             0x0090 => Some(Self::CtxEnablePeerAccess),
             0x0091 => Some(Self::CtxDisablePeerAccess),
+            0x00C0 => Some(Self::MemAllocAsync),
+            0x00C1 => Some(Self::MemFreeAsync),
+            0x00C2 => Some(Self::DeviceGetDefaultMemPool),
+            0x00C3 => Some(Self::MemPoolCreate),
+            0x00C4 => Some(Self::MemPoolDestroy),
+            0x00C5 => Some(Self::MemPoolGetAttribute),
+            0x00C6 => Some(Self::MemPoolSetAttribute),
+            0x00C7 => Some(Self::MemPoolTrimTo),
+            0x00C8 => Some(Self::MemAllocFromPoolAsync),
             0x00B2 => Some(Self::MemGetAddressRange),
             0x00B3 => Some(Self::MemHostGetDevicePointer),
             0x00B4 => Some(Self::MemHostGetFlags),

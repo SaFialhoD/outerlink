@@ -369,6 +369,40 @@ pub trait GpuBackend: Send + Sync {
     /// Set the shared memory configuration for a kernel function.
     fn func_set_shared_mem_config(&self, func: u64, config: u32) -> Result<(), CuResult>;
 
+    // --- Stream-ordered memory / pool operations ---
+
+    /// Allocate device memory asynchronously on a stream.
+    /// In stub mode, delegates to `mem_alloc` (stream is ignored).
+    fn mem_alloc_async(&self, size: usize, stream: u64) -> Result<u64, CuResult>;
+
+    /// Free device memory asynchronously on a stream.
+    /// In stub mode, delegates to `mem_free` (stream is ignored).
+    fn mem_free_async(&self, ptr: u64, stream: u64) -> Result<(), CuResult>;
+
+    /// Get the default memory pool for a device.
+    /// Returns a deterministic handle per device.
+    fn device_get_default_mem_pool(&self, device: i32) -> Result<u64, CuResult>;
+
+    /// Create a new memory pool.
+    /// Returns a pool handle.
+    fn mem_pool_create(&self, alloc_type: i32, location_type: i32, location_id: i32) -> Result<u64, CuResult>;
+
+    /// Destroy a memory pool.
+    fn mem_pool_destroy(&self, pool: u64) -> Result<(), CuResult>;
+
+    /// Get an attribute of a memory pool.
+    fn mem_pool_get_attribute(&self, pool: u64, attr: i32) -> Result<u64, CuResult>;
+
+    /// Set an attribute of a memory pool.
+    fn mem_pool_set_attribute(&self, pool: u64, attr: i32, value: u64) -> Result<(), CuResult>;
+
+    /// Trim a memory pool to at most `min_bytes` of reserved memory.
+    fn mem_pool_trim_to(&self, pool: u64, min_bytes: u64) -> Result<(), CuResult>;
+
+    /// Allocate device memory from a specific pool asynchronously on a stream.
+    /// In stub mode, delegates to `mem_alloc` (pool and stream are ignored).
+    fn mem_alloc_from_pool_async(&self, size: usize, pool: u64, stream: u64) -> Result<u64, CuResult>;
+
     // --- Lifecycle ---
 
     /// Clean up all GPU resources held by this backend.
@@ -461,6 +495,13 @@ struct PrimaryCtxState {
     flags: u32,
 }
 
+/// State for a stub memory pool.
+pub struct MemPoolState {
+    pub alloc_type: i32,
+    pub location_id: i32,
+    pub attrs: HashMap<i32, u64>,
+}
+
 /// Combined state for the stub GPU backend, protected by a single `Mutex`
 /// to prevent deadlocks from multi-lock acquisition ordering.
 struct StubState {
@@ -502,6 +543,10 @@ struct StubState {
     context_stack: Vec<u64>,
     /// Resource limits: CU_LIMIT_* -> value.
     context_limits: HashMap<u32, u64>,
+    /// Memory pools: handle -> pool state.
+    mem_pools: HashMap<u64, MemPoolState>,
+    /// Counter for generating memory pool handles.
+    next_pool_id: u64,
     /// Peer contexts currently enabled for P2P access.
     peer_access: HashSet<u64>,
     /// Preferred cache configuration (CU_FUNC_CACHE_PREFER_*).
@@ -551,6 +596,8 @@ impl StubGpuBackend {
                 host_allocations: HashMap::new(),
                 next_host_ptr: 0x0000_CAFE_0000_0000,
                 registered_host: HashMap::new(),
+                mem_pools: HashMap::new(),
+                next_pool_id: 0xB000_0000_0000_0001,
                 primary_contexts: HashMap::new(),
                 context_stack: Vec::new(),
                 context_limits: {
@@ -1639,6 +1686,91 @@ impl GpuBackend for StubGpuBackend {
         entry.refcount = 0;
         // Preserve flags
         Ok(if had_ctx { Some(old_handle) } else { None })
+    }
+
+    // --- Stream-ordered memory / pool operations ---
+
+    fn mem_alloc_async(&self, size: usize, _stream: u64) -> Result<u64, CuResult> {
+        // Stub ignores stream; delegates to synchronous mem_alloc.
+        self.mem_alloc(size)
+    }
+
+    fn mem_free_async(&self, ptr: u64, _stream: u64) -> Result<(), CuResult> {
+        // Stub ignores stream; delegates to synchronous mem_free.
+        self.mem_free(ptr)
+    }
+
+    fn device_get_default_mem_pool(&self, device: i32) -> Result<u64, CuResult> {
+        Self::check_device(device)?;
+        // Deterministic handle per device: 0xDEFA_0000 | dev
+        let handle = 0xDEFA_0000_u64 | (device as u64);
+        // Ensure the pool exists in state so get/set attribute work on it.
+        let mut state = self.state.lock().unwrap();
+        state.mem_pools.entry(handle).or_insert_with(|| MemPoolState {
+            alloc_type: 1, // CU_MEM_ALLOCATION_TYPE_PINNED
+            location_id: device,
+            attrs: HashMap::new(),
+        });
+        Ok(handle)
+    }
+
+    fn mem_pool_create(&self, alloc_type: i32, _location_type: i32, location_id: i32) -> Result<u64, CuResult> {
+        let mut state = self.state.lock().unwrap();
+        let handle = state.next_pool_id;
+        state.next_pool_id += 1;
+        state.mem_pools.insert(handle, MemPoolState {
+            alloc_type,
+            location_id,
+            attrs: HashMap::new(),
+        });
+        Ok(handle)
+    }
+
+    fn mem_pool_destroy(&self, pool: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        match state.mem_pools.remove(&pool) {
+            Some(_) => Ok(()),
+            None => Err(CuResult::InvalidValue),
+        }
+    }
+
+    fn mem_pool_get_attribute(&self, pool: u64, attr: i32) -> Result<u64, CuResult> {
+        let state = self.state.lock().unwrap();
+        match state.mem_pools.get(&pool) {
+            Some(ps) => Ok(*ps.attrs.get(&attr).unwrap_or(&0)),
+            None => Err(CuResult::InvalidValue),
+        }
+    }
+
+    fn mem_pool_set_attribute(&self, pool: u64, attr: i32, value: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        match state.mem_pools.get_mut(&pool) {
+            Some(ps) => {
+                ps.attrs.insert(attr, value);
+                Ok(())
+            }
+            None => Err(CuResult::InvalidValue),
+        }
+    }
+
+    fn mem_pool_trim_to(&self, pool: u64, _min_bytes: u64) -> Result<(), CuResult> {
+        let state = self.state.lock().unwrap();
+        if state.mem_pools.contains_key(&pool) {
+            Ok(()) // Stub is a no-op for trim
+        } else {
+            Err(CuResult::InvalidValue)
+        }
+    }
+
+    fn mem_alloc_from_pool_async(&self, size: usize, pool: u64, _stream: u64) -> Result<u64, CuResult> {
+        // Verify pool exists, then delegate to mem_alloc.
+        {
+            let state = self.state.lock().unwrap();
+            if !state.mem_pools.contains_key(&pool) {
+                return Err(CuResult::InvalidValue);
+            }
+        }
+        self.mem_alloc(size)
     }
 }
 
@@ -3559,5 +3691,142 @@ mod tests {
     fn test_device_get_by_pci_bus_id_zero_bus() {
         let gpu = StubGpuBackend::new();
         assert_eq!(gpu.device_get_by_pci_bus_id("0000:00:00.0"), Err(CuResult::InvalidValue));
+    }
+
+    // --- Stream-ordered memory / pool tests ---
+
+    #[test]
+    fn test_mem_alloc_async_basic() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        let ptr = gpu.mem_alloc_async(1024, stream).unwrap();
+        assert_ne!(ptr, 0);
+        assert!(gpu.mem_free_async(ptr, stream).is_ok());
+    }
+
+    #[test]
+    fn test_mem_alloc_async_zero_size() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_alloc_async(0, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_free_async_invalid_ptr() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_free_async(0xBAD, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_device_get_default_mem_pool() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.device_get_default_mem_pool(0).unwrap();
+        assert_eq!(pool, 0xDEFA_0000);
+        // Calling again returns same handle
+        let pool2 = gpu.device_get_default_mem_pool(0).unwrap();
+        assert_eq!(pool, pool2);
+    }
+
+    #[test]
+    fn test_device_get_default_mem_pool_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_get_default_mem_pool(5), Err(CuResult::InvalidDevice));
+    }
+
+    #[test]
+    fn test_mem_pool_create_and_destroy() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.mem_pool_create(1, 1, 0).unwrap();
+        assert_ne!(pool, 0);
+        assert!(gpu.mem_pool_destroy(pool).is_ok());
+    }
+
+    #[test]
+    fn test_mem_pool_destroy_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_pool_destroy(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_pool_destroy_double() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.mem_pool_create(1, 1, 0).unwrap();
+        assert!(gpu.mem_pool_destroy(pool).is_ok());
+        assert_eq!(gpu.mem_pool_destroy(pool), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_pool_get_set_attribute() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.mem_pool_create(1, 1, 0).unwrap();
+        // Default attribute value is 0
+        assert_eq!(gpu.mem_pool_get_attribute(pool, 1).unwrap(), 0);
+        // Set and get
+        gpu.mem_pool_set_attribute(pool, 1, 42).unwrap();
+        assert_eq!(gpu.mem_pool_get_attribute(pool, 1).unwrap(), 42);
+    }
+
+    #[test]
+    fn test_mem_pool_get_attribute_invalid_pool() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_pool_get_attribute(0xBAD, 1), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_pool_set_attribute_invalid_pool() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_pool_set_attribute(0xBAD, 1, 42), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_pool_trim_to() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.mem_pool_create(1, 1, 0).unwrap();
+        assert!(gpu.mem_pool_trim_to(pool, 0).is_ok());
+    }
+
+    #[test]
+    fn test_mem_pool_trim_to_invalid_pool() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_pool_trim_to(0xBAD, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_alloc_from_pool_async() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.mem_pool_create(1, 1, 0).unwrap();
+        let stream = gpu.stream_create(0).unwrap();
+        let ptr = gpu.mem_alloc_from_pool_async(512, pool, stream).unwrap();
+        assert_ne!(ptr, 0);
+        assert!(gpu.mem_free(ptr).is_ok());
+    }
+
+    #[test]
+    fn test_mem_alloc_from_pool_async_invalid_pool() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_alloc_from_pool_async(512, 0xBAD, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_alloc_from_pool_async_zero_size() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.mem_pool_create(1, 1, 0).unwrap();
+        assert_eq!(gpu.mem_alloc_from_pool_async(0, pool, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_default_mem_pool_attributes() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.device_get_default_mem_pool(0).unwrap();
+        // Set attribute on default pool
+        gpu.mem_pool_set_attribute(pool, 2, 100).unwrap();
+        assert_eq!(gpu.mem_pool_get_attribute(pool, 2).unwrap(), 100);
+    }
+
+    #[test]
+    fn test_mem_pool_create_unique_handles() {
+        let gpu = StubGpuBackend::new();
+        let p1 = gpu.mem_pool_create(1, 1, 0).unwrap();
+        let p2 = gpu.mem_pool_create(1, 1, 0).unwrap();
+        assert_ne!(p1, p2);
     }
 }

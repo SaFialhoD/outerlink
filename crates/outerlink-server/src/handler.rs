@@ -1412,6 +1412,142 @@ pub fn handle_request(
             }
         }
 
+        // --- Stream-ordered memory / pool operations ---
+
+        MessageType::MemAllocAsync => {
+            // Payload: u64 size + u64 stream = 16 bytes
+            if payload.len() < 16 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let size = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
+            let stream = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            match backend.mem_alloc_async(size, stream) {
+                Ok(ptr) => {
+                    session.track_mem_alloc(ptr);
+                    success_with(rid, &ptr.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemFreeAsync => {
+            // Payload: u64 dptr + u64 stream = 16 bytes
+            if payload.len() < 16 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let ptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let stream = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            match backend.mem_free_async(ptr, stream) {
+                Ok(()) => {
+                    session.untrack_mem_alloc(ptr);
+                    result_only(rid, CuResult::Success)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::DeviceGetDefaultMemPool => {
+            // Payload: i32 device = 4 bytes
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let device = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            match backend.device_get_default_mem_pool(device) {
+                Ok(pool) => success_with(rid, &pool.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemPoolCreate => {
+            // Payload: i32 alloc_type + i32 loc_type + i32 loc_id + u32 reserved = 16 bytes
+            if payload.len() < 16 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let alloc_type = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            let loc_type = i32::from_le_bytes(payload[4..8].try_into().unwrap());
+            let loc_id = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+            // payload[12..16] is reserved, ignored
+            match backend.mem_pool_create(alloc_type, loc_type, loc_id) {
+                Ok(pool) => {
+                    session.track_mem_pool(pool);
+                    success_with(rid, &pool.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemPoolDestroy => {
+            // Payload: u64 pool = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let pool = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.mem_pool_destroy(pool) {
+                Ok(()) => {
+                    session.untrack_mem_pool(pool);
+                    result_only(rid, CuResult::Success)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemPoolGetAttribute => {
+            // Payload: u64 pool + i32 attr = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let pool = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let attr = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+            match backend.mem_pool_get_attribute(pool, attr) {
+                Ok(value) => success_with(rid, &value.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemPoolSetAttribute => {
+            // Payload: u64 pool + i32 attr + u64 value = 20 bytes
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let pool = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let attr = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let value = u64::from_le_bytes(payload[12..20].try_into().unwrap());
+            match backend.mem_pool_set_attribute(pool, attr, value) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemPoolTrimTo => {
+            // Payload: u64 pool + u64 min_bytes = 16 bytes
+            if payload.len() < 16 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let pool = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let min_bytes = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            match backend.mem_pool_trim_to(pool, min_bytes) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemAllocFromPoolAsync => {
+            // Payload: u64 size + u64 pool + u64 stream = 24 bytes
+            if payload.len() < 24 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let size = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
+            let pool = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            let stream = u64::from_le_bytes(payload[16..24].try_into().unwrap());
+            match backend.mem_alloc_from_pool_async(size, pool, stream) {
+                Ok(ptr) => {
+                    session.track_mem_alloc(ptr);
+                    success_with(rid, &ptr.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         // Anything else is unimplemented for the PoC.
         _ => {
             tracing::warn!(msg_type = ?header.msg_type, "unhandled message type");
@@ -4664,6 +4800,175 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let hdr = req(MessageType::DeviceGetByPCIBusId, 0);
         let (_, resp) = dispatch(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- Stream-ordered memory / pool handler tests ---
+
+    #[test]
+    fn test_handler_mem_alloc_async() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1024u64.to_le_bytes()); // size
+        payload.extend_from_slice(&0u64.to_le_bytes()); // stream (NULL)
+        let hdr = req(MessageType::MemAllocAsync, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert!(resp.len() >= 12); // 4B result + 8B dptr
+        assert_eq!(session.mem_alloc_count(), 1);
+    }
+
+    #[test]
+    fn test_handler_mem_alloc_async_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemAllocAsync, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_handler_mem_free_async() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        // Allocate first
+        let mut alloc_payload = Vec::new();
+        alloc_payload.extend_from_slice(&256u64.to_le_bytes());
+        alloc_payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::MemAllocAsync, alloc_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &alloc_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let dptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Free
+        let mut free_payload = Vec::new();
+        free_payload.extend_from_slice(&dptr.to_le_bytes());
+        free_payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::MemFreeAsync, free_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &free_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.mem_alloc_count(), 0);
+    }
+
+    #[test]
+    fn test_handler_device_get_default_mem_pool() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0i32.to_le_bytes();
+        let hdr = req(MessageType::DeviceGetDefaultMemPool, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let pool = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(pool, 0xDEFA_0000);
+    }
+
+    #[test]
+    fn test_handler_device_get_default_mem_pool_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        let payload = 5i32.to_le_bytes();
+        let hdr = req(MessageType::DeviceGetDefaultMemPool, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidDevice);
+    }
+
+    #[test]
+    fn test_handler_mem_pool_create_destroy() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1i32.to_le_bytes()); // alloc_type
+        payload.extend_from_slice(&1i32.to_le_bytes()); // loc_type
+        payload.extend_from_slice(&0i32.to_le_bytes()); // loc_id
+        payload.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        let hdr = req(MessageType::MemPoolCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let pool = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(session.mem_pool_count(), 1);
+
+        // Destroy
+        let hdr = req(MessageType::MemPoolDestroy, 8);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &pool.to_le_bytes(), &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.mem_pool_count(), 0);
+    }
+
+    #[test]
+    fn test_handler_mem_pool_get_set_attribute() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.mem_pool_create(1, 1, 0).unwrap();
+
+        // Set attribute
+        let mut set_payload = Vec::new();
+        set_payload.extend_from_slice(&pool.to_le_bytes());
+        set_payload.extend_from_slice(&3i32.to_le_bytes()); // attr
+        set_payload.extend_from_slice(&99u64.to_le_bytes()); // value
+        let hdr = req(MessageType::MemPoolSetAttribute, set_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &set_payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Get attribute
+        let mut get_payload = Vec::new();
+        get_payload.extend_from_slice(&pool.to_le_bytes());
+        get_payload.extend_from_slice(&3i32.to_le_bytes());
+        let hdr = req(MessageType::MemPoolGetAttribute, get_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &get_payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let value = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(value, 99);
+    }
+
+    #[test]
+    fn test_handler_mem_pool_trim_to() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.mem_pool_create(1, 1, 0).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&pool.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::MemPoolTrimTo, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_handler_mem_alloc_from_pool_async() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let pool = gpu.mem_pool_create(1, 1, 0).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&512u64.to_le_bytes()); // size
+        payload.extend_from_slice(&pool.to_le_bytes()); // pool
+        payload.extend_from_slice(&0u64.to_le_bytes()); // stream
+        let hdr = req(MessageType::MemAllocFromPoolAsync, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.mem_alloc_count(), 1);
+    }
+
+    #[test]
+    fn test_handler_mem_alloc_from_pool_async_invalid_pool() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&512u64.to_le_bytes());
+        payload.extend_from_slice(&0xBADu64.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::MemAllocFromPoolAsync, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_handler_mem_pool_create_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemPoolCreate, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_handler_mem_pool_set_attribute_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemPoolSetAttribute, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0; 8]);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }

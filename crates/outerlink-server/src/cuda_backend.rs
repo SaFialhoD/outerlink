@@ -141,6 +141,30 @@ type FnCuMemcpy = unsafe extern "C" fn(dst: u64, src: u64, bytecount: usize) -> 
 type FnCuMemcpyAsync =
     unsafe extern "C" fn(dst: u64, src: u64, bytecount: usize, stream: usize) -> i32;
 
+// Stream-ordered memory / pool operations (CUDA 11.2+)
+type FnCuMemAllocAsync = unsafe extern "C" fn(dptr: *mut u64, bytesize: usize, stream: usize) -> i32;
+type FnCuMemFreeAsync = unsafe extern "C" fn(dptr: u64, stream: usize) -> i32;
+type FnCuDeviceGetDefaultMemPool = unsafe extern "C" fn(pool: *mut usize, dev: i32) -> i32;
+
+/// CUmemPoolProps for cuMemPoolCreate (CUDA 11.2+).
+#[repr(C)]
+struct CuMemPoolProps {
+    alloc_type: i32,         // CUmemAllocationType
+    handle_types: i32,       // CUmemAllocationHandleType
+    location_type: i32,      // CUmemLocationType
+    location_id: i32,        // device ordinal
+    win32_security: usize,   // pointer, NULL for us
+    max_size: usize,         // 0 = no limit
+    reserved: [u8; 56],      // reserved bytes per CUDA spec
+}
+
+type FnCuMemPoolCreate = unsafe extern "C" fn(pool: *mut usize, props: *const CuMemPoolProps) -> i32;
+type FnCuMemPoolDestroy = unsafe extern "C" fn(pool: usize) -> i32;
+type FnCuMemPoolGetAttribute = unsafe extern "C" fn(pool: usize, attr: i32, value: *mut u64) -> i32;
+type FnCuMemPoolSetAttribute = unsafe extern "C" fn(pool: usize, attr: i32, value: *const u64) -> i32;
+type FnCuMemPoolTrimTo = unsafe extern "C" fn(pool: usize, min_bytes_to_keep: usize) -> i32;
+type FnCuMemAllocFromPoolAsync = unsafe extern "C" fn(dptr: *mut u64, bytesize: usize, pool: usize, stream: usize) -> i32;
+
 // Host pinned memory
 type FnCuMemAllocHost = unsafe extern "C" fn(pp: *mut *mut std::ffi::c_void, bytesize: usize) -> i32;
 type FnCuMemFreeHost = unsafe extern "C" fn(p: *mut std::ffi::c_void) -> i32;
@@ -277,6 +301,17 @@ struct CudaApi {
     cu_memset_d32_async: Option<FnCuMemsetD32Async>,
     cu_memset_d16: Option<FnCuMemsetD16>,
     cu_memset_d16_async: Option<FnCuMemsetD16Async>,
+    // Stream-ordered memory / pool (CUDA 11.2+)
+    cu_mem_alloc_async: Option<FnCuMemAllocAsync>,
+    cu_mem_free_async: Option<FnCuMemFreeAsync>,
+    cu_device_get_default_mem_pool: Option<FnCuDeviceGetDefaultMemPool>,
+    cu_mem_pool_create: Option<FnCuMemPoolCreate>,
+    cu_mem_pool_destroy: Option<FnCuMemPoolDestroy>,
+    cu_mem_pool_get_attribute: Option<FnCuMemPoolGetAttribute>,
+    cu_mem_pool_set_attribute: Option<FnCuMemPoolSetAttribute>,
+    cu_mem_pool_trim_to: Option<FnCuMemPoolTrimTo>,
+    cu_mem_alloc_from_pool_async: Option<FnCuMemAllocFromPoolAsync>,
+
     cu_mem_alloc_host: Option<FnCuMemAllocHost>,
     cu_mem_free_host: Option<FnCuMemFreeHost>,
     cu_mem_host_get_device_pointer: Option<FnCuMemHostGetDevicePointer>,
@@ -436,6 +471,17 @@ impl CudaApi {
             cu_memset_d32_async: load_sym!(lib, b"cuMemsetD32Async\0"),
             cu_memset_d16: load_sym!(lib, b"cuMemsetD16_v2\0", b"cuMemsetD16\0"),
             cu_memset_d16_async: load_sym!(lib, b"cuMemsetD16Async\0"),
+            // Stream-ordered memory / pool (CUDA 11.2+, optional)
+            cu_mem_alloc_async: load_sym!(lib, b"cuMemAllocAsync\0"),
+            cu_mem_free_async: load_sym!(lib, b"cuMemFreeAsync\0"),
+            cu_device_get_default_mem_pool: load_sym!(lib, b"cuDeviceGetDefaultMemPool\0"),
+            cu_mem_pool_create: load_sym!(lib, b"cuMemPoolCreate\0"),
+            cu_mem_pool_destroy: load_sym!(lib, b"cuMemPoolDestroy\0"),
+            cu_mem_pool_get_attribute: load_sym!(lib, b"cuMemPoolGetAttribute\0"),
+            cu_mem_pool_set_attribute: load_sym!(lib, b"cuMemPoolSetAttribute\0"),
+            cu_mem_pool_trim_to: load_sym!(lib, b"cuMemPoolTrimTo\0"),
+            cu_mem_alloc_from_pool_async: load_sym!(lib, b"cuMemAllocFromPoolAsync\0"),
+
             cu_mem_alloc_host: load_sym!(lib, b"cuMemAllocHost_v2\0", b"cuMemAllocHost\0"),
             cu_mem_free_host: load_sym!(lib, b"cuMemFreeHost\0"),
             cu_mem_host_get_device_pointer: load_sym!(lib, b"cuMemHostGetDevicePointer_v2\0", b"cuMemHostGetDevicePointer\0"),
@@ -1688,6 +1734,95 @@ impl GpuBackend for CudaGpuBackend {
         }
         // Real CUDA doesn't return the old handle; we return None.
         Ok(None)
+    }
+
+    // --- Stream-ordered memory / pool operations ---
+
+    fn mem_alloc_async(&self, size: usize, stream: u64) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_mem_alloc_async)?;
+        let mut dptr: u64 = 0;
+        unsafe {
+            map_cuda_result(func(&mut dptr, size, stream as usize))?;
+        }
+        Ok(dptr)
+    }
+
+    fn mem_free_async(&self, ptr: u64, stream: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_mem_free_async)?;
+        unsafe {
+            map_cuda_result(func(ptr, stream as usize))?;
+        }
+        Ok(())
+    }
+
+    fn device_get_default_mem_pool(&self, device: i32) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_device_get_default_mem_pool)?;
+        let dev = self.resolve_device(device)?;
+        let mut pool: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut pool, dev))?;
+        }
+        Ok(pool as u64)
+    }
+
+    fn mem_pool_create(&self, alloc_type: i32, location_type: i32, location_id: i32) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_mem_pool_create)?;
+        let props = CuMemPoolProps {
+            alloc_type,
+            handle_types: 0, // CU_MEM_HANDLE_TYPE_NONE
+            location_type,
+            location_id,
+            win32_security: 0,
+            max_size: 0,
+            reserved: [0u8; 56],
+        };
+        let mut pool: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut pool, &props))?;
+        }
+        Ok(pool as u64)
+    }
+
+    fn mem_pool_destroy(&self, pool: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_mem_pool_destroy)?;
+        unsafe {
+            map_cuda_result(func(pool as usize))?;
+        }
+        Ok(())
+    }
+
+    fn mem_pool_get_attribute(&self, pool: u64, attr: i32) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_mem_pool_get_attribute)?;
+        let mut value: u64 = 0;
+        unsafe {
+            map_cuda_result(func(pool as usize, attr, &mut value))?;
+        }
+        Ok(value)
+    }
+
+    fn mem_pool_set_attribute(&self, pool: u64, attr: i32, value: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_mem_pool_set_attribute)?;
+        unsafe {
+            map_cuda_result(func(pool as usize, attr, &value))?;
+        }
+        Ok(())
+    }
+
+    fn mem_pool_trim_to(&self, pool: u64, min_bytes: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_mem_pool_trim_to)?;
+        unsafe {
+            map_cuda_result(func(pool as usize, min_bytes as usize))?;
+        }
+        Ok(())
+    }
+
+    fn mem_alloc_from_pool_async(&self, size: usize, pool: u64, stream: u64) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_mem_alloc_from_pool_async)?;
+        let mut dptr: u64 = 0;
+        unsafe {
+            map_cuda_result(func(&mut dptr, size, pool as usize, stream as usize))?;
+        }
+        Ok(dptr)
     }
 }
 

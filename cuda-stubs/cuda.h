@@ -22,6 +22,7 @@ typedef struct CUfunc_st *CUfunction;
 typedef struct CUstream_st *CUstream;
 typedef struct CUevent_st *CUevent;
 typedef unsigned long long CUdeviceptr;
+typedef struct CUmemPoolHandle_st *CUmemoryPool;
 typedef uint64_t cuuint64_t;
 
 /* Occupancy callback type: maps block size to dynamic shared memory size */
@@ -247,6 +248,14 @@ CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, CUfunction 
 CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize, unsigned int flags);
 CUresult cuOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize, CUfunction func, CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize, int blockSizeLimit);
 CUresult cuOccupancyMaxPotentialBlockSizeWithFlags(int *minGridSize, int *blockSize, CUfunction func, CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize, int blockSizeLimit, unsigned int flags);
+
+/* Function declarations - Memory pool (CUDA 11.2+) */
+CUresult cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream hStream);
+CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream);
+CUresult cuDeviceGetDefaultMemPool(CUmemoryPool *pool_out, CUdevice dev);
+CUresult cuMemPoolDestroy(CUmemoryPool pool);
+CUresult cuMemPoolTrimTo(CUmemoryPool pool, size_t minBytesToKeep);
+CUresult cuMemAllocFromPoolAsync(CUdeviceptr *dptr, size_t bytesize, CUmemoryPool pool, CUstream hStream);
 
 /* Function declarations - Execution */
 CUresult cuLaunchKernel(CUfunction f,

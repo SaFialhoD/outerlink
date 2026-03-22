@@ -165,6 +165,17 @@ static const hook_entry_t hook_table[] = {
     { "cuMemcpyAsync",           (void *)hook_cuMemcpyAsync },
     { "cuMemGetInfo_v2",         (void *)hook_cuMemGetInfo_v2 },
 
+    /* Memory pool (CUDA 11.2+) */
+    { "cuMemAllocAsync",         (void *)hook_cuMemAllocAsync },
+    { "cuMemFreeAsync",          (void *)hook_cuMemFreeAsync },
+    { "cuDeviceGetDefaultMemPool", (void *)hook_cuDeviceGetDefaultMemPool },
+    { "cuMemPoolCreate",         (void *)hook_cuMemPoolCreate },
+    { "cuMemPoolDestroy",        (void *)hook_cuMemPoolDestroy },
+    { "cuMemPoolGetAttribute",   (void *)hook_cuMemPoolGetAttribute },
+    { "cuMemPoolSetAttribute",   (void *)hook_cuMemPoolSetAttribute },
+    { "cuMemPoolTrimTo",         (void *)hook_cuMemPoolTrimTo },
+    { "cuMemAllocFromPoolAsync", (void *)hook_cuMemAllocFromPoolAsync },
+
     /* Error */
     { "cuGetErrorName",          (void *)hook_cuGetErrorName },
     { "cuGetErrorString",        (void *)hook_cuGetErrorString },
@@ -609,6 +620,86 @@ CUresult hook_cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, 
     ensure_init();
     return ol_cuMemcpyAsync((unsigned long long)dst, (unsigned long long)src, ByteCount,
                              (unsigned long long)(uintptr_t)hStream);
+}
+
+/* -- Memory pool (CUDA 11.2+) -- */
+
+CUresult hook_cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream hStream) {
+    ensure_init();
+    return ol_cuMemAllocAsync((unsigned long long *)dptr, bytesize,
+                               (unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream) {
+    ensure_init();
+    return ol_cuMemFreeAsync((unsigned long long)dptr,
+                              (unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuDeviceGetDefaultMemPool(CUmemoryPool *pool_out, CUdevice dev) {
+    ensure_init();
+    unsigned long long pool_u64 = 0;
+    CUresult r = ol_cuDeviceGetDefaultMemPool(&pool_u64, dev);
+    if (r == CUDA_SUCCESS && pool_out)
+        *pool_out = (CUmemoryPool)(uintptr_t)pool_u64;
+    return r;
+}
+
+/*
+ * hook_cuMemPoolCreate: The real CUDA API takes a CUmemPoolProps struct.
+ * We extract the relevant fields and pass them individually to the Rust FFI.
+ * The struct layout is:
+ *   i32 allocType, i32 handleTypes, { i32 type, i32 id } location, ...
+ */
+CUresult hook_cuMemPoolCreate(CUmemoryPool *pool, const void *poolProps) {
+    ensure_init();
+    if (!pool || !poolProps)
+        return CUDA_ERROR_INVALID_VALUE;
+    const int *props = (const int *)poolProps;
+    int alloc_type = props[0];
+    /* props[1] = handleTypes (skip) */
+    int loc_type = props[2];
+    int loc_id = props[3];
+    unsigned long long pool_u64 = 0;
+    CUresult r = ol_cuMemPoolCreate(&pool_u64, alloc_type, loc_type, loc_id);
+    if (r == CUDA_SUCCESS)
+        *pool = (CUmemoryPool)(uintptr_t)pool_u64;
+    return r;
+}
+
+CUresult hook_cuMemPoolDestroy(CUmemoryPool pool) {
+    ensure_init();
+    return ol_cuMemPoolDestroy((unsigned long long)(uintptr_t)pool);
+}
+
+CUresult hook_cuMemPoolGetAttribute(CUmemoryPool pool, int attr, void *value) {
+    ensure_init();
+    if (!value)
+        return CUDA_ERROR_INVALID_VALUE;
+    return ol_cuMemPoolGetAttribute((unsigned long long)(uintptr_t)pool, attr,
+                                     (unsigned long long *)value);
+}
+
+CUresult hook_cuMemPoolSetAttribute(CUmemoryPool pool, int attr, void *value) {
+    ensure_init();
+    if (!value)
+        return CUDA_ERROR_INVALID_VALUE;
+    unsigned long long val = *(unsigned long long *)value;
+    return ol_cuMemPoolSetAttribute((unsigned long long)(uintptr_t)pool, attr, val);
+}
+
+CUresult hook_cuMemPoolTrimTo(CUmemoryPool pool, size_t minBytesToKeep) {
+    ensure_init();
+    return ol_cuMemPoolTrimTo((unsigned long long)(uintptr_t)pool,
+                               (unsigned long long)minBytesToKeep);
+}
+
+CUresult hook_cuMemAllocFromPoolAsync(CUdeviceptr *dptr, size_t bytesize,
+                                       CUmemoryPool pool, CUstream hStream) {
+    ensure_init();
+    return ol_cuMemAllocFromPoolAsync((unsigned long long *)dptr, bytesize,
+                                       (unsigned long long)(uintptr_t)pool,
+                                       (unsigned long long)(uintptr_t)hStream);
 }
 
 /* -- Error -- */

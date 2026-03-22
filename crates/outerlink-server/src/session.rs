@@ -45,6 +45,8 @@ pub struct ConnectionSession {
     registered_host: HashSet<u64>,
     /// Peer contexts enabled for P2P access by this session.
     peer_access_ctxs: HashSet<u64>,
+    /// Memory pools created by this session.
+    mem_pools: HashSet<u64>,
 }
 
 impl ConnectionSession {
@@ -61,6 +63,7 @@ impl ConnectionSession {
             primary_ctxs: HashMap::new(),
             registered_host: HashSet::new(),
             peer_access_ctxs: HashSet::new(),
+            mem_pools: HashSet::new(),
         }
     }
 
@@ -210,6 +213,21 @@ impl ConnectionSession {
         self.peer_access_ctxs.remove(&peer_ctx);
     }
 
+    /// Record that this session created a memory pool with handle `pool`.
+    pub fn track_mem_pool(&mut self, pool: u64) {
+        self.mem_pools.insert(pool);
+    }
+
+    /// Remove `pool` from this session's tracked memory pools.
+    pub fn untrack_mem_pool(&mut self, pool: u64) {
+        self.mem_pools.remove(&pool);
+    }
+
+    /// Number of memory pools tracked by this session.
+    pub fn mem_pool_count(&self) -> usize {
+        self.mem_pools.len()
+    }
+
     // --- Resource queries ---
 
     /// Number of device memory allocations tracked by this session.
@@ -252,6 +270,7 @@ impl ConnectionSession {
             + self.streams.len()
             + self.events.len()
             + self.peer_access_ctxs.len()
+            + self.mem_pools.len()
     }
 
     // --- Cleanup ---
@@ -271,6 +290,21 @@ impl ConnectionSession {
     /// and the number that failed.
     pub fn cleanup(&mut self, backend: &dyn GpuBackend) -> CleanupReport {
         let mut report = CleanupReport::default();
+
+        // 0. Memory pools (destroy before other resources so pool-allocated memory
+        //    can be freed cleanly)
+        for pool in self.mem_pools.drain() {
+            match backend.mem_pool_destroy(pool) {
+                Ok(()) => {
+                    tracing::debug!(handle = pool, "session cleanup: destroyed mem pool");
+                    report.succeeded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(handle = pool, error = ?e, "session cleanup: failed to destroy mem pool");
+                    report.failed += 1;
+                }
+            }
+        }
 
         // 1. Events
         for event in self.events.drain() {
