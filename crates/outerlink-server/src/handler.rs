@@ -79,6 +79,10 @@ fn error_response(request_id: u64, err: CuResult) -> (MessageHeader, Vec<u8>) {
 /// | CtxGetStreamPriorityRange| (empty)             | i32 least, i32 greatest               |
 /// | CtxGetFlags             | (empty)              | u32 flags                             |
 /// | FuncGetAttribute        | i32 attrib, u64 func | i32 value                             |
+/// | OccupancyMaxActiveBlocks| u64 func, i32 blockSize, u64 dynSmem = 20B | i32 numBlocks |
+/// | OccupancyMaxActiveBlocksWithFlags| u64 func, i32 blockSize, u64 dynSmem, u32 flags = 24B | i32 numBlocks |
+/// | OccupancyMaxPotentialBlockSize| u64 func, u64 dynSmem, i32 limit = 20B | i32 minGridSize, i32 blockSize |
+/// | OccupancyMaxPotentialBlockSizeWithFlags| u64 func, u64 dynSmem, i32 limit, u32 flags = 24B | i32 minGridSize, i32 blockSize |
 pub fn handle_request(
     backend: &dyn GpuBackend,
     header: &MessageHeader,
@@ -931,6 +935,74 @@ pub fn handle_request(
             let flags = u32::from_le_bytes(payload[16..20].try_into().unwrap());
             match backend.stream_wait_event(stream, event, flags) {
                 Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- Occupancy operations ---
+
+        MessageType::OccupancyMaxActiveBlocksPerMultiprocessor => {
+            // [8B func][4B blockSize][8B dynamicSMemSize] = 20 bytes
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let func = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let block_size = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let dynamic_smem = u64::from_le_bytes(payload[12..20].try_into().unwrap());
+            match backend.occupancy_max_active_blocks(func, block_size, dynamic_smem, 0) {
+                Ok(num_blocks) => success_with(rid, &num_blocks.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::OccupancyMaxActiveBlocksPerMultiprocessorWithFlags => {
+            // [8B func][4B blockSize][8B dynamicSMemSize][4B flags] = 24 bytes
+            if payload.len() < 24 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let func = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let block_size = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let dynamic_smem = u64::from_le_bytes(payload[12..20].try_into().unwrap());
+            let flags = u32::from_le_bytes(payload[20..24].try_into().unwrap());
+            match backend.occupancy_max_active_blocks(func, block_size, dynamic_smem, flags) {
+                Ok(num_blocks) => success_with(rid, &num_blocks.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::OccupancyMaxPotentialBlockSize => {
+            // [8B func][8B dynamicSMemSize][4B blockSizeLimit] = 20 bytes
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let func = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let dynamic_smem = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            let block_size_limit = i32::from_le_bytes(payload[16..20].try_into().unwrap());
+            match backend.occupancy_max_potential_block_size(func, dynamic_smem, block_size_limit, 0) {
+                Ok((min_grid, block_sz)) => {
+                    let mut data = min_grid.to_le_bytes().to_vec();
+                    data.extend_from_slice(&block_sz.to_le_bytes());
+                    success_with(rid, &data)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::OccupancyMaxPotentialBlockSizeWithFlags => {
+            // [8B func][8B dynamicSMemSize][4B blockSizeLimit][4B flags] = 24 bytes
+            if payload.len() < 24 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let func = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let dynamic_smem = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            let block_size_limit = i32::from_le_bytes(payload[16..20].try_into().unwrap());
+            let flags = u32::from_le_bytes(payload[20..24].try_into().unwrap());
+            match backend.occupancy_max_potential_block_size(func, dynamic_smem, block_size_limit, flags) {
+                Ok((min_grid, block_sz)) => {
+                    let mut data = min_grid.to_le_bytes().to_vec();
+                    data.extend_from_slice(&block_sz.to_le_bytes());
+                    success_with(rid, &data)
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -3040,5 +3112,131 @@ mod tests {
         let hdr = req(MessageType::CtxGetFlags, 0);
         let (_, resp) = dispatch(&gpu, &hdr, &[]);
         assert_eq!(response_result(&resp), CuResult::InvalidContext);
+    }
+
+    // --- Occupancy handler tests ---
+
+    #[test]
+    fn test_occupancy_max_active_blocks() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // [8B func][4B blockSize=256][8B dynamicSMemSize=0] = 20B
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&256i32.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::OccupancyMaxActiveBlocksPerMultiprocessor, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let num_blocks = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(num_blocks, 8);  // 2048/256 = 8
+    }
+
+    #[test]
+    fn test_occupancy_max_active_blocks_with_flags() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // [8B func][4B blockSize=512][8B dynamicSMemSize=0][4B flags=0] = 24B
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&512i32.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::OccupancyMaxActiveBlocksPerMultiprocessorWithFlags, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let num_blocks = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(num_blocks, 4);  // 2048/512 = 4
+    }
+
+    #[test]
+    fn test_occupancy_max_active_blocks_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 10]; // need 20
+        let hdr = req(MessageType::OccupancyMaxActiveBlocksPerMultiprocessor, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_occupancy_max_active_blocks_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 0xDEADu64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&256i32.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::OccupancyMaxActiveBlocksPerMultiprocessor, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_occupancy_max_potential_block_size() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // [8B func][8B dynamicSMemSize=0][4B blockSizeLimit=0] = 20B
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::OccupancyMaxPotentialBlockSize, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let min_grid = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let block_sz = i32::from_le_bytes(resp[8..12].try_into().unwrap());
+        assert_eq!(block_sz, 256);
+        assert_eq!(min_grid, 656);  // (2048/256)*82 = 656
+    }
+
+    #[test]
+    fn test_occupancy_max_potential_block_size_with_flags() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // [8B func][8B dynamicSMemSize=0][4B blockSizeLimit=128][4B flags=0] = 24B
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&128i32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::OccupancyMaxPotentialBlockSizeWithFlags, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let min_grid = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let block_sz = i32::from_le_bytes(resp[8..12].try_into().unwrap());
+        assert_eq!(block_sz, 128);
+        assert_eq!(min_grid, 1312);  // (2048/128)*82 = 1312
+    }
+
+    #[test]
+    fn test_occupancy_max_potential_block_size_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 10]; // need 20
+        let hdr = req(MessageType::OccupancyMaxPotentialBlockSize, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_occupancy_max_potential_block_size_with_flags_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 16]; // need 24
+        let hdr = req(MessageType::OccupancyMaxPotentialBlockSizeWithFlags, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_occupancy_max_potential_block_size_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 0xDEADu64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::OccupancyMaxPotentialBlockSize, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_occupancy_max_active_blocks_with_flags_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 18]; // need 24
+        let hdr = req(MessageType::OccupancyMaxActiveBlocksPerMultiprocessorWithFlags, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }

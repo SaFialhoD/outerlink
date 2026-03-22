@@ -24,6 +24,9 @@ typedef struct CUevent_st *CUevent;
 typedef unsigned long long CUdeviceptr;
 typedef uint64_t cuuint64_t;
 
+/* Occupancy callback type: maps block size to dynamic shared memory size */
+typedef size_t (*CUoccupancyB2DSize)(int blockSize);
+
 /* UUID */
 typedef struct CUuuid_st {
     char bytes[16];
@@ -207,6 +210,12 @@ CUresult cuModuleUnload(CUmodule hmod);
 CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name);
 CUresult cuModuleGetGlobal_v2(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name);
 CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc);
+
+/* Function declarations - Occupancy */
+CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize);
+CUresult cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize, unsigned int flags);
+CUresult cuOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize, CUfunction func, CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize, int blockSizeLimit);
+CUresult cuOccupancyMaxPotentialBlockSizeWithFlags(int *minGridSize, int *blockSize, CUfunction func, CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize, int blockSizeLimit, unsigned int flags);
 
 /* Function declarations - Execution */
 CUresult cuLaunchKernel(CUfunction f,

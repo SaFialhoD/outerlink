@@ -88,6 +88,12 @@ extern CUresult ol_cuModuleGetFunction(unsigned long long *func, unsigned long l
 extern CUresult ol_cuModuleGetGlobal(unsigned long long *dptr, size_t *size, unsigned long long module, const unsigned char *name, size_t name_len);
 extern CUresult ol_cuFuncGetAttribute(int *pi, int attrib, unsigned long long func);
 
+/* Occupancy */
+extern CUresult ol_cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, unsigned long long func, int blockSize, unsigned long long dynamicSMemSize);
+extern CUresult ol_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlocks, unsigned long long func, int blockSize, unsigned long long dynamicSMemSize, unsigned int flags);
+extern CUresult ol_cuOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize, unsigned long long func, const void *callback, unsigned long long dynamicSMemSize, int blockSizeLimit);
+extern CUresult ol_cuOccupancyMaxPotentialBlockSizeWithFlags(int *minGridSize, int *blockSize, unsigned long long func, const void *callback, unsigned long long dynamicSMemSize, int blockSizeLimit, unsigned int flags);
+
 /* Stream management */
 extern CUresult ol_cuStreamCreate(unsigned long long *stream, unsigned int flags);
 extern CUresult ol_cuStreamCreateWithPriority(unsigned long long *stream, unsigned int flags, int priority);
@@ -197,6 +203,12 @@ CUresult hook_cuModuleUnload(CUmodule hmod);
 CUresult hook_cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name);
 CUresult hook_cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name);
 CUresult hook_cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc);
+
+/* Occupancy */
+CUresult hook_cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize);
+CUresult hook_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize, unsigned int flags);
+CUresult hook_cuOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize, CUfunction func, CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize, int blockSizeLimit);
+CUresult hook_cuOccupancyMaxPotentialBlockSizeWithFlags(int *minGridSize, int *blockSize, CUfunction func, CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize, int blockSizeLimit, unsigned int flags);
 
 /* Stream */
 CUresult hook_cuStreamCreate(CUstream *phStream, unsigned int Flags);

@@ -127,6 +127,31 @@ type FnCuMemFreeHost = unsafe extern "C" fn(p: *mut std::ffi::c_void) -> i32;
 // Stream wait event
 type FnCuStreamWaitEvent = unsafe extern "C" fn(stream: usize, event: usize, flags: u32) -> i32;
 
+// Occupancy operations
+type FnCuOccupancyMaxActiveBlocksPerMultiprocessor =
+    unsafe extern "C" fn(num_blocks: *mut i32, func: usize, block_size: i32, dynamic_smem_size: usize) -> i32;
+type FnCuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags =
+    unsafe extern "C" fn(num_blocks: *mut i32, func: usize, block_size: i32, dynamic_smem_size: usize, flags: u32) -> i32;
+type FnCuOccupancyMaxPotentialBlockSize =
+    unsafe extern "C" fn(
+        min_grid_size: *mut i32,
+        block_size: *mut i32,
+        func: usize,
+        block_size_to_dynamic_smem_size: usize, // function pointer, NULL when called from server
+        dynamic_smem_size: usize,
+        block_size_limit: i32,
+    ) -> i32;
+type FnCuOccupancyMaxPotentialBlockSizeWithFlags =
+    unsafe extern "C" fn(
+        min_grid_size: *mut i32,
+        block_size: *mut i32,
+        func: usize,
+        block_size_to_dynamic_smem_size: usize, // function pointer, NULL when called from server
+        dynamic_smem_size: usize,
+        block_size_limit: i32,
+        flags: u32,
+    ) -> i32;
+
 // Primary context operations
 type FnCuDevicePrimaryCtxRetain = unsafe extern "C" fn(pctx: *mut usize, dev: i32) -> i32;
 type FnCuDevicePrimaryCtxRelease = unsafe extern "C" fn(dev: i32) -> i32;
@@ -221,6 +246,11 @@ struct CudaApi {
     cu_event_query: Option<FnCuEventQuery>,
 
     cu_launch_kernel: Option<FnCuLaunchKernel>,
+
+    cu_occupancy_max_active_blocks: Option<FnCuOccupancyMaxActiveBlocksPerMultiprocessor>,
+    cu_occupancy_max_active_blocks_with_flags: Option<FnCuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags>,
+    cu_occupancy_max_potential_block_size: Option<FnCuOccupancyMaxPotentialBlockSize>,
+    cu_occupancy_max_potential_block_size_with_flags: Option<FnCuOccupancyMaxPotentialBlockSizeWithFlags>,
 
     cu_device_primary_ctx_retain: Option<FnCuDevicePrimaryCtxRetain>,
     cu_device_primary_ctx_release: Option<FnCuDevicePrimaryCtxRelease>,
@@ -347,6 +377,11 @@ impl CudaApi {
             cu_event_query: load_sym!(lib, b"cuEventQuery\0"),
 
             cu_launch_kernel: load_sym!(lib, b"cuLaunchKernel\0"),
+
+            cu_occupancy_max_active_blocks: load_sym!(lib, b"cuOccupancyMaxActiveBlocksPerMultiprocessor\0"),
+            cu_occupancy_max_active_blocks_with_flags: load_sym!(lib, b"cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags\0"),
+            cu_occupancy_max_potential_block_size: load_sym!(lib, b"cuOccupancyMaxPotentialBlockSize\0"),
+            cu_occupancy_max_potential_block_size_with_flags: load_sym!(lib, b"cuOccupancyMaxPotentialBlockSizeWithFlags\0"),
 
             cu_device_primary_ctx_retain: load_sym!(lib, b"cuDevicePrimaryCtxRetain\0"),
             cu_device_primary_ctx_release: load_sym!(lib, b"cuDevicePrimaryCtxRelease_v2\0", b"cuDevicePrimaryCtxRelease\0"),
@@ -791,6 +826,81 @@ impl GpuBackend for CudaGpuBackend {
         }
         tracing::trace!(attrib, func, value, "CUDA func attribute queried");
         Ok(value)
+    }
+
+    // --- Occupancy operations ---
+
+    fn occupancy_max_active_blocks(
+        &self,
+        func: u64,
+        block_size: i32,
+        dynamic_smem_size: u64,
+        flags: u32,
+    ) -> Result<i32, CuResult> {
+        let mut num_blocks: i32 = 0;
+        if flags != 0 {
+            let f = require_fn(&self.api.cu_occupancy_max_active_blocks_with_flags)?;
+            unsafe {
+                map_cuda_result(f(
+                    &mut num_blocks,
+                    func as usize,
+                    block_size,
+                    dynamic_smem_size as usize,
+                    flags,
+                ))?;
+            }
+        } else {
+            let f = require_fn(&self.api.cu_occupancy_max_active_blocks)?;
+            unsafe {
+                map_cuda_result(f(
+                    &mut num_blocks,
+                    func as usize,
+                    block_size,
+                    dynamic_smem_size as usize,
+                ))?;
+            }
+        }
+        tracing::trace!(func, block_size, dynamic_smem_size, flags, num_blocks, "CUDA occupancy max active blocks");
+        Ok(num_blocks)
+    }
+
+    fn occupancy_max_potential_block_size(
+        &self,
+        func: u64,
+        dynamic_smem_size: u64,
+        block_size_limit: i32,
+        flags: u32,
+    ) -> Result<(i32, i32), CuResult> {
+        let mut min_grid_size: i32 = 0;
+        let mut block_size: i32 = 0;
+        if flags != 0 {
+            let f = require_fn(&self.api.cu_occupancy_max_potential_block_size_with_flags)?;
+            unsafe {
+                map_cuda_result(f(
+                    &mut min_grid_size,
+                    &mut block_size,
+                    func as usize,
+                    0, // NULL callback -- server never has the client's callback
+                    dynamic_smem_size as usize,
+                    block_size_limit,
+                    flags,
+                ))?;
+            }
+        } else {
+            let f = require_fn(&self.api.cu_occupancy_max_potential_block_size)?;
+            unsafe {
+                map_cuda_result(f(
+                    &mut min_grid_size,
+                    &mut block_size,
+                    func as usize,
+                    0, // NULL callback
+                    dynamic_smem_size as usize,
+                    block_size_limit,
+                ))?;
+            }
+        }
+        tracing::trace!(func, dynamic_smem_size, block_size_limit, flags, min_grid_size, block_size, "CUDA occupancy max potential block size");
+        Ok((min_grid_size, block_size))
     }
 
     // --- Stream operations ---

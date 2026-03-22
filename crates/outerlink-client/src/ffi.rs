@@ -1426,6 +1426,250 @@ pub extern "C" fn ol_cuFuncGetAttribute(pi: *mut i32, attrib: i32, func: u64) ->
 }
 
 // ---------------------------------------------------------------------------
+// Occupancy
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuOccupancyMaxActiveBlocksPerMultiprocessor(
+    num_blocks: *mut i32,
+    func: u64,
+    block_size: i32,
+    dynamic_smem_size: u64,
+) -> u32 {
+    let client = get_client();
+    if num_blocks.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = [0u8; 20];
+        payload[0..8].copy_from_slice(&remote_func.to_le_bytes());
+        payload[8..12].copy_from_slice(&block_size.to_le_bytes());
+        payload[12..20].copy_from_slice(&dynamic_smem_size.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(
+            MessageType::OccupancyMaxActiveBlocksPerMultiprocessor,
+            &payload,
+        ) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe { *num_blocks = i32::from_le_bytes(resp[4..8].try_into().unwrap()) };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback
+    if client.handles.functions.to_remote(func).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if block_size <= 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let blocks = std::cmp::min(2048 / block_size, 16);
+    unsafe { *num_blocks = std::cmp::max(blocks, 1) };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+    num_blocks: *mut i32,
+    func: u64,
+    block_size: i32,
+    dynamic_smem_size: u64,
+    flags: u32,
+) -> u32 {
+    let client = get_client();
+    if num_blocks.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = [0u8; 24];
+        payload[0..8].copy_from_slice(&remote_func.to_le_bytes());
+        payload[8..12].copy_from_slice(&block_size.to_le_bytes());
+        payload[12..20].copy_from_slice(&dynamic_smem_size.to_le_bytes());
+        payload[20..24].copy_from_slice(&flags.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(
+            MessageType::OccupancyMaxActiveBlocksPerMultiprocessorWithFlags,
+            &payload,
+        ) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe { *num_blocks = i32::from_le_bytes(resp[4..8].try_into().unwrap()) };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback
+    if client.handles.functions.to_remote(func).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if block_size <= 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let blocks = std::cmp::min(2048 / block_size, 16);
+    unsafe { *num_blocks = std::cmp::max(blocks, 1) };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuOccupancyMaxPotentialBlockSize(
+    min_grid_size: *mut i32,
+    block_size: *mut i32,
+    func: u64,
+    callback: *const std::ffi::c_void,
+    dynamic_smem_size: u64,
+    block_size_limit: i32,
+) -> u32 {
+    let client = get_client();
+    if min_grid_size.is_null() || block_size.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // If callback is non-NULL, compute locally with conservative defaults
+    if !callback.is_null() {
+        let bs = if block_size_limit > 0 && block_size_limit < 256 {
+            block_size_limit
+        } else {
+            256
+        };
+        let blocks_per_sm = 2048 / bs;
+        let num_sms = 82;
+        unsafe {
+            *block_size = bs;
+            *min_grid_size = blocks_per_sm * num_sms;
+        }
+        return CUDA_SUCCESS;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = [0u8; 20];
+        payload[0..8].copy_from_slice(&remote_func.to_le_bytes());
+        payload[8..16].copy_from_slice(&dynamic_smem_size.to_le_bytes());
+        payload[16..20].copy_from_slice(&block_size_limit.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(
+            MessageType::OccupancyMaxPotentialBlockSize,
+            &payload,
+        ) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                unsafe {
+                    *min_grid_size = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                    *block_size = i32::from_le_bytes(resp[8..12].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback
+    if client.handles.functions.to_remote(func).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let bs = if block_size_limit > 0 && block_size_limit < 256 {
+        block_size_limit
+    } else {
+        256
+    };
+    let blocks_per_sm = 2048 / bs;
+    let num_sms = 82;
+    unsafe {
+        *block_size = bs;
+        *min_grid_size = blocks_per_sm * num_sms;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuOccupancyMaxPotentialBlockSizeWithFlags(
+    min_grid_size: *mut i32,
+    block_size: *mut i32,
+    func: u64,
+    callback: *const std::ffi::c_void,
+    dynamic_smem_size: u64,
+    block_size_limit: i32,
+    flags: u32,
+) -> u32 {
+    let client = get_client();
+    if min_grid_size.is_null() || block_size.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // If callback is non-NULL, compute locally with conservative defaults
+    if !callback.is_null() {
+        let bs = if block_size_limit > 0 && block_size_limit < 256 {
+            block_size_limit
+        } else {
+            256
+        };
+        let blocks_per_sm = 2048 / bs;
+        let num_sms = 82;
+        unsafe {
+            *block_size = bs;
+            *min_grid_size = blocks_per_sm * num_sms;
+        }
+        return CUDA_SUCCESS;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = [0u8; 24];
+        payload[0..8].copy_from_slice(&remote_func.to_le_bytes());
+        payload[8..16].copy_from_slice(&dynamic_smem_size.to_le_bytes());
+        payload[16..20].copy_from_slice(&block_size_limit.to_le_bytes());
+        payload[20..24].copy_from_slice(&flags.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(
+            MessageType::OccupancyMaxPotentialBlockSizeWithFlags,
+            &payload,
+        ) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                unsafe {
+                    *min_grid_size = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                    *block_size = i32::from_le_bytes(resp[8..12].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback
+    if client.handles.functions.to_remote(func).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let bs = if block_size_limit > 0 && block_size_limit < 256 {
+        block_size_limit
+    } else {
+        256
+    };
+    let blocks_per_sm = 2048 / bs;
+    let num_sms = 82;
+    unsafe {
+        *block_size = bs;
+        *min_grid_size = blocks_per_sm * num_sms;
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // Stream management
 // ---------------------------------------------------------------------------
 
@@ -3754,6 +3998,188 @@ mod tests {
     #[test]
     fn test_ol_cu_ctx_get_flags_null_ptr() {
         let result = ol_cuCtxGetFlags(ptr::null_mut());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // --- Occupancy tests ---
+
+    /// Helper: create module + function for occupancy tests.
+    fn setup_func_for_occupancy() -> u64 {
+        let mut module: u64 = 0;
+        let data = b"ptx";
+        assert_eq!(
+            ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()),
+            CUDA_SUCCESS
+        );
+        let mut func: u64 = 0;
+        assert_eq!(
+            ol_cuModuleGetFunction(&mut func, module, b"kern\0".as_ptr() as *const i8),
+            CUDA_SUCCESS
+        );
+        func
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_active_blocks() {
+        let func = setup_func_for_occupancy();
+        let mut num_blocks: i32 = 0;
+        let result = ol_cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut num_blocks, func, 256, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(num_blocks, 8); // 2048/256
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_active_blocks_null_ptr() {
+        let func = setup_func_for_occupancy();
+        let result = ol_cuOccupancyMaxActiveBlocksPerMultiprocessor(ptr::null_mut(), func, 256, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_active_blocks_invalid_func() {
+        let mut num_blocks: i32 = 0;
+        let result = ol_cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut num_blocks, 0xDEAD, 256, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_active_blocks_zero_block_size() {
+        let func = setup_func_for_occupancy();
+        let mut num_blocks: i32 = 0;
+        let result = ol_cuOccupancyMaxActiveBlocksPerMultiprocessor(&mut num_blocks, func, 0, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_active_blocks_with_flags() {
+        let func = setup_func_for_occupancy();
+        let mut num_blocks: i32 = 0;
+        let result = ol_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(&mut num_blocks, func, 512, 0, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(num_blocks, 4); // 2048/512
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_active_blocks_with_flags_null_ptr() {
+        let result = ol_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(ptr::null_mut(), 1, 256, 0, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_potential_block_size() {
+        let func = setup_func_for_occupancy();
+        let mut min_grid: i32 = 0;
+        let mut block_sz: i32 = 0;
+        let result = ol_cuOccupancyMaxPotentialBlockSize(
+            &mut min_grid,
+            &mut block_sz,
+            func,
+            ptr::null(),
+            0,
+            0,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(block_sz, 256);
+        assert_eq!(min_grid, 656); // (2048/256)*82
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_potential_block_size_with_callback() {
+        let func = setup_func_for_occupancy();
+        let mut min_grid: i32 = 0;
+        let mut block_sz: i32 = 0;
+        // Non-NULL callback pointer -- should compute locally
+        let fake_callback = 0x1234usize as *const std::ffi::c_void;
+        let result = ol_cuOccupancyMaxPotentialBlockSize(
+            &mut min_grid,
+            &mut block_sz,
+            func,
+            fake_callback,
+            0,
+            0,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(block_sz, 256);
+        assert_eq!(min_grid, 656);
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_potential_block_size_null_ptrs() {
+        let result = ol_cuOccupancyMaxPotentialBlockSize(
+            ptr::null_mut(),
+            ptr::null_mut(),
+            1,
+            ptr::null(),
+            0,
+            0,
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_potential_block_size_with_limit() {
+        let func = setup_func_for_occupancy();
+        let mut min_grid: i32 = 0;
+        let mut block_sz: i32 = 0;
+        let result = ol_cuOccupancyMaxPotentialBlockSize(
+            &mut min_grid,
+            &mut block_sz,
+            func,
+            ptr::null(),
+            0,
+            128,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(block_sz, 128);
+        assert_eq!(min_grid, 1312); // (2048/128)*82
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_potential_block_size_with_flags() {
+        let func = setup_func_for_occupancy();
+        let mut min_grid: i32 = 0;
+        let mut block_sz: i32 = 0;
+        let result = ol_cuOccupancyMaxPotentialBlockSizeWithFlags(
+            &mut min_grid,
+            &mut block_sz,
+            func,
+            ptr::null(),
+            0,
+            0,
+            0,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(block_sz, 256);
+        assert_eq!(min_grid, 656);
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_potential_block_size_with_flags_null_ptrs() {
+        let result = ol_cuOccupancyMaxPotentialBlockSizeWithFlags(
+            ptr::null_mut(),
+            ptr::null_mut(),
+            1,
+            ptr::null(),
+            0,
+            0,
+            0,
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_max_potential_block_size_with_flags_invalid_func() {
+        let mut min_grid: i32 = 0;
+        let mut block_sz: i32 = 0;
+        let result = ol_cuOccupancyMaxPotentialBlockSizeWithFlags(
+            &mut min_grid,
+            &mut block_sz,
+            0xDEAD,
+            ptr::null(),
+            0,
+            0,
+            0,
+        );
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
     }
 }

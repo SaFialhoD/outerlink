@@ -102,6 +102,12 @@ pub enum MessageType {
     EventElapsedTime = 0x0074,
     EventQuery = 0x0075,
 
+    // Occupancy
+    OccupancyMaxActiveBlocksPerMultiprocessor = 0x0080,
+    OccupancyMaxActiveBlocksPerMultiprocessorWithFlags = 0x0081,
+    OccupancyMaxPotentialBlockSize = 0x0082,
+    OccupancyMaxPotentialBlockSizeWithFlags = 0x0083,
+
     // Context (extended)
     CtxGetStreamPriorityRange = 0x00A0,
     CtxGetFlags = 0x00A1,
@@ -177,6 +183,10 @@ impl MessageType {
             0x0073 => Some(Self::EventSynchronize),
             0x0074 => Some(Self::EventElapsedTime),
             0x0075 => Some(Self::EventQuery),
+            0x0080 => Some(Self::OccupancyMaxActiveBlocksPerMultiprocessor),
+            0x0081 => Some(Self::OccupancyMaxActiveBlocksPerMultiprocessorWithFlags),
+            0x0082 => Some(Self::OccupancyMaxPotentialBlockSize),
+            0x0083 => Some(Self::OccupancyMaxPotentialBlockSizeWithFlags),
             0x00A0 => Some(Self::CtxGetStreamPriorityRange),
             0x00A1 => Some(Self::CtxGetFlags),
             0x00F0 => Some(Self::Response),

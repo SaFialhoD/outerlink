@@ -156,6 +156,12 @@ static const hook_entry_t hook_table[] = {
     { "cuModuleGetGlobal_v2",    (void *)hook_cuModuleGetGlobal },
     { "cuFuncGetAttribute",      (void *)hook_cuFuncGetAttribute },
 
+    /* Occupancy */
+    { "cuOccupancyMaxActiveBlocksPerMultiprocessor", (void *)hook_cuOccupancyMaxActiveBlocksPerMultiprocessor },
+    { "cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags", (void *)hook_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags },
+    { "cuOccupancyMaxPotentialBlockSize", (void *)hook_cuOccupancyMaxPotentialBlockSize },
+    { "cuOccupancyMaxPotentialBlockSizeWithFlags", (void *)hook_cuOccupancyMaxPotentialBlockSizeWithFlags },
+
     /* Stream */
     { "cuStreamCreate",          (void *)hook_cuStreamCreate },
     { "cuStreamCreateWithPriority", (void *)hook_cuStreamCreateWithPriority },
@@ -642,6 +648,51 @@ CUresult hook_cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod,
 CUresult hook_cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc) {
     ensure_init();
     return ol_cuFuncGetAttribute(pi, (int)attrib, (unsigned long long)(uintptr_t)hfunc);
+}
+
+/* -- Occupancy -- */
+
+CUresult hook_cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize) {
+    ensure_init();
+    return ol_cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        numBlocks,
+        (unsigned long long)(uintptr_t)func,
+        blockSize,
+        (unsigned long long)dynamicSMemSize);
+}
+
+CUresult hook_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize, unsigned int flags) {
+    ensure_init();
+    return ol_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+        numBlocks,
+        (unsigned long long)(uintptr_t)func,
+        blockSize,
+        (unsigned long long)dynamicSMemSize,
+        flags);
+}
+
+CUresult hook_cuOccupancyMaxPotentialBlockSize(int *minGridSize, int *blockSize, CUfunction func, CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize, int blockSizeLimit) {
+    ensure_init();
+    /* Pass the callback pointer through as void* -- Rust checks if it's null */
+    return ol_cuOccupancyMaxPotentialBlockSize(
+        minGridSize,
+        blockSize,
+        (unsigned long long)(uintptr_t)func,
+        (const void *)blockSizeToDynamicSMemSize,
+        (unsigned long long)dynamicSMemSize,
+        blockSizeLimit);
+}
+
+CUresult hook_cuOccupancyMaxPotentialBlockSizeWithFlags(int *minGridSize, int *blockSize, CUfunction func, CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize, int blockSizeLimit, unsigned int flags) {
+    ensure_init();
+    return ol_cuOccupancyMaxPotentialBlockSizeWithFlags(
+        minGridSize,
+        blockSize,
+        (unsigned long long)(uintptr_t)func,
+        (const void *)blockSizeToDynamicSMemSize,
+        (unsigned long long)dynamicSMemSize,
+        blockSizeLimit,
+        flags);
 }
 
 /* -- Stream -- */

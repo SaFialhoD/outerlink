@@ -97,6 +97,31 @@ pub trait GpuBackend: Send + Sync {
     /// Returns the attribute value on success.
     fn func_get_attribute(&self, attrib: i32, func: u64) -> Result<i32, CuResult>;
 
+    // --- Occupancy operations ---
+
+    /// Compute max active blocks per SM for a given function and block size.
+    ///
+    /// `flags` is passed for the WithFlags variant (0 for the plain variant).
+    fn occupancy_max_active_blocks(
+        &self,
+        func: u64,
+        block_size: i32,
+        dynamic_smem_size: u64,
+        flags: u32,
+    ) -> Result<i32, CuResult>;
+
+    /// Compute optimal block size and minimum grid size for a function.
+    ///
+    /// `flags` is passed for the WithFlags variant (0 for the plain variant).
+    /// Returns `(min_grid_size, block_size)`.
+    fn occupancy_max_potential_block_size(
+        &self,
+        func: u64,
+        dynamic_smem_size: u64,
+        block_size_limit: i32,
+        flags: u32,
+    ) -> Result<(i32, i32), CuResult>;
+
     // --- Stream operations ---
 
     /// Create a new CUDA stream with the given flags.
@@ -649,6 +674,51 @@ impl GpuBackend for StubGpuBackend {
             _ => return Err(CuResult::InvalidValue),
         };
         Ok(val)
+    }
+
+    // --- Occupancy operations ---
+
+    fn occupancy_max_active_blocks(
+        &self,
+        func: u64,
+        block_size: i32,
+        _dynamic_smem_size: u64,
+        _flags: u32,
+    ) -> Result<i32, CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.functions.contains_key(&func) {
+            return Err(CuResult::InvalidValue);
+        }
+        if block_size <= 0 {
+            return Err(CuResult::InvalidValue);
+        }
+        // Simplified Ampere occupancy model:
+        // max_threads_per_sm=2048, max_blocks_per_sm=16
+        let blocks = std::cmp::min(2048 / block_size, 16);
+        Ok(std::cmp::max(blocks, 1))
+    }
+
+    fn occupancy_max_potential_block_size(
+        &self,
+        func: u64,
+        _dynamic_smem_size: u64,
+        block_size_limit: i32,
+        _flags: u32,
+    ) -> Result<(i32, i32), CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.functions.contains_key(&func) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Safe default: blockSize=256, numSMs=82 (3090 stub)
+        let block_size = if block_size_limit > 0 && block_size_limit < 256 {
+            block_size_limit
+        } else {
+            256
+        };
+        let num_sms = 82;
+        let blocks_per_sm = 2048 / block_size;
+        let min_grid_size = blocks_per_sm * num_sms;
+        Ok((min_grid_size, block_size))
     }
 
     // --- Stream operations ---
@@ -2235,5 +2305,107 @@ mod tests {
     fn test_ctx_get_flags_invalid_context() {
         let gpu = StubGpuBackend::new();
         assert_eq!(gpu.ctx_get_flags(0xDEAD), Err(CuResult::InvalidContext));
+    }
+
+    // --- Occupancy tests ---
+
+    /// Helper: create a module + function in the stub.
+    fn setup_func(gpu: &StubGpuBackend) -> u64 {
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        gpu.module_get_function(module, "kern").unwrap()
+    }
+
+    #[test]
+    fn test_occupancy_max_active_blocks_basic() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_func(&gpu);
+        // block_size=256 => 2048/256=8, min(8,16)=8
+        let blocks = gpu.occupancy_max_active_blocks(func, 256, 0, 0).unwrap();
+        assert_eq!(blocks, 8);
+    }
+
+    #[test]
+    fn test_occupancy_max_active_blocks_large_block() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_func(&gpu);
+        // block_size=1024 => 2048/1024=2, min(2,16)=2
+        let blocks = gpu.occupancy_max_active_blocks(func, 1024, 0, 0).unwrap();
+        assert_eq!(blocks, 2);
+    }
+
+    #[test]
+    fn test_occupancy_max_active_blocks_small_block() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_func(&gpu);
+        // block_size=32 => 2048/32=64, min(64,16)=16
+        let blocks = gpu.occupancy_max_active_blocks(func, 32, 0, 0).unwrap();
+        assert_eq!(blocks, 16);
+    }
+
+    #[test]
+    fn test_occupancy_max_active_blocks_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.occupancy_max_active_blocks(0xDEAD, 256, 0, 0),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_occupancy_max_active_blocks_zero_block_size() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_func(&gpu);
+        assert_eq!(
+            gpu.occupancy_max_active_blocks(func, 0, 0, 0),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_occupancy_max_active_blocks_negative_block_size() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_func(&gpu);
+        assert_eq!(
+            gpu.occupancy_max_active_blocks(func, -1, 0, 0),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_occupancy_max_potential_block_size_basic() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_func(&gpu);
+        let (min_grid, block_sz) = gpu.occupancy_max_potential_block_size(func, 0, 0, 0).unwrap();
+        assert_eq!(block_sz, 256);
+        // 2048/256=8 blocks/SM * 82 SMs = 656
+        assert_eq!(min_grid, 656);
+    }
+
+    #[test]
+    fn test_occupancy_max_potential_block_size_with_limit() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_func(&gpu);
+        let (min_grid, block_sz) = gpu.occupancy_max_potential_block_size(func, 0, 128, 0).unwrap();
+        assert_eq!(block_sz, 128);
+        // 2048/128=16 blocks/SM * 82 SMs = 1312
+        assert_eq!(min_grid, 1312);
+    }
+
+    #[test]
+    fn test_occupancy_max_potential_block_size_large_limit() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_func(&gpu);
+        // limit > 256 => uses default 256
+        let (_, block_sz) = gpu.occupancy_max_potential_block_size(func, 0, 512, 0).unwrap();
+        assert_eq!(block_sz, 256);
+    }
+
+    #[test]
+    fn test_occupancy_max_potential_block_size_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.occupancy_max_potential_block_size(0xDEAD, 0, 0, 0),
+            Err(CuResult::InvalidValue)
+        );
     }
 }
