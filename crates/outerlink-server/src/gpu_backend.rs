@@ -221,7 +221,7 @@ pub trait GpuBackend: Send + Sync {
     fn ctx_get_stream_priority_range(&self) -> Result<(i32, i32), CuResult>;
 
     /// Get the flags of the current context.
-    fn ctx_get_flags(&self) -> Result<u32, CuResult>;
+    fn ctx_get_flags(&self, ctx: u64) -> Result<u32, CuResult>;
 
     // --- Lifecycle ---
 
@@ -1006,9 +1006,12 @@ impl GpuBackend for StubGpuBackend {
         Ok((0, -1))
     }
 
-    fn ctx_get_flags(&self) -> Result<u32, CuResult> {
-        // Default flags (CU_CTX_SCHED_AUTO = 0)
-        Ok(0)
+    fn ctx_get_flags(&self, ctx: u64) -> Result<u32, CuResult> {
+        let state = self.state.lock().unwrap();
+        match state.contexts.get(&ctx) {
+            Some(c) => Ok(c.flags),
+            None => Err(CuResult::InvalidContext),
+        }
     }
 
     fn shutdown(&self) {
@@ -2217,6 +2220,20 @@ mod tests {
     #[test]
     fn test_ctx_get_flags() {
         let gpu = StubGpuBackend::new();
-        assert_eq!(gpu.ctx_get_flags().unwrap(), 0);
+        let ctx = gpu.ctx_create(0x01, 0).unwrap();
+        assert_eq!(gpu.ctx_get_flags(ctx).unwrap(), 0x01);
+    }
+
+    #[test]
+    fn test_ctx_get_flags_default() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        assert_eq!(gpu.ctx_get_flags(ctx).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_ctx_get_flags_invalid_context() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_get_flags(0xDEAD), Err(CuResult::InvalidContext));
     }
 }

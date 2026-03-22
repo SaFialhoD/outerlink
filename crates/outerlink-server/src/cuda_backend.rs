@@ -1137,7 +1137,7 @@ impl GpuBackend for CudaGpuBackend {
         Ok((least, greatest))
     }
 
-    fn ctx_get_flags(&self) -> Result<u32, CuResult> {
+    fn ctx_get_flags(&self, _ctx: u64) -> Result<u32, CuResult> {
         let func = require_fn(&self.api.cu_ctx_get_flags)?;
         let mut flags: u32 = 0;
         unsafe {

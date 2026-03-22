@@ -366,7 +366,7 @@ pub fn handle_request(
             }
         }
 
-        MessageType::CtxGetFlags => match backend.ctx_get_flags() {
+        MessageType::CtxGetFlags => match backend.ctx_get_flags(session.current_ctx()) {
             Ok(flags) => success_with(rid, &flags.to_le_bytes()),
             Err(e) => error_response(rid, e),
         },
@@ -3023,10 +3023,22 @@ mod tests {
     #[test]
     fn test_ctx_get_flags_handler() {
         let gpu = StubGpuBackend::new();
+        // Create a context with flags=0x01 (CU_CTX_SCHED_SPIN)
+        let ctx = gpu.ctx_create(0x01, 0).unwrap();
+        let mut session = ConnectionSession::new();
+        session.set_current_ctx(ctx);
         let hdr = req(MessageType::CtxGetFlags, 0);
-        let (_, resp) = dispatch(&gpu, &hdr, &[]);
+        let (_, resp) = handle_request(&gpu, &hdr, &[], &mut session);
         assert_eq!(response_result(&resp), CuResult::Success);
         let flags = u32::from_le_bytes(resp[4..8].try_into().unwrap());
-        assert_eq!(flags, 0);
+        assert_eq!(flags, 0x01);
+    }
+
+    #[test]
+    fn test_ctx_get_flags_no_current_context() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxGetFlags, 0);
+        let (_, resp) = dispatch(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&resp), CuResult::InvalidContext);
     }
 }
