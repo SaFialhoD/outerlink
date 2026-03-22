@@ -262,6 +262,21 @@ pub trait GpuBackend: Send + Sync {
     /// Disable peer access previously enabled via `ctx_enable_peer_access`.
     fn ctx_disable_peer_access(&self, peer_ctx: u64) -> Result<(), CuResult>;
 
+    // --- Pointer attribute queries ---
+
+    /// Get a single attribute of a device or host pointer.
+    ///
+    /// `attribute` is the raw `CUpointer_attribute` value:
+    ///   1=CONTEXT, 2=MEMORY_TYPE, 3=DEVICE_POINTER, 4=HOST_POINTER,
+    ///   6=IS_MANAGED, 8=DEVICE_ORDINAL.
+    /// Returns the attribute value as u64 on success.
+    fn pointer_get_attribute(&self, attribute: i32, ptr: u64) -> Result<u64, CuResult>;
+
+    /// Get multiple attributes of a pointer in one call.
+    ///
+    /// Returns a Vec of u64 values, one per requested attribute, in order.
+    fn pointer_get_attributes(&self, attributes: &[i32], ptr: u64) -> Result<Vec<u64>, CuResult>;
+
     // --- Lifecycle ---
 
     // --- Context stack & query operations ---
@@ -797,6 +812,44 @@ impl GpuBackend for StubGpuBackend {
         let blocks_per_sm = STUB_MAX_THREADS_PER_SM / block_size;
         let min_grid_size = blocks_per_sm * STUB_NUM_SMS;
         Ok((min_grid_size, block_size))
+    }
+
+    // --- Pointer attribute queries ---
+
+    fn pointer_get_attribute(&self, attribute: i32, ptr: u64) -> Result<u64, CuResult> {
+        let state = self.state.lock().unwrap();
+        let is_device = state.allocations.contains_key(&ptr);
+        let is_host = state.host_allocations.contains_key(&ptr);
+        if !is_device && !is_host {
+            return Err(CuResult::InvalidValue);
+        }
+        let val = match attribute {
+            1 => 0u64,                          // CONTEXT: stub doesn't track
+            2 => if is_device { 2 } else { 1 }, // MEMORY_TYPE: DEVICE=2, HOST=1
+            3 => if is_device { ptr } else { 0 }, // DEVICE_POINTER
+            4 => if is_host { ptr } else { 0 },   // HOST_POINTER
+            6 => 0,                              // IS_MANAGED: no managed memory
+            8 => 0,                              // DEVICE_ORDINAL: always 0
+            _ => return Err(CuResult::InvalidValue),
+        };
+        Ok(val)
+    }
+
+    fn pointer_get_attributes(&self, attributes: &[i32], ptr: u64) -> Result<Vec<u64>, CuResult> {
+        // Validate the pointer exists before iterating
+        {
+            let state = self.state.lock().unwrap();
+            let is_device = state.allocations.contains_key(&ptr);
+            let is_host = state.host_allocations.contains_key(&ptr);
+            if !is_device && !is_host {
+                return Err(CuResult::InvalidValue);
+            }
+        }
+        let mut results = Vec::with_capacity(attributes.len());
+        for &attr in attributes {
+            results.push(self.pointer_get_attribute(attr, ptr)?);
+        }
+        Ok(results)
     }
 
     // --- Stream operations ---
@@ -2695,5 +2748,98 @@ mod tests {
         let ptr = gpu.mem_alloc(4096).unwrap();
         // Interior pointer (ptr + 100) is not the base, stub doesn't support this
         assert_eq!(gpu.mem_get_address_range(ptr + 100), Err(CuResult::InvalidValue));
+    }
+
+    // --- Pointer attribute tests ---
+
+    #[test]
+    fn test_pointer_get_attribute_memory_type_device() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(1024).unwrap();
+        let val = gpu.pointer_get_attribute(2, ptr).unwrap(); // MEMORY_TYPE
+        assert_eq!(val, 2); // CU_MEMORYTYPE_DEVICE
+        let _ = gpu.mem_free(ptr);
+    }
+
+    #[test]
+    fn test_pointer_get_attribute_memory_type_host() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_host(1024).unwrap();
+        let val = gpu.pointer_get_attribute(2, ptr).unwrap(); // MEMORY_TYPE
+        assert_eq!(val, 1); // CU_MEMORYTYPE_HOST
+        let _ = gpu.mem_free_host(ptr);
+    }
+
+    #[test]
+    fn test_pointer_get_attribute_memory_type_unknown() {
+        let gpu = StubGpuBackend::new();
+        let result = gpu.pointer_get_attribute(2, 0xDEAD_BEEF);
+        assert_eq!(result, Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_pointer_get_attribute_device_pointer() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(512).unwrap();
+        let val = gpu.pointer_get_attribute(3, ptr).unwrap(); // DEVICE_POINTER
+        assert_eq!(val, ptr);
+        let _ = gpu.mem_free(ptr);
+    }
+
+    #[test]
+    fn test_pointer_get_attribute_host_pointer() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(512).unwrap();
+        let val = gpu.pointer_get_attribute(4, ptr).unwrap(); // HOST_POINTER
+        assert_eq!(val, 0); // device pointers have no host pointer
+        let _ = gpu.mem_free(ptr);
+    }
+
+    #[test]
+    fn test_pointer_get_attribute_context() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(256).unwrap();
+        let val = gpu.pointer_get_attribute(1, ptr).unwrap(); // CONTEXT
+        assert_eq!(val, 0); // stub doesn't track allocation context
+        let _ = gpu.mem_free(ptr);
+    }
+
+    #[test]
+    fn test_pointer_get_attribute_is_managed() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(256).unwrap();
+        let val = gpu.pointer_get_attribute(6, ptr).unwrap(); // IS_MANAGED
+        assert_eq!(val, 0); // no managed memory in stub
+        let _ = gpu.mem_free(ptr);
+    }
+
+    #[test]
+    fn test_pointer_get_attribute_device_ordinal() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(256).unwrap();
+        let val = gpu.pointer_get_attribute(8, ptr).unwrap(); // DEVICE_ORDINAL
+        assert_eq!(val, 0);
+        let _ = gpu.mem_free(ptr);
+    }
+
+    #[test]
+    fn test_pointer_get_attributes_multiple() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc(1024).unwrap();
+        // Query MEMORY_TYPE(2) and DEVICE_POINTER(3) and DEVICE_ORDINAL(8)
+        let attrs = vec![2, 3, 8];
+        let vals = gpu.pointer_get_attributes(&attrs, ptr).unwrap();
+        assert_eq!(vals.len(), 3);
+        assert_eq!(vals[0], 2); // DEVICE
+        assert_eq!(vals[1], ptr); // device pointer value
+        assert_eq!(vals[2], 0); // ordinal 0
+        let _ = gpu.mem_free(ptr);
+    }
+
+    #[test]
+    fn test_pointer_get_attributes_unknown_ptr() {
+        let gpu = StubGpuBackend::new();
+        let result = gpu.pointer_get_attributes(&[2], 0xDEAD);
+        assert_eq!(result, Err(CuResult::InvalidValue));
     }
 }

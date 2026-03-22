@@ -130,6 +130,16 @@ typedef enum {
     CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE = 15,
 } CUfunction_attribute;
 
+/* Pointer attributes */
+typedef enum {
+    CU_POINTER_ATTRIBUTE_CONTEXT = 1,
+    CU_POINTER_ATTRIBUTE_MEMORY_TYPE = 2,
+    CU_POINTER_ATTRIBUTE_DEVICE_POINTER = 3,
+    CU_POINTER_ATTRIBUTE_HOST_POINTER = 4,
+    CU_POINTER_ATTRIBUTE_IS_MANAGED = 6,
+    CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL = 8,
+} CUpointer_attribute;
+
 /* Memory copy direction */
 typedef enum {
     CU_MEMORYTYPE_HOST = 0x01,
@@ -212,6 +222,10 @@ CUresult cuModuleGetGlobal_v2(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, c
 CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc);
 CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value);
 CUresult cuMemGetAddressRange_v2(CUdeviceptr *pbase, size_t *psize, CUdeviceptr dptr);
+
+/* Function declarations - Pointer attributes */
+CUresult cuPointerGetAttribute(void *data, CUpointer_attribute attribute, CUdeviceptr devPtr);
+CUresult cuPointerGetAttributes(unsigned int numAttributes, CUpointer_attribute *attributes, void **data, CUdeviceptr ptr);
 
 /* Function declarations - Occupancy */
 CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize);

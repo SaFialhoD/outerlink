@@ -162,6 +162,12 @@ type FnCuOccupancyMaxPotentialBlockSizeWithFlags =
         flags: u32,
     ) -> i32;
 
+// Pointer attribute queries
+type FnCuPointerGetAttribute =
+    unsafe extern "C" fn(data: *mut std::ffi::c_void, attribute: i32, ptr: u64) -> i32;
+type FnCuPointerGetAttributes =
+    unsafe extern "C" fn(num_attributes: u32, attributes: *const i32, data: *mut *mut std::ffi::c_void, ptr: u64) -> i32;
+
 // Primary context operations
 type FnCuDevicePrimaryCtxRetain = unsafe extern "C" fn(pctx: *mut usize, dev: i32) -> i32;
 type FnCuDevicePrimaryCtxRelease = unsafe extern "C" fn(dev: i32) -> i32;
@@ -263,6 +269,9 @@ struct CudaApi {
     cu_occupancy_max_active_blocks_with_flags: Option<FnCuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags>,
     cu_occupancy_max_potential_block_size: Option<FnCuOccupancyMaxPotentialBlockSize>,
     cu_occupancy_max_potential_block_size_with_flags: Option<FnCuOccupancyMaxPotentialBlockSizeWithFlags>,
+
+    cu_pointer_get_attribute: Option<FnCuPointerGetAttribute>,
+    cu_pointer_get_attributes: Option<FnCuPointerGetAttributes>,
 
     cu_device_can_access_peer: Option<FnCuDeviceCanAccessPeer>,
     cu_device_get_p2p_attribute: Option<FnCuDeviceGetP2PAttribute>,
@@ -401,6 +410,9 @@ impl CudaApi {
             cu_occupancy_max_active_blocks_with_flags: load_sym!(lib, b"cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags\0"),
             cu_occupancy_max_potential_block_size: load_sym!(lib, b"cuOccupancyMaxPotentialBlockSize\0"),
             cu_occupancy_max_potential_block_size_with_flags: load_sym!(lib, b"cuOccupancyMaxPotentialBlockSizeWithFlags\0"),
+
+            cu_pointer_get_attribute: load_sym!(lib, b"cuPointerGetAttribute\0"),
+            cu_pointer_get_attributes: load_sym!(lib, b"cuPointerGetAttributes\0"),
 
             cu_device_can_access_peer: load_sym!(lib, b"cuDeviceCanAccessPeer\0"),
             cu_device_get_p2p_attribute: load_sym!(lib, b"cuDeviceGetP2PAttribute\0"),
@@ -951,6 +963,34 @@ impl GpuBackend for CudaGpuBackend {
         }
         tracing::trace!(func, dynamic_smem_size, block_size_limit, flags, min_grid_size, block_size, "CUDA occupancy max potential block size");
         Ok((min_grid_size, block_size))
+    }
+
+    // --- Pointer attribute queries ---
+
+    fn pointer_get_attribute(&self, attribute: i32, ptr: u64) -> Result<u64, CuResult> {
+        let f = require_fn(&self.api.cu_pointer_get_attribute)?;
+        let mut value: u64 = 0;
+        unsafe {
+            map_cuda_result(f(
+                &mut value as *mut u64 as *mut std::ffi::c_void,
+                attribute,
+                ptr,
+            ))?;
+        }
+        tracing::trace!(attribute, ptr, value, "CUDA pointer attribute queried");
+        Ok(value)
+    }
+
+    fn pointer_get_attributes(&self, attributes: &[i32], ptr: u64) -> Result<Vec<u64>, CuResult> {
+        // For the real CUDA backend, query each attribute individually.
+        // cuPointerGetAttributes has a complex void** interface that varies
+        // by attribute type; iterating with cuPointerGetAttribute is simpler
+        // and equally correct.
+        let mut results = Vec::with_capacity(attributes.len());
+        for &attr in attributes {
+            results.push(self.pointer_get_attribute(attr, ptr)?);
+        }
+        Ok(results)
     }
 
     // --- Stream operations ---
