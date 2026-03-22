@@ -81,6 +81,7 @@ pub enum MessageType {
     ModuleGetGlobal = 0x0043,
     ModuleLoadDataEx = 0x0044,
     FuncGetAttribute = 0x0045,
+    FuncSetAttribute = 0x0046,
 
     // Execution
     LaunchKernel = 0x0050,
@@ -113,6 +114,9 @@ pub enum MessageType {
     // Peer access
     CtxEnablePeerAccess = 0x0090,
     CtxDisablePeerAccess = 0x0091,
+
+    // Memory (extended)
+    MemGetAddressRange = 0x00B2,
 
     // Context (extended)
     CtxGetStreamPriorityRange = 0x00A0,
@@ -175,6 +179,7 @@ impl MessageType {
             0x0043 => Some(Self::ModuleGetGlobal),
             0x0044 => Some(Self::ModuleLoadDataEx),
             0x0045 => Some(Self::FuncGetAttribute),
+            0x0046 => Some(Self::FuncSetAttribute),
             0x0050 => Some(Self::LaunchKernel),
             0x0060 => Some(Self::StreamCreate),
             0x0061 => Some(Self::StreamDestroy),
@@ -197,6 +202,7 @@ impl MessageType {
             0x0083 => Some(Self::OccupancyMaxPotentialBlockSizeWithFlags),
             0x0090 => Some(Self::CtxEnablePeerAccess),
             0x0091 => Some(Self::CtxDisablePeerAccess),
+            0x00B2 => Some(Self::MemGetAddressRange),
             0x00A0 => Some(Self::CtxGetStreamPriorityRange),
             0x00A1 => Some(Self::CtxGetFlags),
             0x00F0 => Some(Self::Response),

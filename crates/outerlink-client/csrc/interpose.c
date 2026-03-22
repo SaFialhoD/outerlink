@@ -161,6 +161,9 @@ static const hook_entry_t hook_table[] = {
     { "cuModuleGetFunction",     (void *)hook_cuModuleGetFunction },
     { "cuModuleGetGlobal_v2",    (void *)hook_cuModuleGetGlobal },
     { "cuFuncGetAttribute",      (void *)hook_cuFuncGetAttribute },
+    { "cuFuncSetAttribute",      (void *)hook_cuFuncSetAttribute },
+    { "cuMemGetAddressRange",    (void *)hook_cuMemGetAddressRange },
+    { "cuMemGetAddressRange_v2", (void *)hook_cuMemGetAddressRange },
 
     /* Occupancy */
     { "cuOccupancyMaxActiveBlocksPerMultiprocessor", (void *)hook_cuOccupancyMaxActiveBlocksPerMultiprocessor },
@@ -676,6 +679,26 @@ CUresult hook_cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod,
 CUresult hook_cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc) {
     ensure_init();
     return ol_cuFuncGetAttribute(pi, (int)attrib, (unsigned long long)(uintptr_t)hfunc);
+}
+
+CUresult hook_cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) {
+    ensure_init();
+    return ol_cuFuncSetAttribute((unsigned long long)(uintptr_t)hfunc, (int)attrib, value);
+}
+
+CUresult hook_cuMemGetAddressRange(CUdeviceptr *pbase, size_t *psize, CUdeviceptr dptr) {
+    ensure_init();
+    unsigned long long base_u64 = 0;
+    size_t size_out = 0;
+    CUresult r = ol_cuMemGetAddressRange_v2(
+        pbase ? &base_u64 : NULL,
+        psize ? &size_out : NULL,
+        (unsigned long long)dptr);
+    if (r == CUDA_SUCCESS) {
+        if (pbase) *pbase = (CUdeviceptr)base_u64;
+        if (psize) *psize = size_out;
+    }
+    return r;
 }
 
 /* -- Occupancy -- */

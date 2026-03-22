@@ -210,6 +210,8 @@ CUresult cuModuleUnload(CUmodule hmod);
 CUresult cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name);
 CUresult cuModuleGetGlobal_v2(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name);
 CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc);
+CUresult cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value);
+CUresult cuMemGetAddressRange_v2(CUdeviceptr *pbase, size_t *psize, CUdeviceptr dptr);
 
 /* Function declarations - Occupancy */
 CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize);

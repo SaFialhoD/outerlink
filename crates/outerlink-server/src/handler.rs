@@ -83,6 +83,8 @@ fn error_response(request_id: u64, err: CuResult) -> (MessageHeader, Vec<u8>) {
 /// | CtxEnablePeerAccess     | u64 peerCtx, u32 flags| (empty)                               |
 /// | CtxDisablePeerAccess    | u64 peerCtx           | (empty)                               |
 /// | FuncGetAttribute        | i32 attrib, u64 func | i32 value                             |
+/// | FuncSetAttribute        | u64 func, i32 attrib, i32 value | (empty)                      |
+/// | MemGetAddressRange      | u64 dptr             | u64 base, u64 size                    |
 /// | OccupancyMaxActiveBlocks| u64 func, i32 blockSize, u64 dynSmem = 20B | i32 numBlocks |
 /// | OccupancyMaxActiveBlocksWithFlags| u64 func, i32 blockSize, u64 dynSmem, u32 flags = 24B | i32 numBlocks |
 /// | OccupancyMaxPotentialBlockSize| u64 func, u64 dynSmem, i32 limit = 20B | i32 minGridSize, i32 blockSize |
@@ -583,6 +585,36 @@ pub fn handle_request(
             let func = u64::from_le_bytes(payload[4..12].try_into().unwrap());
             match backend.func_get_attribute(attrib, func) {
                 Ok(val) => success_with(rid, &val.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::FuncSetAttribute => {
+            // Payload: 8B func (u64 LE) + 4B attrib (i32 LE) + 4B value (i32 LE) = 16 bytes
+            if payload.len() < 16 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let func = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let attrib = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let value = i32::from_le_bytes(payload[12..16].try_into().unwrap());
+            match backend.func_set_attribute(func, attrib, value) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemGetAddressRange => {
+            // Payload: 8B dptr (u64 LE) = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let dptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.mem_get_address_range(dptr) {
+                Ok((base, size)) => {
+                    let mut data = base.to_le_bytes().to_vec();
+                    data.extend_from_slice(&(size as u64).to_le_bytes());
+                    success_with(rid, &data)
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -3468,6 +3500,104 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let hdr = req(MessageType::CtxDisablePeerAccess, 4);
         let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- FuncSetAttribute handler tests ---
+
+    #[test]
+    fn test_func_set_attribute_handler() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // Set MAX_DYNAMIC_SHARED_SIZE_BYTES (attrib 8) = 65536
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&8i32.to_le_bytes());
+        payload.extend_from_slice(&65536i32.to_le_bytes());
+        let hdr = req(MessageType::FuncSetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Verify via FuncGetAttribute
+        let mut get_payload = 8i32.to_le_bytes().to_vec();
+        get_payload.extend_from_slice(&func.to_le_bytes());
+        let hdr2 = req(MessageType::FuncGetAttribute, get_payload.len() as u32);
+        let (_, resp2) = dispatch(&gpu, &hdr2, &get_payload);
+        assert_eq!(response_result(&resp2), CuResult::Success);
+        let val = i32::from_le_bytes(resp2[4..8].try_into().unwrap());
+        assert_eq!(val, 65536);
+    }
+
+    #[test]
+    fn test_func_set_attribute_read_only_rejected() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // attrib 0 = MAX_THREADS_PER_BLOCK (read-only)
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.extend_from_slice(&512i32.to_le_bytes());
+        let hdr = req(MessageType::FuncSetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_func_set_attribute_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 0xDEADu64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&8i32.to_le_bytes());
+        payload.extend_from_slice(&100i32.to_le_bytes());
+        let hdr = req(MessageType::FuncSetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_func_set_attribute_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 10]; // need 16
+        let hdr = req(MessageType::FuncSetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- MemGetAddressRange handler tests ---
+
+    #[test]
+    fn test_mem_get_address_range_handler() {
+        let gpu = StubGpuBackend::new();
+        // Allocate memory via handler
+        let alloc_payload = 4096u64.to_le_bytes();
+        let hdr = req(MessageType::MemAlloc, alloc_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &alloc_payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let devptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Query address range
+        let range_payload = devptr.to_le_bytes();
+        let hdr2 = req(MessageType::MemGetAddressRange, range_payload.len() as u32);
+        let (_, resp2) = dispatch(&gpu, &hdr2, &range_payload);
+        assert_eq!(response_result(&resp2), CuResult::Success);
+        let base = u64::from_le_bytes(resp2[4..12].try_into().unwrap());
+        let size = u64::from_le_bytes(resp2[12..20].try_into().unwrap());
+        assert_eq!(base, devptr);
+        assert_eq!(size, 4096);
+    }
+
+    #[test]
+    fn test_mem_get_address_range_unknown_ptr() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xDEADu64.to_le_bytes();
+        let hdr = req(MessageType::MemGetAddressRange, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_mem_get_address_range_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 4]; // need 8
+        let hdr = req(MessageType::MemGetAddressRange, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }
