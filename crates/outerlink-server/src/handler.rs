@@ -6386,6 +6386,11 @@ mod tests {
     fn test_handler_mem_alloc_managed_short_payload() {
         let gpu = StubGpuBackend::new();
         let hdr = req(MessageType::MemAllocManaged, 4);
+        let payload = 1024u64.to_le_bytes()[..4].to_vec(); // too short (need 12)
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
     // -----------------------------------------------------------------------
     // Library API (CUDA 12+) tests
     // -----------------------------------------------------------------------
@@ -6593,6 +6598,10 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let hdr = req(MessageType::MemRangeGetAttributes, 12);
         let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 12]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
     fn test_library_load_data_too_many_jit_options() {
         let gpu = StubGpuBackend::new();
         let mut payload = Vec::new();
