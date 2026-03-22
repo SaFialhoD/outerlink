@@ -323,6 +323,9 @@ impl ConnectionSession {
         }
 
         // 5.5. Peer access (disable before contexts are destroyed)
+        // Note: ctx_disable_peer_access may fail if the peer context was already
+        // destroyed by another session closing concurrently. That is expected
+        // behavior -- we log the warning but do not treat it as fatal.
         for peer_ctx in self.peer_access_ctxs.drain() {
             match backend.ctx_disable_peer_access(peer_ctx) {
                 Ok(()) => {

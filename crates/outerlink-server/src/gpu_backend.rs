@@ -10,6 +10,17 @@ use std::sync::Mutex;
 
 use outerlink_common::cuda_types::CuResult;
 
+// ---------------------------------------------------------------------------
+// Occupancy stub constants (Ampere / GA102 defaults)
+// ---------------------------------------------------------------------------
+
+/// Number of SMs on the stub GPU (RTX 3090 = 82 SMs).
+const STUB_NUM_SMS: i32 = 82;
+/// Maximum resident threads per SM on Ampere.
+const STUB_MAX_THREADS_PER_SM: i32 = 2048;
+/// Maximum resident blocks per SM on Ampere.
+const STUB_MAX_BLOCKS_PER_SM: i32 = 16;
+
 /// Trait abstracting GPU operations.
 ///
 /// Real implementations load `libcuda.so` / `nvcuda.dll` via `libloading`
@@ -712,9 +723,8 @@ impl GpuBackend for StubGpuBackend {
         if block_size <= 0 {
             return Err(CuResult::InvalidValue);
         }
-        // Simplified Ampere occupancy model:
-        // max_threads_per_sm=2048, max_blocks_per_sm=16
-        let blocks = std::cmp::min(2048 / block_size, 16);
+        // Simplified Ampere occupancy model
+        let blocks = std::cmp::min(STUB_MAX_THREADS_PER_SM / block_size, STUB_MAX_BLOCKS_PER_SM);
         Ok(std::cmp::max(blocks, 1))
     }
 
@@ -729,15 +739,14 @@ impl GpuBackend for StubGpuBackend {
         if !state.functions.contains_key(&func) {
             return Err(CuResult::InvalidValue);
         }
-        // Safe default: blockSize=256, numSMs=82 (3090 stub)
+        // Safe default: blockSize=256, numSMs from stub constant (3090)
         let block_size = if block_size_limit > 0 && block_size_limit < 256 {
             block_size_limit
         } else {
             256
         };
-        let num_sms = 82;
-        let blocks_per_sm = 2048 / block_size;
-        let min_grid_size = blocks_per_sm * num_sms;
+        let blocks_per_sm = STUB_MAX_THREADS_PER_SM / block_size;
+        let min_grid_size = blocks_per_sm * STUB_NUM_SMS;
         Ok((min_grid_size, block_size))
     }
 

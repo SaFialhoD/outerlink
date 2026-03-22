@@ -854,6 +854,9 @@ impl GpuBackend for CudaGpuBackend {
         flags: u32,
     ) -> Result<i32, CuResult> {
         let mut num_blocks: i32 = 0;
+        // CUDA defines flags=0 as default behavior, so dispatching to the
+        // non-flags variant when flags==0 is semantically equivalent and avoids
+        // requiring the WithFlags symbol on older drivers.
         if flags != 0 {
             let f = require_fn(&self.api.cu_occupancy_max_active_blocks_with_flags)?;
             unsafe {
@@ -889,6 +892,9 @@ impl GpuBackend for CudaGpuBackend {
     ) -> Result<(i32, i32), CuResult> {
         let mut min_grid_size: i32 = 0;
         let mut block_size: i32 = 0;
+        // CUDA defines flags=0 as default behavior, so dispatching to the
+        // non-flags variant when flags==0 is semantically equivalent and avoids
+        // requiring the WithFlags symbol on older drivers.
         if flags != 0 {
             let f = require_fn(&self.api.cu_occupancy_max_potential_block_size_with_flags)?;
             unsafe {

@@ -33,13 +33,22 @@ const CUDA_ERROR_NOT_FOUND: u32 = 500;
 // Returned by server when cuDevicePrimaryCtxSetFlags is called on an active context
 #[allow(dead_code)]
 const CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE: u32 = 708;
-// Returned by server when peer access was already enabled
-#[allow(dead_code)]
+// Returned when peer access was already enabled
 const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: u32 = 704;
-// Returned by server when peer access was not previously enabled
-#[allow(dead_code)]
+// Returned when peer access was not previously enabled
 const CUDA_ERROR_PEER_ACCESS_NOT_ENABLED: u32 = 705;
 const CUDA_ERROR_UNKNOWN: u32 = 999;
+
+// ---------------------------------------------------------------------------
+// Occupancy stub constants (Ampere / GA102 defaults)
+// ---------------------------------------------------------------------------
+
+/// Number of SMs on the stub GPU (RTX 3090 = 82 SMs).
+const STUB_NUM_SMS: i32 = 82;
+/// Maximum resident threads per SM on Ampere.
+const STUB_MAX_THREADS_PER_SM: i32 = 2048;
+/// Maximum resident blocks per SM on Ampere.
+const STUB_MAX_BLOCKS_PER_SM: i32 = 16;
 
 // ---------------------------------------------------------------------------
 // Global client singleton
@@ -57,6 +66,16 @@ static CLIENT: OnceLock<OuterLinkClient> = OnceLock::new();
 /// only used in disconnected/stub fallback mode to generate unique local handles.
 static STUB_HANDLE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0x1000);
+
+/// Tracks which peer contexts have been enabled via `cuCtxEnablePeerAccess` in
+/// stub mode. Used to return correct error codes on double-enable and
+/// disable-without-enable.
+static STUB_PEER_ACCESS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+fn stub_peer_access() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
+    STUB_PEER_ACCESS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
 
 /// Initialize the global client. Called by the C layer via pthread_once,
 /// but also called lazily from each FFI function as a safety net.
@@ -1476,7 +1495,7 @@ pub extern "C" fn ol_cuOccupancyMaxActiveBlocksPerMultiprocessor(
     if block_size <= 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    let blocks = std::cmp::min(2048 / block_size, 16);
+    let blocks = std::cmp::min(STUB_MAX_THREADS_PER_SM / block_size, STUB_MAX_BLOCKS_PER_SM);
     unsafe { *num_blocks = std::cmp::max(blocks, 1) };
     CUDA_SUCCESS
 }
@@ -1524,7 +1543,7 @@ pub extern "C" fn ol_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     if block_size <= 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    let blocks = std::cmp::min(2048 / block_size, 16);
+    let blocks = std::cmp::min(STUB_MAX_THREADS_PER_SM / block_size, STUB_MAX_BLOCKS_PER_SM);
     unsafe { *num_blocks = std::cmp::max(blocks, 1) };
     CUDA_SUCCESS
 }
@@ -1542,18 +1561,22 @@ pub extern "C" fn ol_cuOccupancyMaxPotentialBlockSize(
     if min_grid_size.is_null() || block_size.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // If callback is non-NULL, compute locally with conservative defaults
+    // If callback is non-NULL, invoke it to get dynamic shared memory for the
+    // chosen block size, then compute occupancy locally.
     if !callback.is_null() {
         let bs = if block_size_limit > 0 && block_size_limit < 256 {
             block_size_limit
         } else {
             256
         };
-        let blocks_per_sm = 2048 / bs;
-        let num_sms = 82;
+        // The CUDA callback signature is: size_t (*CUoccupancyB2DSize)(int blockSize)
+        let callback_fn: unsafe extern "C" fn(i32) -> usize =
+            unsafe { std::mem::transmute(callback) };
+        let _dynamic_smem = unsafe { callback_fn(bs) };
+        let blocks_per_sm = STUB_MAX_THREADS_PER_SM / bs;
         unsafe {
             *block_size = bs;
-            *min_grid_size = blocks_per_sm * num_sms;
+            *min_grid_size = blocks_per_sm * STUB_NUM_SMS;
         }
         return CUDA_SUCCESS;
     }
@@ -1592,11 +1615,10 @@ pub extern "C" fn ol_cuOccupancyMaxPotentialBlockSize(
     } else {
         256
     };
-    let blocks_per_sm = 2048 / bs;
-    let num_sms = 82;
+    let blocks_per_sm = STUB_MAX_THREADS_PER_SM / bs;
     unsafe {
         *block_size = bs;
-        *min_grid_size = blocks_per_sm * num_sms;
+        *min_grid_size = blocks_per_sm * STUB_NUM_SMS;
     }
     CUDA_SUCCESS
 }
@@ -1615,18 +1637,22 @@ pub extern "C" fn ol_cuOccupancyMaxPotentialBlockSizeWithFlags(
     if min_grid_size.is_null() || block_size.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // If callback is non-NULL, compute locally with conservative defaults
+    // If callback is non-NULL, invoke it to get dynamic shared memory for the
+    // chosen block size, then compute occupancy locally.
     if !callback.is_null() {
         let bs = if block_size_limit > 0 && block_size_limit < 256 {
             block_size_limit
         } else {
             256
         };
-        let blocks_per_sm = 2048 / bs;
-        let num_sms = 82;
+        // The CUDA callback signature is: size_t (*CUoccupancyB2DSize)(int blockSize)
+        let callback_fn: unsafe extern "C" fn(i32) -> usize =
+            unsafe { std::mem::transmute(callback) };
+        let _dynamic_smem = unsafe { callback_fn(bs) };
+        let blocks_per_sm = STUB_MAX_THREADS_PER_SM / bs;
         unsafe {
             *block_size = bs;
-            *min_grid_size = blocks_per_sm * num_sms;
+            *min_grid_size = blocks_per_sm * STUB_NUM_SMS;
         }
         return CUDA_SUCCESS;
     }
@@ -1666,11 +1692,10 @@ pub extern "C" fn ol_cuOccupancyMaxPotentialBlockSizeWithFlags(
     } else {
         256
     };
-    let blocks_per_sm = 2048 / bs;
-    let num_sms = 82;
+    let blocks_per_sm = STUB_MAX_THREADS_PER_SM / bs;
     unsafe {
         *block_size = bs;
-        *min_grid_size = blocks_per_sm * num_sms;
+        *min_grid_size = blocks_per_sm * STUB_NUM_SMS;
     }
     CUDA_SUCCESS
 }
@@ -2849,9 +2874,13 @@ pub extern "C" fn ol_cuCtxEnablePeerAccess(peer_ctx: u64, flags: u32) -> u32 {
         }
         return CUDA_ERROR_UNKNOWN;
     }
-    // Stub: validate context handle
+    // Stub: validate context handle and track state
     if client.handles.contexts.to_remote(peer_ctx).is_none() {
         return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    let mut peers = stub_peer_access().lock().unwrap();
+    if !peers.insert(peer_ctx) {
+        return CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED;
     }
     CUDA_SUCCESS
 }
@@ -2873,11 +2902,14 @@ pub extern "C" fn ol_cuCtxDisablePeerAccess(peer_ctx: u64) -> u32 {
         }
         return CUDA_ERROR_UNKNOWN;
     }
-    // Stub: validate context handle
+    // Stub: validate context handle and check state
     if client.handles.contexts.to_remote(peer_ctx).is_none() {
         return CUDA_ERROR_INVALID_CONTEXT;
     }
-    // In stub mode, peer access was never really enabled, so this is a best-effort success
+    let mut peers = stub_peer_access().lock().unwrap();
+    if !peers.remove(&peer_ctx) {
+        return CUDA_ERROR_PEER_ACCESS_NOT_ENABLED;
+    }
     CUDA_SUCCESS
 }
 
@@ -4236,13 +4268,14 @@ mod tests {
         let func = setup_func_for_occupancy();
         let mut min_grid: i32 = 0;
         let mut block_sz: i32 = 0;
-        // Non-NULL callback pointer -- should compute locally
-        let fake_callback = 0x1234usize as *const std::ffi::c_void;
+        // Real callback that returns 0 dynamic shared memory
+        unsafe extern "C" fn zero_smem(_block_size: i32) -> usize { 0 }
+        let cb_ptr = zero_smem as *const std::ffi::c_void;
         let result = ol_cuOccupancyMaxPotentialBlockSize(
             &mut min_grid,
             &mut block_sz,
             func,
-            fake_callback,
+            cb_ptr,
             0,
             0,
         );
@@ -4391,12 +4424,23 @@ mod tests {
     }
 
     #[test]
-    fn test_ol_cu_ctx_disable_peer_access_valid() {
+    fn test_ol_cu_ctx_disable_peer_access_after_enable() {
         let mut ctx: u64 = 0;
         assert_eq!(ol_cuCtxCreate_v2(&mut ctx, 0, 0), CUDA_SUCCESS);
-        // In stub mode, disable should succeed (best-effort)
+        // Enable first, then disable should succeed
+        assert_eq!(ol_cuCtxEnablePeerAccess(ctx, 0), CUDA_SUCCESS);
         let result = ol_cuCtxDisablePeerAccess(ctx);
         assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuCtxDestroy_v2(ctx);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_disable_peer_access_without_enable() {
+        let mut ctx: u64 = 0;
+        assert_eq!(ol_cuCtxCreate_v2(&mut ctx, 0, 0), CUDA_SUCCESS);
+        // Disable without prior enable should return PEER_ACCESS_NOT_ENABLED
+        let result = ol_cuCtxDisablePeerAccess(ctx);
+        assert_eq!(result, CUDA_ERROR_PEER_ACCESS_NOT_ENABLED);
         let _ = ol_cuCtxDestroy_v2(ctx);
     }
 
@@ -4404,5 +4448,80 @@ mod tests {
     fn test_ol_cu_ctx_disable_peer_access_invalid_context() {
         let result = ol_cuCtxDisablePeerAccess(0xDEAD_BEEF);
         assert_eq!(result, CUDA_ERROR_INVALID_CONTEXT);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_enable_peer_access_double_enable() {
+        let mut ctx: u64 = 0;
+        assert_eq!(ol_cuCtxCreate_v2(&mut ctx, 0, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuCtxEnablePeerAccess(ctx, 0), CUDA_SUCCESS);
+        // Second enable should return ALREADY_ENABLED
+        let result = ol_cuCtxEnablePeerAccess(ctx, 0);
+        assert_eq!(result, CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED);
+        let _ = ol_cuCtxDisablePeerAccess(ctx);
+        let _ = ol_cuCtxDestroy_v2(ctx);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_peer_access_enable_disable_reenable() {
+        let mut ctx: u64 = 0;
+        assert_eq!(ol_cuCtxCreate_v2(&mut ctx, 0, 0), CUDA_SUCCESS);
+        // Enable -> Disable -> Re-enable should all succeed
+        assert_eq!(ol_cuCtxEnablePeerAccess(ctx, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuCtxDisablePeerAccess(ctx), CUDA_SUCCESS);
+        assert_eq!(ol_cuCtxEnablePeerAccess(ctx, 0), CUDA_SUCCESS);
+        let _ = ol_cuCtxDisablePeerAccess(ctx);
+        let _ = ol_cuCtxDestroy_v2(ctx);
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_callback_invoked() {
+        let func = setup_func_for_occupancy();
+        let mut min_grid: i32 = 0;
+        let mut block_sz: i32 = 0;
+
+        // A real callback that returns 1024 bytes of dynamic shared memory
+        unsafe extern "C" fn smem_callback(_block_size: i32) -> usize {
+            1024
+        }
+
+        let cb_ptr = smem_callback as *const std::ffi::c_void;
+        let result = ol_cuOccupancyMaxPotentialBlockSize(
+            &mut min_grid,
+            &mut block_sz,
+            func,
+            cb_ptr,
+            0,
+            0,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(block_sz, 256);
+        // With callback invoked, grid size should still be computed correctly
+        assert!(min_grid > 0);
+    }
+
+    #[test]
+    fn test_ol_cu_occupancy_callback_with_flags_invoked() {
+        let func = setup_func_for_occupancy();
+        let mut min_grid: i32 = 0;
+        let mut block_sz: i32 = 0;
+
+        unsafe extern "C" fn smem_callback(_block_size: i32) -> usize {
+            512
+        }
+
+        let cb_ptr = smem_callback as *const std::ffi::c_void;
+        let result = ol_cuOccupancyMaxPotentialBlockSizeWithFlags(
+            &mut min_grid,
+            &mut block_sz,
+            func,
+            cb_ptr,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(block_sz, 256);
+        assert!(min_grid > 0);
     }
 }
