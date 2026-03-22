@@ -333,6 +333,9 @@ CUresult hook_cuLaunchCooperativeKernel(CUfunction f,
                               unsigned int sharedMemBytes, CUstream hStream,
                               void **kernelParams);
 
+/* cuGetExportTable -- passthrough to real libcuda.so */
+CUresult hook_cuGetExportTable(const void **ppExportTable, const void *pExportTableId);
+
 /* cuGetProcAddress hooks */
 CUresult hook_cuGetProcAddress(const char *symbol, void **pfn,
                                int cudaVersion, cuuint64_t flags);

@@ -237,6 +237,9 @@ static const hook_entry_t hook_table[] = {
     { "cuLaunchKernel",          (void *)hook_cuLaunchKernel },
     { "cuLaunchCooperativeKernel", (void *)hook_cuLaunchCooperativeKernel },
 
+    /* Export table -- passthrough to real libcuda.so (in-process vtables) */
+    { "cuGetExportTable",        (void *)hook_cuGetExportTable },
+
     /* cuGetProcAddress itself -- we hook the hooking mechanism */
     { "cuGetProcAddress",        (void *)hook_cuGetProcAddress },
     { "cuGetProcAddress_v2",     (void *)hook_cuGetProcAddress_v2 },
@@ -1364,6 +1367,36 @@ CUresult hook_cuDeviceGetPCIBusId(char *pciBusId, int len, CUdevice dev) {
 CUresult hook_cuDeviceGetByPCIBusId(CUdevice *dev, const char *pciBusId) {
     ensure_init();
     return ol_cuDeviceGetByPCIBusId((int *)dev, (const unsigned char *)pciBusId);
+}
+
+/* -----------------------------------------------------------------------
+ * cuGetExportTable passthrough
+ *
+ * cuGetExportTable returns vtables (structs of function pointers) keyed by
+ * 16-byte UUIDs. cuDNN, cuBLAS, cuFFT, and the CUDA runtime all call this
+ * during initialization. The returned pointers are raw function pointers
+ * into libcuda.so -- they cannot be serialized or stubbed. We forward to
+ * the real libcuda.so via RTLD_NEXT (same pattern as HAMi-core).
+ * ----------------------------------------------------------------------- */
+
+CUresult hook_cuGetExportTable(const void **ppExportTable, const void *pExportTableId) {
+    typedef CUresult (*real_fn_t)(const void **, const void *);
+    static real_fn_t real_cuGetExportTable = NULL;
+    static int resolved = 0;
+
+    if (!resolved) {
+        real_cuGetExportTable = (real_fn_t)dlsym(RTLD_NEXT, "cuGetExportTable");
+        resolved = 1;
+    }
+
+    if (real_cuGetExportTable) {
+        return real_cuGetExportTable(ppExportTable, pExportTableId);
+    }
+
+    /* No real libcuda.so found -- return not found */
+    if (ppExportTable)
+        *ppExportTable = NULL;
+    return CUDA_ERROR_NOT_FOUND;
 }
 
 /* -----------------------------------------------------------------------
