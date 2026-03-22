@@ -54,6 +54,10 @@ pub trait GpuBackend: Send + Sync {
     /// Free a previously-allocated device pointer.
     fn mem_free(&self, ptr: u64) -> Result<(), CuResult>;
 
+    /// Allocate 2D device memory with row pitch alignment.
+    /// Returns `(device_pointer, pitch_in_bytes)`.
+    fn mem_alloc_pitch(&self, width_in_bytes: usize, height: usize, element_size: u32) -> Result<(u64, usize), CuResult>;
+
     /// Copy host data to device memory (host-to-device).
     fn memcpy_htod(&self, dst: u64, data: &[u8]) -> CuResult;
 
@@ -83,8 +87,16 @@ pub trait GpuBackend: Send + Sync {
 
     // --- Module operations ---
 
+    /// Load a module from a file path.
+    /// In stub mode, returns NotFound (no real filesystem access).
+    fn module_load(&self, path: &str) -> Result<u64, CuResult>;
+
     /// Load a module from raw data (e.g. PTX or cubin).
     fn module_load_data(&self, data: &[u8]) -> Result<u64, CuResult>;
+
+    /// Load a fat binary module (multiple architectures).
+    /// In stub mode, delegates to module_load_data.
+    fn module_load_fat_binary(&self, data: &[u8]) -> Result<u64, CuResult>;
 
     /// Load a module from raw data with JIT compiler options.
     ///
@@ -204,6 +216,9 @@ pub trait GpuBackend: Send + Sync {
     /// Allocate pinned (page-locked) host memory.
     fn mem_alloc_host(&self, size: usize) -> Result<u64, CuResult>;
 
+    /// Allocate pinned host memory with flags (CU_MEMHOSTALLOC_PORTABLE, etc.).
+    fn mem_host_alloc(&self, byte_size: usize, flags: u32) -> Result<u64, CuResult>;
+
     /// Free pinned host memory.
     fn mem_free_host(&self, ptr: u64) -> Result<(), CuResult>;
 
@@ -260,6 +275,10 @@ pub trait GpuBackend: Send + Sync {
 
     /// Generic direction-agnostic async memory copy (both pointers are device).
     fn memcpy_async(&self, dst: u64, src: u64, size: u64, stream: u64) -> Result<(), CuResult>;
+
+    /// Async device-to-device copy (takes stream parameter).
+    /// In the stub, delegates to memcpy_dtod (stream is ignored).
+    fn memcpy_dtod_async(&self, dst: u64, src: u64, byte_count: usize, stream: u64) -> Result<(), CuResult>;
 
     // --- Kernel launch ---
 
@@ -402,6 +421,17 @@ pub trait GpuBackend: Send + Sync {
     /// Allocate device memory from a specific pool asynchronously on a stream.
     /// In stub mode, delegates to `mem_alloc` (pool and stream are ignored).
     fn mem_alloc_from_pool_async(&self, size: usize, pool: u64, stream: u64) -> Result<u64, CuResult>;
+
+    /// Get the current memory pool for a device.
+    /// In stub mode, returns the default pool for the device.
+    fn device_get_mem_pool(&self, device: i32) -> Result<u64, CuResult>;
+
+    /// Set the current memory pool for a device.
+    fn device_set_mem_pool(&self, device: i32, pool: u64) -> Result<(), CuResult>;
+
+    /// Get the minimum allocation granularity (alignment) for a given location.
+    /// Returns alignment in bytes (stub: 512).
+    fn mem_get_allocation_granularity(&self, location_type: i32, location_id: i32, option: i32) -> Result<u64, CuResult>;
 
     // --- JIT Linker operations ---
 
@@ -601,6 +631,8 @@ struct StubState {
     link_states: HashMap<u64, StubLinkState>,
     /// Counter for generating linker state handles.
     next_link_id: u64,
+    /// Per-device current memory pool (set via cuDeviceSetMemPool).
+    current_mem_pools: HashMap<i32, u64>,
     /// Peer contexts currently enabled for P2P access.
     peer_access: HashSet<u64>,
     /// Preferred cache configuration (CU_FUNC_CACHE_PREFER_*).
@@ -663,6 +695,7 @@ impl StubGpuBackend {
                 },
                 link_states: HashMap::new(),
                 next_link_id: 0x4C00_0000_0000_0001, // 'L' prefix
+                current_mem_pools: HashMap::new(),
                 peer_access: HashSet::new(),
                 cache_config: 0,        // CU_FUNC_CACHE_PREFER_NONE
                 shared_mem_config: 0,    // CU_SHARED_MEM_CONFIG_DEFAULT_BANK_SIZE
@@ -765,6 +798,17 @@ impl GpuBackend for StubGpuBackend {
         }
     }
 
+    fn mem_alloc_pitch(&self, width_in_bytes: usize, height: usize, _element_size: u32) -> Result<(u64, usize), CuResult> {
+        if width_in_bytes == 0 || height == 0 {
+            return Err(CuResult::InvalidValue);
+        }
+        // Align pitch to 512 bytes (NVIDIA standard).
+        let pitch = (width_in_bytes + 511) & !511;
+        let total_size = pitch * height;
+        let ptr = self.mem_alloc(total_size)?;
+        Ok((ptr, pitch))
+    }
+
     fn memcpy_htod(&self, dst: u64, data: &[u8]) -> CuResult {
         let mut state = self.state.lock().unwrap();
         match state.allocations.get_mut(&dst) {
@@ -833,6 +877,16 @@ impl GpuBackend for StubGpuBackend {
     }
 
     // --- Module operations ---
+
+    fn module_load(&self, _path: &str) -> Result<u64, CuResult> {
+        // Stub has no filesystem access.
+        Err(CuResult::NotFound)
+    }
+
+    fn module_load_fat_binary(&self, data: &[u8]) -> Result<u64, CuResult> {
+        // Fat binary is just a container; delegate to module_load_data.
+        self.module_load_data(data)
+    }
 
     fn module_load_data(&self, data: &[u8]) -> Result<u64, CuResult> {
         if data.is_empty() {
@@ -1201,6 +1255,11 @@ impl GpuBackend for StubGpuBackend {
         Ok(ptr)
     }
 
+    fn mem_host_alloc(&self, byte_size: usize, _flags: u32) -> Result<u64, CuResult> {
+        // Same as mem_alloc_host but with flags (ignored in stub).
+        self.mem_alloc_host(byte_size)
+    }
+
     fn mem_free_host(&self, ptr: u64) -> Result<(), CuResult> {
         let mut state = self.state.lock().unwrap();
         if state.host_allocations.remove(&ptr).is_none() {
@@ -1420,6 +1479,17 @@ impl GpuBackend for StubGpuBackend {
         }
         // Stub: async behaves same as sync.
         self.memcpy(dst, src, size)
+    }
+
+    fn memcpy_dtod_async(&self, dst: u64, src: u64, byte_count: usize, stream: u64) -> Result<(), CuResult> {
+        {
+            let state = self.state.lock().unwrap();
+            if stream != 0 && !state.streams.contains_key(&stream) {
+                return Err(CuResult::InvalidValue);
+            }
+        }
+        // Stub: async behaves same as sync.
+        self.memcpy_dtod(dst, src, byte_count as u64)
     }
 
     // --- Kernel launch ---
@@ -1932,6 +2002,33 @@ impl GpuBackend for StubGpuBackend {
             }
         }
         self.mem_alloc(size)
+    }
+
+    fn device_get_mem_pool(&self, device: i32) -> Result<u64, CuResult> {
+        Self::check_device(device)?;
+        let state = self.state.lock().unwrap();
+        // If a current pool has been set, return it. Otherwise return the default.
+        if let Some(&pool) = state.current_mem_pools.get(&device) {
+            return Ok(pool);
+        }
+        drop(state);
+        // Return the default pool.
+        self.device_get_default_mem_pool(device)
+    }
+
+    fn device_set_mem_pool(&self, device: i32, pool: u64) -> Result<(), CuResult> {
+        Self::check_device(device)?;
+        let mut state = self.state.lock().unwrap();
+        if !state.mem_pools.contains_key(&pool) {
+            return Err(CuResult::InvalidValue);
+        }
+        state.current_mem_pools.insert(device, pool);
+        Ok(())
+    }
+
+    fn mem_get_allocation_granularity(&self, _location_type: i32, _location_id: i32, _option: i32) -> Result<u64, CuResult> {
+        // Stub: return 512 bytes (NVIDIA standard minimum alignment).
+        Ok(512)
     }
 }
 

@@ -37,6 +37,7 @@ const CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE: u32 = 708;
 const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: u32 = 704;
 // Returned when peer access was not previously enabled
 const CUDA_ERROR_PEER_ACCESS_NOT_ENABLED: u32 = 705;
+const CUDA_ERROR_NOT_SUPPORTED: u32 = 801;
 const CUDA_ERROR_UNKNOWN: u32 = 999;
 
 // ---------------------------------------------------------------------------
@@ -4569,6 +4570,579 @@ pub extern "C" fn ol_cuCtxDisablePeerAccess(peer_ctx: u64) -> u32 {
 }
 
 // ===========================================================================
+// cuMemcpyDtoDAsync_v2
+// ===========================================================================
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemcpyDtoDAsync_v2(
+    dst: u64,
+    src: u64,
+    byte_count: usize,
+    stream: u64,
+) -> u32 {
+    let client = get_client();
+    // CUDA: zero-size memcpy is a successful no-op
+    if byte_count == 0 {
+        return CUDA_SUCCESS;
+    }
+    // Connected: translate all handles and send to server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_dst = match client.handles.device_ptrs.to_remote(dst) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_src = match client.handles.device_ptrs.to_remote(src) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        // Payload: [8B dst][8B src][8B byte_count][8B stream] = 32B
+        let mut payload = [0u8; 32];
+        payload[0..8].copy_from_slice(&remote_dst.to_le_bytes());
+        payload[8..16].copy_from_slice(&remote_src.to_le_bytes());
+        payload[16..24].copy_from_slice(&(byte_count as u64).to_le_bytes());
+        payload[24..32].copy_from_slice(&remote_stream.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemcpyDtoDAsync, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate all handles
+    if client.handles.device_ptrs.to_remote(dst).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.handles.device_ptrs.to_remote(src).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+// ===========================================================================
+// cuMemHostAlloc
+// ===========================================================================
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemHostAlloc(pp: *mut *mut u8, byte_size: usize, flags: u32) -> u32 {
+    let client = get_client();
+    if pp.is_null() || byte_size == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&(byte_size as u64).to_le_bytes());
+        payload.extend_from_slice(&flags.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemHostAlloc, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let host_ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                unsafe { *pp = host_ptr as *mut u8 };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: allocate real host memory (same as cuMemAllocHost)
+    let layout = std::alloc::Layout::from_size_align(byte_size, 8).unwrap();
+    let allocated = unsafe { std::alloc::alloc_zeroed(layout) };
+    if allocated.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let ptr_val = allocated as u64;
+    host_allocs().lock().unwrap().insert(ptr_val);
+    host_alloc_sizes().lock().unwrap().insert(ptr_val, byte_size);
+    unsafe { *pp = allocated };
+    CUDA_SUCCESS
+}
+
+// ===========================================================================
+// cuMemAllocPitch_v2
+// ===========================================================================
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemAllocPitch_v2(
+    dptr: *mut u64,
+    pitch: *mut usize,
+    width_in_bytes: usize,
+    height: usize,
+    element_size: u32,
+) -> u32 {
+    let client = get_client();
+    if dptr.is_null() || pitch.is_null() || width_in_bytes == 0 || height == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = Vec::with_capacity(20);
+        payload.extend_from_slice(&(width_in_bytes as u64).to_le_bytes());
+        payload.extend_from_slice(&(height as u64).to_le_bytes());
+        payload.extend_from_slice(&element_size.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemAllocPitch, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 20 {
+                let remote_devptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let resp_pitch = u64::from_le_bytes(resp[12..20].try_into().unwrap()) as usize;
+                let synthetic = client.handles.device_ptrs.insert(remote_devptr);
+                let alloc_size = resp_pitch * height;
+                device_alloc_sizes().lock().unwrap().insert(synthetic, alloc_size);
+                unsafe {
+                    *dptr = synthetic;
+                    *pitch = resp_pitch;
+                };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: generate a local-only handle with 512-byte pitch alignment
+    let aligned_pitch = (width_in_bytes + 511) & !511;
+    let alloc_size = aligned_pitch * height;
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.device_ptrs.insert(stub_remote);
+    device_alloc_sizes().lock().unwrap().insert(synthetic, alloc_size);
+    unsafe {
+        *dptr = synthetic;
+        *pitch = aligned_pitch;
+    };
+    CUDA_SUCCESS
+}
+
+// ===========================================================================
+// cuModuleLoad / cuModuleLoadFatBinary
+// ===========================================================================
+
+#[no_mangle]
+pub extern "C" fn ol_cuModuleLoad(module: *mut u64, fname: *const u8) -> u32 {
+    let client = get_client();
+    if module.is_null() || fname.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let c_str = unsafe { std::ffi::CStr::from_ptr(fname as *const i8) };
+    let path = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return CUDA_ERROR_INVALID_VALUE,
+    };
+    // Connected: send the path to the server
+    if client.connected.load(Ordering::Acquire) {
+        let path_bytes = path.as_bytes();
+        let mut payload = Vec::with_capacity(4 + path_bytes.len());
+        payload.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(path_bytes);
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::ModuleLoad, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.modules.insert(remote_module);
+                unsafe { *module = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: generate a local-only handle
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.modules.insert(stub_remote);
+    unsafe { *module = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuModuleLoadFatBinary(module: *mut u64, fat_cubin: *const u8) -> u32 {
+    let client = get_client();
+    if module.is_null() || fat_cubin.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Fat binary size detection: read the magic + header to determine size.
+    // The __cudaFatMAGIC2 header has a headerSize field at offset 8 (u64).
+    // For simplicity in Phase 1, we treat this like ModuleLoadData with a
+    // fixed-size probe. Real fat binaries start with 0x466243B1 magic.
+    // We send the first 8 bytes to detect; the server does the real loading.
+    //
+    // Connected: send the fat binary data to the server.
+    // Since we don't know the size of a fat binary from a raw pointer,
+    // we delegate to ModuleLoadData-style handling. The caller is expected
+    // to pass a valid fat cubin pointer; we send a probe request.
+    if client.connected.load(Ordering::Acquire) {
+        // Fat binary header: first 4 bytes are magic, offset 8 is u64 length.
+        // For safety, read magic only and let server handle via cuModuleLoadFatBinary.
+        // Since we can't determine size from a raw pointer in a generic way,
+        // fall through to stub for now. Server-side implementation uses the
+        // real CUDA API which accepts the pointer directly.
+    }
+    // Stub: generate a local-only handle
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.modules.insert(stub_remote);
+    unsafe { *module = synthetic };
+    CUDA_SUCCESS
+}
+
+// ===========================================================================
+// cuDeviceGetMemPool / cuDeviceSetMemPool / cuMemGetAllocationGranularity
+// ===========================================================================
+
+#[no_mangle]
+pub extern "C" fn ol_cuDeviceGetMemPool(pool: *mut u64, dev: i32) -> u32 {
+    let client = get_client();
+    if pool.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let payload = dev.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DeviceGetMemPool, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_pool = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.mem_pools.insert_or_get(remote_pool);
+                unsafe { *pool = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: same as cuDeviceGetDefaultMemPool (current pool defaults to default)
+    if dev < 0 || dev >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    let stub_remote = 0xDEFA_0000_u64 | (dev as u64);
+    let synthetic = client.handles.mem_pools.insert_or_get(stub_remote);
+    unsafe { *pool = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuDeviceSetMemPool(dev: i32, pool: u64) -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let remote_pool = match client.handles.mem_pools.to_remote(pool) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&dev.to_le_bytes());
+        payload.extend_from_slice(&remote_pool.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DeviceSetMemPool, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    // Stub: validate device and pool handle
+    if dev < 0 || dev >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    if client.handles.mem_pools.to_remote(pool).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemGetAllocationGranularity(
+    granularity: *mut usize,
+    prop: *const u8, // CUmemAllocationProp*
+    option: i32,
+) -> u32 {
+    let client = get_client();
+    if granularity.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Extract location_type and location_id from the prop struct.
+    // CUmemAllocationProp layout starts with:
+    //   i32 type (allocationType)
+    //   i32 requestedHandleTypes
+    //   struct { i32 type; i32 id; } location
+    // So location_type is at offset 8, location_id at offset 12.
+    let (location_type, location_id) = if !prop.is_null() {
+        unsafe {
+            let loc_type = *(prop.add(8) as *const i32);
+            let loc_id = *(prop.add(12) as *const i32);
+            (loc_type, loc_id)
+        }
+    } else {
+        (0, 0)
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&location_type.to_le_bytes());
+        payload.extend_from_slice(&location_id.to_le_bytes());
+        payload.extend_from_slice(&option.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemGetAllocationGranularity, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let val = u64::from_le_bytes(resp[4..12].try_into().unwrap()) as usize;
+                unsafe { *granularity = val };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: return 512 bytes (NVIDIA standard minimum alignment)
+    unsafe { *granularity = 512 };
+    CUDA_SUCCESS
+}
+
+// ===========================================================================
+// CUDA Graph safety stubs (torch.compile reduce-overhead mode)
+// ===========================================================================
+//
+// These stubs prevent segfaults when torch.compile(mode="reduce-overhead")
+// tries to capture a CUDA graph. Without them, calls fall through to the
+// real libcuda.so which knows nothing about our virtual handles.
+//
+// Graph capture is NOT supported in Phase 1 — stubs return NOT_SUPPORTED
+// so PyTorch falls back to eager mode gracefully. Query functions return
+// SUCCESS with "not capturing" status so defensive callers work correctly.
+
+#[no_mangle]
+pub extern "C" fn ol_cuStreamBeginCapture_v2(stream: u64, mode: i32) -> u32 {
+    let _ = (stream, mode);
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuStreamEndCapture(stream: u64, graph: *mut u64) -> u32 {
+    let _ = (stream, graph);
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+/// Returns SUCCESS with captureStatus=0 (CU_STREAM_CAPTURE_STATUS_NONE).
+/// Apps check this defensively — returning NOT_SUPPORTED would break them.
+#[no_mangle]
+pub extern "C" fn ol_cuStreamIsCapturing(stream: u64, capture_status: *mut i32) -> u32 {
+    let _ = stream;
+    if !capture_status.is_null() {
+        unsafe { *capture_status = 0 }; // CU_STREAM_CAPTURE_STATUS_NONE
+    }
+    CUDA_SUCCESS
+}
+
+/// Returns SUCCESS with captureStatus=0 and all output pointers zeroed.
+#[no_mangle]
+pub extern "C" fn ol_cuStreamGetCaptureInfo_v2(
+    stream: u64,
+    capture_status: *mut i32,
+    id: *mut u64,
+    graph: *mut u64,
+    deps: *mut *const u64,
+    num_deps: *mut usize,
+) -> u32 {
+    let _ = stream;
+    if !capture_status.is_null() {
+        unsafe { *capture_status = 0 }; // CU_STREAM_CAPTURE_STATUS_NONE
+    }
+    if !id.is_null() {
+        unsafe { *id = 0 };
+    }
+    if !graph.is_null() {
+        unsafe { *graph = 0 };
+    }
+    if !deps.is_null() {
+        unsafe { *deps = ptr::null() };
+    }
+    if !num_deps.is_null() {
+        unsafe { *num_deps = 0 };
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuGraphCreate(graph: *mut u64, flags: u32) -> u32 {
+    let _ = (graph, flags);
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuGraphInstantiate_v2(
+    graph_exec: *mut u64,
+    graph: u64,
+    err_node: *mut u64,
+    log_buffer: *mut u8,
+    buffer_size: usize,
+) -> u32 {
+    let _ = (graph_exec, graph, err_node, log_buffer, buffer_size);
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuGraphInstantiate(
+    graph_exec: *mut u64,
+    graph: u64,
+    err_node: *mut u64,
+    log_buffer: *mut u8,
+    buffer_size: usize,
+) -> u32 {
+    let _ = (graph_exec, graph, err_node, log_buffer, buffer_size);
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuGraphInstantiateWithFlags(
+    graph_exec: *mut u64,
+    graph: u64,
+    flags: u64,
+) -> u32 {
+    let _ = (graph_exec, graph, flags);
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuGraphLaunch(graph_exec: u64, stream: u64) -> u32 {
+    let _ = (graph_exec, stream);
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuGraphExecDestroy(graph_exec: u64) -> u32 {
+    let _ = graph_exec;
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuGraphDestroy(graph: u64) -> u32 {
+    let _ = graph;
+    CUDA_ERROR_NOT_SUPPORTED
+}
+
+// ===========================================================================
+// cuLaunchKernelEx (CUDA 12 extended launch API)
+// ===========================================================================
+//
+// Used by Triton compiler / torch.compile on CUDA 12. Takes a CUlaunchConfig*
+// struct instead of individual grid/block/shared/stream params.
+//
+// Phase 1: extract grid/block/shared/stream from the config struct and
+// delegate to the existing LaunchKernel infrastructure. Launch attributes
+// (cluster dimensions, etc.) are ignored.
+//
+// CUlaunchConfig layout (x86_64):
+//   offset 0:  gridDimX   (u32)
+//   offset 4:  gridDimY   (u32)
+//   offset 8:  gridDimZ   (u32)
+//   offset 12: blockDimX  (u32)
+//   offset 16: blockDimY  (u32)
+//   offset 20: blockDimZ  (u32)
+//   offset 24: sharedMemBytes (u32)
+//   offset 28: 4 bytes padding (alignment to 8)
+//   offset 32: hStream    (u64 / CUstream pointer)
+//   offset 40: attrs      (pointer to CUlaunchAttribute array)
+//   offset 48: numAttrs   (u32)
+//   Total: 56 bytes (with padding)
+
+#[no_mangle]
+pub extern "C" fn ol_cuLaunchKernelEx(
+    config: *const u8,
+    func: u64,
+    kernel_params: *const *const u8,
+    num_params: u32,
+    param_sizes: *const u32,
+) -> u32 {
+    if config.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    // Parse fields from the CUlaunchConfig struct.
+    // SAFETY: caller guarantees config points to a valid CUlaunchConfig.
+    let (grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_mem, stream) = unsafe {
+        let grid_x = u32::from_ne_bytes(std::slice::from_raw_parts(config, 4).try_into().unwrap());
+        let grid_y = u32::from_ne_bytes(std::slice::from_raw_parts(config.add(4), 4).try_into().unwrap());
+        let grid_z = u32::from_ne_bytes(std::slice::from_raw_parts(config.add(8), 4).try_into().unwrap());
+        let block_x = u32::from_ne_bytes(std::slice::from_raw_parts(config.add(12), 4).try_into().unwrap());
+        let block_y = u32::from_ne_bytes(std::slice::from_raw_parts(config.add(16), 4).try_into().unwrap());
+        let block_z = u32::from_ne_bytes(std::slice::from_raw_parts(config.add(20), 4).try_into().unwrap());
+        let shared_mem = u32::from_ne_bytes(std::slice::from_raw_parts(config.add(24), 4).try_into().unwrap());
+        // offset 32: hStream (u64, after 4 bytes padding)
+        let stream = u64::from_ne_bytes(std::slice::from_raw_parts(config.add(32), 8).try_into().unwrap());
+        (grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_mem, stream)
+    };
+
+    // Delegate to the existing LaunchKernel path. The wire format is identical
+    // once we have extracted the config fields.
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+
+        let mut payload = Vec::with_capacity(44 + 4);
+        payload.extend_from_slice(&remote_func.to_le_bytes());
+        payload.extend_from_slice(&grid_x.to_le_bytes());
+        payload.extend_from_slice(&grid_y.to_le_bytes());
+        payload.extend_from_slice(&grid_z.to_le_bytes());
+        payload.extend_from_slice(&block_x.to_le_bytes());
+        payload.extend_from_slice(&block_y.to_le_bytes());
+        payload.extend_from_slice(&block_z.to_le_bytes());
+        payload.extend_from_slice(&shared_mem.to_le_bytes());
+        payload.extend_from_slice(&remote_stream.to_le_bytes());
+
+        const MAX_KERNEL_PARAMS: u32 = 1024;
+        let n = num_params;
+        if n > MAX_KERNEL_PARAMS {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        payload.extend_from_slice(&n.to_le_bytes());
+        if n > 0 && !kernel_params.is_null() && !param_sizes.is_null() {
+            for i in 0..n as usize {
+                unsafe {
+                    let size = *param_sizes.add(i);
+                    let p = *kernel_params.add(i);
+                    if size > 0 && p.is_null() {
+                        return CUDA_ERROR_INVALID_VALUE;
+                    }
+                    payload.extend_from_slice(&size.to_le_bytes());
+                    if size > 0 {
+                        let bytes = std::slice::from_raw_parts(p, size as usize);
+                        payload.extend_from_slice(bytes);
+                    }
+                }
+            }
+        }
+
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::LaunchKernelEx, &payload) {
+            return parse_result(&resp);
+        }
+    }
+
+    // Stub: validate handles
+    if client.handles.functions.to_remote(func).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -7421,5 +7995,177 @@ mod tests {
         assert_ne!(s1, s2);
         let _ = ol_cuLinkDestroy(s1);
         let _ = ol_cuLinkDestroy(s2);
+    }
+
+    // -- CUDA Graph safety stubs --
+
+    #[test]
+    fn test_graph_stream_begin_capture_returns_not_supported() {
+        assert_eq!(ol_cuStreamBeginCapture_v2(0, 0), CUDA_ERROR_NOT_SUPPORTED);
+        assert_eq!(ol_cuStreamBeginCapture_v2(0xBEEF, 1), CUDA_ERROR_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn test_graph_stream_end_capture_returns_not_supported() {
+        let mut graph: u64 = 0;
+        assert_eq!(ol_cuStreamEndCapture(0, &mut graph), CUDA_ERROR_NOT_SUPPORTED);
+        assert_eq!(ol_cuStreamEndCapture(0, ptr::null_mut()), CUDA_ERROR_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn test_graph_stream_is_capturing_returns_not_capturing() {
+        let mut status: i32 = 99;
+        assert_eq!(ol_cuStreamIsCapturing(0, &mut status), CUDA_SUCCESS);
+        assert_eq!(status, 0); // CU_STREAM_CAPTURE_STATUS_NONE
+    }
+
+    #[test]
+    fn test_graph_stream_is_capturing_null_ptr() {
+        // Should not crash with null pointer
+        assert_eq!(ol_cuStreamIsCapturing(0, ptr::null_mut()), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_graph_stream_get_capture_info_v2_returns_not_capturing() {
+        let mut status: i32 = 99;
+        let mut id: u64 = 99;
+        let mut graph: u64 = 99;
+        let mut deps: *const u64 = 0xDEAD as *const u64;
+        let mut num_deps: usize = 99;
+        assert_eq!(
+            ol_cuStreamGetCaptureInfo_v2(
+                0,
+                &mut status,
+                &mut id,
+                &mut graph,
+                &mut deps,
+                &mut num_deps,
+            ),
+            CUDA_SUCCESS
+        );
+        assert_eq!(status, 0);
+        assert_eq!(id, 0);
+        assert_eq!(graph, 0);
+        assert!(deps.is_null());
+        assert_eq!(num_deps, 0);
+    }
+
+    #[test]
+    fn test_graph_stream_get_capture_info_v2_null_ptrs() {
+        // Should not crash with all null pointers
+        assert_eq!(
+            ol_cuStreamGetCaptureInfo_v2(0, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut()),
+            CUDA_SUCCESS
+        );
+    }
+
+    #[test]
+    fn test_graph_create_returns_not_supported() {
+        let mut graph: u64 = 0;
+        assert_eq!(ol_cuGraphCreate(&mut graph, 0), CUDA_ERROR_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn test_graph_instantiate_v2_returns_not_supported() {
+        let mut exec: u64 = 0;
+        let mut err_node: u64 = 0;
+        let mut log_buf = [0u8; 64];
+        assert_eq!(
+            ol_cuGraphInstantiate_v2(&mut exec, 0, &mut err_node, log_buf.as_mut_ptr(), 64),
+            CUDA_ERROR_NOT_SUPPORTED
+        );
+    }
+
+    #[test]
+    fn test_graph_instantiate_returns_not_supported() {
+        let mut exec: u64 = 0;
+        let mut err_node: u64 = 0;
+        assert_eq!(
+            ol_cuGraphInstantiate(&mut exec, 0, &mut err_node, ptr::null_mut(), 0),
+            CUDA_ERROR_NOT_SUPPORTED
+        );
+    }
+
+    #[test]
+    fn test_graph_instantiate_with_flags_returns_not_supported() {
+        let mut exec: u64 = 0;
+        assert_eq!(ol_cuGraphInstantiateWithFlags(&mut exec, 0, 0), CUDA_ERROR_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn test_graph_launch_returns_not_supported() {
+        assert_eq!(ol_cuGraphLaunch(0xBEEF, 0), CUDA_ERROR_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn test_graph_exec_destroy_returns_not_supported() {
+        assert_eq!(ol_cuGraphExecDestroy(0xBEEF), CUDA_ERROR_NOT_SUPPORTED);
+    }
+
+    #[test]
+    fn test_graph_destroy_returns_not_supported() {
+        assert_eq!(ol_cuGraphDestroy(0xBEEF), CUDA_ERROR_NOT_SUPPORTED);
+    }
+
+    // -- cuLaunchKernelEx --
+
+    #[test]
+    fn test_launch_kernel_ex_null_config_returns_invalid_value() {
+        assert_eq!(
+            ol_cuLaunchKernelEx(ptr::null(), 0xBEEF, ptr::null(), 0, ptr::null()),
+            CUDA_ERROR_INVALID_VALUE
+        );
+    }
+
+    #[test]
+    fn test_launch_kernel_ex_stub_invalid_func() {
+        // Build a minimal CUlaunchConfig on the stack (56 bytes)
+        let mut config = [0u8; 56];
+        // gridDim = (1,1,1)
+        config[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        config[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        config[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        // blockDim = (1,1,1)
+        config[12..16].copy_from_slice(&1u32.to_ne_bytes());
+        config[16..20].copy_from_slice(&1u32.to_ne_bytes());
+        config[20..24].copy_from_slice(&1u32.to_ne_bytes());
+
+        // func = 0xDEAD_BEEF — not in handle store, should return INVALID_VALUE in stub
+        assert_eq!(
+            ol_cuLaunchKernelEx(config.as_ptr(), 0xDEAD_BEEF, ptr::null(), 0, ptr::null()),
+            CUDA_ERROR_INVALID_VALUE
+        );
+    }
+
+    #[test]
+    fn test_launch_kernel_ex_stub_valid_func() {
+        // Create a valid function handle via module load + get_function
+        let ptx = b"dummy ptx data for module\0";
+        let mut module: u64 = 0;
+        assert_eq!(ol_cuModuleLoadData(&mut module, ptx.as_ptr(), ptx.len()), CUDA_SUCCESS);
+
+        let func_name = std::ffi::CString::new("my_kernel").unwrap();
+        let mut func: u64 = 0;
+        assert_eq!(
+            ol_cuModuleGetFunction(&mut func, module, func_name.as_ptr() as *const i8),
+            CUDA_SUCCESS
+        );
+
+        // Build CUlaunchConfig
+        let mut config = [0u8; 56];
+        config[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        config[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        config[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        config[12..16].copy_from_slice(&32u32.to_ne_bytes());
+        config[16..20].copy_from_slice(&1u32.to_ne_bytes());
+        config[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        // sharedMem = 0, stream = 0 (default)
+
+        assert_eq!(
+            ol_cuLaunchKernelEx(config.as_ptr(), func, ptr::null(), 0, ptr::null()),
+            CUDA_SUCCESS
+        );
+
+        let _ = ol_cuModuleUnload(module);
     }
 }

@@ -135,16 +135,32 @@ type FnCuMemsetD16Async =
 
 // Device-to-device memory copy
 type FnCuMemcpyDtoD = unsafe extern "C" fn(dst: u64, src: u64, bytecount: usize) -> i32;
+type FnCuMemcpyDtoDAsync = unsafe extern "C" fn(dst: u64, src: u64, bytecount: usize, stream: usize) -> i32;
 
 // Generic direction-agnostic memory copy
 type FnCuMemcpy = unsafe extern "C" fn(dst: u64, src: u64, bytecount: usize) -> i32;
 type FnCuMemcpyAsync =
     unsafe extern "C" fn(dst: u64, src: u64, bytecount: usize, stream: usize) -> i32;
 
+// Host memory allocation with flags
+type FnCuMemHostAlloc = unsafe extern "C" fn(pp: *mut *mut std::ffi::c_void, bytesize: usize, flags: u32) -> i32;
+
+// 2D pitched allocation
+type FnCuMemAllocPitch = unsafe extern "C" fn(dptr: *mut u64, pitch: *mut usize, width: usize, height: usize, element_size: u32) -> i32;
+
+// Module loading
+type FnCuModuleLoad = unsafe extern "C" fn(module: *mut usize, fname: *const u8) -> i32;
+type FnCuModuleLoadFatBinary = unsafe extern "C" fn(module: *mut usize, fat_cubin: *const u8) -> i32;
+
 // Stream-ordered memory / pool operations (CUDA 11.2+)
 type FnCuMemAllocAsync = unsafe extern "C" fn(dptr: *mut u64, bytesize: usize, stream: usize) -> i32;
 type FnCuMemFreeAsync = unsafe extern "C" fn(dptr: u64, stream: usize) -> i32;
 type FnCuDeviceGetDefaultMemPool = unsafe extern "C" fn(pool: *mut usize, dev: i32) -> i32;
+type FnCuDeviceGetMemPool = unsafe extern "C" fn(pool: *mut usize, dev: i32) -> i32;
+type FnCuDeviceSetMemPool = unsafe extern "C" fn(dev: i32, pool: usize) -> i32;
+
+/// CUmemAllocationGranularity_flags for cuMemGetAllocationGranularity.
+type FnCuMemGetAllocationGranularity = unsafe extern "C" fn(granularity: *mut usize, prop: *const std::ffi::c_void, option: i32) -> i32;
 
 /// CUmemPoolProps for cuMemPoolCreate (CUDA 11.2+).
 #[repr(C)]
@@ -291,6 +307,7 @@ struct CudaApi {
     cu_memcpy_dtoh: Option<FnCuMemcpyDtoH>,
     cu_mem_get_info: Option<FnCuMemGetInfo>,
     cu_memcpy_dtod: Option<FnCuMemcpyDtoD>,
+    cu_memcpy_dtod_async: Option<FnCuMemcpyDtoDAsync>,
     cu_memcpy: Option<FnCuMemcpy>,
     cu_memcpy_async: Option<FnCuMemcpyAsync>,
     cu_memcpy_htod_async: Option<FnCuMemcpyHtoDAsync>,
@@ -311,14 +328,22 @@ struct CudaApi {
     cu_mem_pool_set_attribute: Option<FnCuMemPoolSetAttribute>,
     cu_mem_pool_trim_to: Option<FnCuMemPoolTrimTo>,
     cu_mem_alloc_from_pool_async: Option<FnCuMemAllocFromPoolAsync>,
+    cu_device_get_mem_pool: Option<FnCuDeviceGetMemPool>,
+    cu_device_set_mem_pool: Option<FnCuDeviceSetMemPool>,
+    cu_mem_get_allocation_granularity: Option<FnCuMemGetAllocationGranularity>,
 
     cu_mem_alloc_host: Option<FnCuMemAllocHost>,
+    cu_mem_host_alloc: Option<FnCuMemHostAlloc>,
     cu_mem_free_host: Option<FnCuMemFreeHost>,
     cu_mem_host_get_device_pointer: Option<FnCuMemHostGetDevicePointer>,
     cu_mem_host_get_flags: Option<FnCuMemHostGetFlags>,
     cu_mem_host_register: Option<FnCuMemHostRegister>,
     cu_mem_host_unregister: Option<FnCuMemHostUnregister>,
 
+    cu_mem_alloc_pitch: Option<FnCuMemAllocPitch>,
+
+    cu_module_load: Option<FnCuModuleLoad>,
+    cu_module_load_fat_binary: Option<FnCuModuleLoadFatBinary>,
     cu_module_load_data: Option<FnCuModuleLoadData>,
     cu_module_load_data_ex: Option<FnCuModuleLoadDataEx>,
     cu_module_unload: Option<FnCuModuleUnload>,
@@ -461,6 +486,7 @@ impl CudaApi {
             cu_memcpy_dtoh: load_sym!(lib, b"cuMemcpyDtoH_v2\0", b"cuMemcpyDtoH\0"),
             cu_mem_get_info: load_sym!(lib, b"cuMemGetInfo_v2\0", b"cuMemGetInfo\0"),
             cu_memcpy_dtod: load_sym!(lib, b"cuMemcpyDtoD_v2\0", b"cuMemcpyDtoD\0"),
+            cu_memcpy_dtod_async: load_sym!(lib, b"cuMemcpyDtoDAsync_v2\0", b"cuMemcpyDtoDAsync\0"),
             cu_memcpy: load_sym!(lib, b"cuMemcpy\0"),
             cu_memcpy_async: load_sym!(lib, b"cuMemcpyAsync\0"),
             cu_memcpy_htod_async: load_sym!(lib, b"cuMemcpyHtoDAsync_v2\0", b"cuMemcpyHtoDAsync\0"),
@@ -481,14 +507,22 @@ impl CudaApi {
             cu_mem_pool_set_attribute: load_sym!(lib, b"cuMemPoolSetAttribute\0"),
             cu_mem_pool_trim_to: load_sym!(lib, b"cuMemPoolTrimTo\0"),
             cu_mem_alloc_from_pool_async: load_sym!(lib, b"cuMemAllocFromPoolAsync\0"),
+            cu_device_get_mem_pool: load_sym!(lib, b"cuDeviceGetMemPool\0"),
+            cu_device_set_mem_pool: load_sym!(lib, b"cuDeviceSetMemPool\0"),
+            cu_mem_get_allocation_granularity: load_sym!(lib, b"cuMemGetAllocationGranularity\0"),
 
             cu_mem_alloc_host: load_sym!(lib, b"cuMemAllocHost_v2\0", b"cuMemAllocHost\0"),
+            cu_mem_host_alloc: load_sym!(lib, b"cuMemHostAlloc\0"),
             cu_mem_free_host: load_sym!(lib, b"cuMemFreeHost\0"),
             cu_mem_host_get_device_pointer: load_sym!(lib, b"cuMemHostGetDevicePointer_v2\0", b"cuMemHostGetDevicePointer\0"),
             cu_mem_host_get_flags: load_sym!(lib, b"cuMemHostGetFlags\0"),
             cu_mem_host_register: load_sym!(lib, b"cuMemHostRegister_v2\0", b"cuMemHostRegister\0"),
             cu_mem_host_unregister: load_sym!(lib, b"cuMemHostUnregister\0"),
 
+            cu_mem_alloc_pitch: load_sym!(lib, b"cuMemAllocPitch_v2\0", b"cuMemAllocPitch\0"),
+
+            cu_module_load: load_sym!(lib, b"cuModuleLoad\0"),
+            cu_module_load_fat_binary: load_sym!(lib, b"cuModuleLoadFatBinary\0"),
             cu_module_load_data: load_sym!(lib, b"cuModuleLoadData\0"),
             cu_module_load_data_ex: load_sym!(lib, b"cuModuleLoadDataEx\0"),
             cu_module_unload: load_sym!(lib, b"cuModuleUnload\0"),
@@ -809,6 +843,20 @@ impl GpuBackend for CudaGpuBackend {
         Ok(())
     }
 
+    fn mem_alloc_pitch(&self, width_in_bytes: usize, height: usize, element_size: u32) -> Result<(u64, usize), CuResult> {
+        if width_in_bytes == 0 || height == 0 {
+            return Err(CuResult::InvalidValue);
+        }
+        let func = require_fn(&self.api.cu_mem_alloc_pitch)?;
+        let mut dptr: u64 = 0;
+        let mut pitch: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut dptr, &mut pitch, width_in_bytes, height, element_size))?;
+        }
+        tracing::trace!(ptr = dptr, pitch, width_in_bytes, height, "pitched VRAM allocated");
+        Ok((dptr, pitch))
+    }
+
     fn memcpy_htod(&self, dst: u64, data: &[u8]) -> CuResult {
         let func = match require_fn(&self.api.cu_memcpy_htod) {
             Ok(f) => f,
@@ -892,6 +940,30 @@ impl GpuBackend for CudaGpuBackend {
     }
 
     // --- Module operations ---
+
+    fn module_load(&self, path: &str) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_module_load)?;
+        let c_path = std::ffi::CString::new(path).map_err(|_| CuResult::InvalidValue)?;
+        let mut module: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut module, c_path.as_ptr() as *const u8))?;
+        }
+        tracing::debug!(module, path, "CUDA module loaded from file");
+        Ok(module as u64)
+    }
+
+    fn module_load_fat_binary(&self, data: &[u8]) -> Result<u64, CuResult> {
+        if data.is_empty() {
+            return Err(CuResult::InvalidValue);
+        }
+        let func = require_fn(&self.api.cu_module_load_fat_binary)?;
+        let mut module: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut module, data.as_ptr()))?;
+        }
+        tracing::debug!(module, data_len = data.len(), "CUDA module loaded from fat binary");
+        Ok(module as u64)
+    }
 
     fn module_load_data(&self, data: &[u8]) -> Result<u64, CuResult> {
         if data.is_empty() {
@@ -1319,6 +1391,19 @@ impl GpuBackend for CudaGpuBackend {
         Ok(ptr as u64)
     }
 
+    fn mem_host_alloc(&self, byte_size: usize, flags: u32) -> Result<u64, CuResult> {
+        if byte_size == 0 {
+            return Err(CuResult::InvalidValue);
+        }
+        let func = require_fn(&self.api.cu_mem_host_alloc)?;
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe {
+            map_cuda_result(func(&mut ptr, byte_size, flags))?;
+        }
+        tracing::trace!(ptr = ?ptr, byte_size, flags, "host memory allocated with flags");
+        Ok(ptr as u64)
+    }
+
     fn mem_free_host(&self, ptr: u64) -> Result<(), CuResult> {
         let func = require_fn(&self.api.cu_mem_free_host)?;
         unsafe {
@@ -1384,6 +1469,14 @@ impl GpuBackend for CudaGpuBackend {
         let func = require_fn(&self.api.cu_memcpy_async)?;
         unsafe {
             map_cuda_result(func(dst, src, size as usize, stream as usize))?;
+        }
+        Ok(())
+    }
+
+    fn memcpy_dtod_async(&self, dst: u64, src: u64, byte_count: usize, stream: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_memcpy_dtod_async)?;
+        unsafe {
+            map_cuda_result(func(dst, src, byte_count, stream as usize))?;
         }
         Ok(())
     }
@@ -1861,6 +1954,38 @@ impl GpuBackend for CudaGpuBackend {
             map_cuda_result(func(&mut dptr, size, pool as usize, stream as usize))?;
         }
         Ok(dptr)
+    }
+
+    fn device_get_mem_pool(&self, device: i32) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_device_get_mem_pool)?;
+        let mut pool: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut pool, device))?;
+        }
+        Ok(pool as u64)
+    }
+
+    fn device_set_mem_pool(&self, device: i32, pool: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_device_set_mem_pool)?;
+        unsafe {
+            map_cuda_result(func(device, pool as usize))?;
+        }
+        Ok(())
+    }
+
+    fn mem_get_allocation_granularity(&self, location_type: i32, location_id: i32, option: i32) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_mem_get_allocation_granularity)?;
+        #[repr(C)]
+        struct CuMemLocation {
+            loc_type: i32,
+            id: i32,
+        }
+        let loc = CuMemLocation { loc_type: location_type, id: location_id };
+        let mut granularity: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut granularity, &loc as *const _ as *const std::ffi::c_void, option))?;
+        }
+        Ok(granularity as u64)
     }
 }
 

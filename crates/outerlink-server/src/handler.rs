@@ -924,6 +924,35 @@ pub fn handle_request_full(
             }
         }
 
+        MessageType::LaunchKernelEx => {
+            // Same wire format as LaunchKernel (44B header + params).
+            // Client extracts fields from CUlaunchConfig and sends the same payload.
+            if payload.len() < 44 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let func = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let grid_x = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let grid_y = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+            let grid_z = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+            let block_x = u32::from_le_bytes(payload[20..24].try_into().unwrap());
+            let block_y = u32::from_le_bytes(payload[24..28].try_into().unwrap());
+            let block_z = u32::from_le_bytes(payload[28..32].try_into().unwrap());
+            let shared_mem = u32::from_le_bytes(payload[32..36].try_into().unwrap());
+            let stream = u64::from_le_bytes(payload[36..44].try_into().unwrap());
+            let params = &payload[44..];
+            match backend.launch_kernel(
+                func,
+                [grid_x, grid_y, grid_z],
+                [block_x, block_y, block_z],
+                shared_mem,
+                stream,
+                params,
+            ) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         MessageType::MemcpyHtoDAsync => {
             // [8B dst][8B stream][data...]
             if payload.len() < 16 {
@@ -1760,6 +1789,138 @@ pub fn handle_request_full(
                     session.untrack_link_state(state_handle);
                     result_only(rid, CuResult::Success)
                 }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- MemcpyDtoDAsync ---
+        MessageType::MemcpyDtoDAsync => {
+            // [8B dst][8B src][8B byte_count][8B stream] = 32 bytes
+            if payload.len() < 32 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let dst = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let src = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            let byte_count = u64::from_le_bytes(payload[16..24].try_into().unwrap()) as usize;
+            let stream = u64::from_le_bytes(payload[24..32].try_into().unwrap());
+            match backend.memcpy_dtod_async(dst, src, byte_count, stream) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- MemHostAlloc ---
+        MessageType::MemHostAlloc => {
+            // [8B byte_size][4B flags] = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let byte_size = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
+            let flags = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            match backend.mem_host_alloc(byte_size, flags) {
+                Ok(ptr) => {
+                    session.track_host_alloc(ptr);
+                    success_with(rid, &ptr.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- MemAllocPitch ---
+        MessageType::MemAllocPitch => {
+            // [8B width_in_bytes][8B height][4B element_size] = 20 bytes
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let width = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
+            let height = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+            let element_size = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+            match backend.mem_alloc_pitch(width, height, element_size) {
+                Ok((dptr, pitch)) => {
+                    session.track_mem_alloc(dptr);
+                    let mut data = dptr.to_le_bytes().to_vec();
+                    data.extend_from_slice(&(pitch as u64).to_le_bytes());
+                    success_with(rid, &data)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- ModuleLoad ---
+        MessageType::ModuleLoad => {
+            // [4B path_len][path_bytes]
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let path_len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+            if payload.len() < 4 + path_len || path_len == 0 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let path = match std::str::from_utf8(&payload[4..4 + path_len]) {
+                Ok(s) => s,
+                Err(_) => return error_response(rid, CuResult::InvalidValue),
+            };
+            match backend.module_load(path) {
+                Ok(handle) => {
+                    session.track_module(handle);
+                    success_with(rid, &handle.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- ModuleLoadFatBinary ---
+        MessageType::ModuleLoadFatBinary => {
+            if payload.is_empty() {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            match backend.module_load_fat_binary(payload) {
+                Ok(handle) => {
+                    session.track_module(handle);
+                    success_with(rid, &handle.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- DeviceGetMemPool ---
+        MessageType::DeviceGetMemPool => {
+            // [4B device]
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let device = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            match backend.device_get_mem_pool(device) {
+                Ok(pool) => success_with(rid, &pool.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- DeviceSetMemPool ---
+        MessageType::DeviceSetMemPool => {
+            // [4B device][8B pool] = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let device = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            let pool = u64::from_le_bytes(payload[4..12].try_into().unwrap());
+            match backend.device_set_mem_pool(device, pool) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- MemGetAllocationGranularity ---
+        MessageType::MemGetAllocationGranularity => {
+            // [4B location_type][4B location_id][4B option] = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let location_type = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            let location_id = i32::from_le_bytes(payload[4..8].try_into().unwrap());
+            let option = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+            match backend.mem_get_allocation_granularity(location_type, location_id, option) {
+                Ok(granularity) => success_with(rid, &granularity.to_le_bytes()),
                 Err(e) => error_response(rid, e),
             }
         }
@@ -5646,5 +5807,107 @@ mod tests {
         let (_, resp) = dispatch_with(&gpu, &hdr, &destroy_payload, &mut session);
         assert_eq!(response_result(&resp), CuResult::Success);
         assert_eq!(session.link_state_count(), 0);
+    }
+
+    // ----- LaunchKernelEx handler tests -----
+
+    #[test]
+    fn test_launch_kernel_ex_handler() {
+        let gpu = StubGpuBackend::new();
+
+        // Load module + get function
+        let mod_payload = b"ptx";
+        let hdr = req(MessageType::ModuleLoadData, mod_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, mod_payload);
+        let module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        let kern_name = b"kern";
+        let mut func_payload = module.to_le_bytes().to_vec();
+        func_payload.extend_from_slice(&(kern_name.len() as u32).to_le_bytes());
+        func_payload.extend_from_slice(kern_name);
+        let hdr = req(MessageType::ModuleGetFunction, func_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &func_payload);
+        let func = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Build LaunchKernelEx payload (same wire format as LaunchKernel)
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // gridX
+        payload.extend_from_slice(&1u32.to_le_bytes()); // gridY
+        payload.extend_from_slice(&1u32.to_le_bytes()); // gridZ
+        payload.extend_from_slice(&256u32.to_le_bytes()); // blockX
+        payload.extend_from_slice(&1u32.to_le_bytes()); // blockY
+        payload.extend_from_slice(&1u32.to_le_bytes()); // blockZ
+        payload.extend_from_slice(&0u32.to_le_bytes()); // shared_mem
+        payload.extend_from_slice(&0u64.to_le_bytes()); // stream (default)
+        payload.extend_from_slice(&0u32.to_le_bytes()); // num_params = 0
+        let hdr = req(MessageType::LaunchKernelEx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_launch_kernel_ex_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 10]; // too short
+        let hdr = req(MessageType::LaunchKernelEx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_launch_kernel_ex_invalid_func() {
+        let gpu = StubGpuBackend::new();
+
+        let mut payload = 0xBADu64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // gridX
+        payload.extend_from_slice(&1u32.to_le_bytes()); // gridY
+        payload.extend_from_slice(&1u32.to_le_bytes()); // gridZ
+        payload.extend_from_slice(&1u32.to_le_bytes()); // blockX
+        payload.extend_from_slice(&1u32.to_le_bytes()); // blockY
+        payload.extend_from_slice(&1u32.to_le_bytes()); // blockZ
+        payload.extend_from_slice(&0u32.to_le_bytes()); // shared_mem
+        payload.extend_from_slice(&0u64.to_le_bytes()); // stream
+        let hdr = req(MessageType::LaunchKernelEx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_launch_kernel_ex_with_params() {
+        let gpu = StubGpuBackend::new();
+
+        // Load module + get function
+        let mod_payload = b"ptx";
+        let hdr = req(MessageType::ModuleLoadData, mod_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, mod_payload);
+        let module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        let kern_name = b"kern";
+        let mut func_payload = module.to_le_bytes().to_vec();
+        func_payload.extend_from_slice(&(kern_name.len() as u32).to_le_bytes());
+        func_payload.extend_from_slice(kern_name);
+        let hdr = req(MessageType::ModuleGetFunction, func_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &func_payload);
+        let func = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Build launch payload with kernel params
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&2u32.to_le_bytes()); // gridX
+        payload.extend_from_slice(&1u32.to_le_bytes()); // gridY
+        payload.extend_from_slice(&1u32.to_le_bytes()); // gridZ
+        payload.extend_from_slice(&128u32.to_le_bytes()); // blockX
+        payload.extend_from_slice(&1u32.to_le_bytes()); // blockY
+        payload.extend_from_slice(&1u32.to_le_bytes()); // blockZ
+        payload.extend_from_slice(&1024u32.to_le_bytes()); // shared_mem
+        payload.extend_from_slice(&0u64.to_le_bytes()); // stream (default)
+        // 2 params
+        payload.extend_from_slice(&2u32.to_le_bytes()); // num_params = 2
+        payload.extend_from_slice(&8u32.to_le_bytes()); // param 0 size
+        payload.extend_from_slice(&0xAAAAu64.to_le_bytes()); // param 0 data
+        payload.extend_from_slice(&4u32.to_le_bytes()); // param 1 size
+        payload.extend_from_slice(&256u32.to_le_bytes()); // param 1 data
+        let hdr = req(MessageType::LaunchKernelEx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
     }
 }

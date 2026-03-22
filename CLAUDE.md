@@ -74,6 +74,17 @@ outterlink/
 - Research: `planning/research/R1-R7`
 - ADRs: `docs/decisions/ADR-001-license.md`, `ADR-002-opendma-naming.md`
 
+## Agent Workflow
+
+**Every implementation agent MUST be followed by a review+fix agent.** This is non-negotiable:
+
+1. Spawn implementation agent (in worktree)
+2. When done, spawn review agent (critic or general-purpose) to review the new code
+3. Fix any issues found by the review
+4. Only then merge to master
+
+This applies to all code-writing agents. No implementation goes unreviewed.
+
 ## Rules
 
 - Documentation framework: `.claude/rules/documentation-framework.md`

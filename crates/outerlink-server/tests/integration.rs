@@ -1219,3 +1219,52 @@ async fn test_memset_d8_short_payload_e2e() {
     drop(client);
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn test_launch_kernel_ex_e2e() {
+    let (listener, addr) = bind_server().await;
+    let backend: Arc<dyn GpuBackend> = Arc::new(StubGpuBackend::new());
+    let server = spawn_server(listener, backend);
+
+    let client = connect_client(&addr).await;
+
+    // 1. Load module.
+    let ptx = b"fake ptx";
+    let (_hdr, payload) = roundtrip(&client, MessageType::ModuleLoadData, ptx, 1).await;
+    let data = assert_success(&payload);
+    let module = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 2. Get function.
+    let name = b"triton_kernel";
+    let mut func_payload = module.to_le_bytes().to_vec();
+    func_payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    func_payload.extend_from_slice(name);
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::ModuleGetFunction, &func_payload, 2).await;
+    let data = assert_success(&payload);
+    let func = u64::from_le_bytes(data[..8].try_into().unwrap());
+
+    // 3. Launch via LaunchKernelEx (same wire format, just different MessageType)
+    let mut launch_payload = func.to_le_bytes().to_vec();
+    launch_payload.extend_from_slice(&4_u32.to_le_bytes()); // gridX
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // gridY
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // gridZ
+    launch_payload.extend_from_slice(&128_u32.to_le_bytes()); // blockX
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // blockY
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // blockZ
+    launch_payload.extend_from_slice(&2048_u32.to_le_bytes()); // sharedMem
+    launch_payload.extend_from_slice(&0_u64.to_le_bytes()); // stream (default)
+    launch_payload.extend_from_slice(&1_u32.to_le_bytes()); // num_params = 1
+    launch_payload.extend_from_slice(&8_u32.to_le_bytes()); // param 0 size = 8
+    launch_payload.extend_from_slice(&0xDEAD_BEEF_u64.to_le_bytes()); // param 0 data
+    let (_hdr, payload) =
+        roundtrip(&client, MessageType::LaunchKernelEx, &launch_payload, 3).await;
+    assert_eq!(
+        response_result(&payload),
+        CuResult::Success,
+        "LaunchKernelEx should succeed"
+    );
+
+    drop(client);
+    server.await.unwrap();
+}

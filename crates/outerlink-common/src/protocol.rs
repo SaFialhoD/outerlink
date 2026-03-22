@@ -86,10 +86,13 @@ pub enum MessageType {
     ModuleLoadDataEx = 0x0044,
     FuncGetAttribute = 0x0045,
     FuncSetAttribute = 0x0046,
+    ModuleLoad = 0x0049,
+    ModuleLoadFatBinary = 0x004A,
 
     // Execution
     LaunchKernel = 0x0050,
     LaunchCooperativeKernel = 0x0055,
+    LaunchKernelEx = 0x0056,
 
     // Stream
     StreamCreate = 0x0060,
@@ -131,6 +134,9 @@ pub enum MessageType {
     MemPoolSetAttribute = 0x00C6,
     MemPoolTrimTo = 0x00C7,
     MemAllocFromPoolAsync = 0x00C8,
+    DeviceGetMemPool = 0x00C9,
+    DeviceSetMemPool = 0x00CA,
+    MemGetAllocationGranularity = 0x00CB,
 
     // Memory (extended)
     MemHostGetDevicePointer = 0x00B3,
@@ -140,6 +146,9 @@ pub enum MessageType {
     MemGetAddressRange = 0x00B2,
     Memcpy = 0x00B7,
     MemcpyAsync = 0x00B8,
+    MemcpyDtoDAsync = 0x00B9,
+    MemHostAlloc = 0x00BA,
+    MemAllocPitch = 0x00BB,
 
     // Context (extended)
     CtxGetStreamPriorityRange = 0x00A0,
@@ -233,8 +242,11 @@ impl MessageType {
             0x0044 => Some(Self::ModuleLoadDataEx),
             0x0045 => Some(Self::FuncGetAttribute),
             0x0046 => Some(Self::FuncSetAttribute),
+            0x0049 => Some(Self::ModuleLoad),
+            0x004A => Some(Self::ModuleLoadFatBinary),
             0x0050 => Some(Self::LaunchKernel),
             0x0055 => Some(Self::LaunchCooperativeKernel),
+            0x0056 => Some(Self::LaunchKernelEx),
             0x0060 => Some(Self::StreamCreate),
             0x0061 => Some(Self::StreamDestroy),
             0x0062 => Some(Self::StreamSynchronize),
@@ -266,6 +278,9 @@ impl MessageType {
             0x00C6 => Some(Self::MemPoolSetAttribute),
             0x00C7 => Some(Self::MemPoolTrimTo),
             0x00C8 => Some(Self::MemAllocFromPoolAsync),
+            0x00C9 => Some(Self::DeviceGetMemPool),
+            0x00CA => Some(Self::DeviceSetMemPool),
+            0x00CB => Some(Self::MemGetAllocationGranularity),
             0x00B2 => Some(Self::MemGetAddressRange),
             0x00B3 => Some(Self::MemHostGetDevicePointer),
             0x00B4 => Some(Self::MemHostGetFlags),
@@ -273,6 +288,9 @@ impl MessageType {
             0x00B6 => Some(Self::MemHostUnregister),
             0x00B7 => Some(Self::Memcpy),
             0x00B8 => Some(Self::MemcpyAsync),
+            0x00B9 => Some(Self::MemcpyDtoDAsync),
+            0x00BA => Some(Self::MemHostAlloc),
+            0x00BB => Some(Self::MemAllocPitch),
             0x0047 => Some(Self::FuncSetCacheConfig),
             0x0048 => Some(Self::FuncSetSharedMemConfig),
             0x00A0 => Some(Self::CtxGetStreamPriorityRange),
@@ -417,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_message_type_roundtrip() {
-        for raw in [0x0001u16, 0x0010, 0x0020, 0x0030, 0x0050, 0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00F0, 0x00FF] {
+        for raw in [0x0001u16, 0x0010, 0x0020, 0x0030, 0x0050, 0x0056, 0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00F0, 0x00FF] {
             let mt = MessageType::from_raw(raw).unwrap();
             assert_eq!(mt as u16, raw);
         }
