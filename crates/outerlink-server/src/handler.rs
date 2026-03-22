@@ -78,6 +78,10 @@ fn error_response(request_id: u64, err: CuResult) -> (MessageHeader, Vec<u8>) {
 /// | CtxSetLimit             | u32 limit_type, u64 val | (empty)                            |
 /// | CtxGetStreamPriorityRange| (empty)             | i32 least, i32 greatest               |
 /// | CtxGetFlags             | (empty)              | u32 flags                             |
+/// | DeviceCanAccessPeer     | i32 dev, i32 peerDev  | i32 canAccessPeer                     |
+/// | DeviceGetP2PAttribute   | i32 attr, i32 src, i32 dst | i32 value                        |
+/// | CtxEnablePeerAccess     | u64 peerCtx, u32 flags| (empty)                               |
+/// | CtxDisablePeerAccess    | u64 peerCtx           | (empty)                               |
 /// | FuncGetAttribute        | i32 attrib, u64 func | i32 value                             |
 pub fn handle_request(
     backend: &dyn GpuBackend,
@@ -931,6 +935,66 @@ pub fn handle_request(
             let flags = u32::from_le_bytes(payload[16..20].try_into().unwrap());
             match backend.stream_wait_event(stream, event, flags) {
                 Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- Peer access ---
+
+        MessageType::DeviceCanAccessPeer => {
+            // [4B dev][4B peerDev] = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let dev = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            let peer_dev = i32::from_le_bytes(payload[4..8].try_into().unwrap());
+            match backend.device_can_access_peer(dev, peer_dev) {
+                Ok(val) => success_with(rid, &val.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::DeviceGetP2PAttribute => {
+            // [4B attrib][4B srcDevice][4B dstDevice] = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let attrib = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            let src_device = i32::from_le_bytes(payload[4..8].try_into().unwrap());
+            let dst_device = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+            match backend.device_get_p2p_attribute(attrib, src_device, dst_device) {
+                Ok(val) => success_with(rid, &val.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::CtxEnablePeerAccess => {
+            // [8B peerContext][4B flags] = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let peer_ctx = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let flags = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            match backend.ctx_enable_peer_access(peer_ctx, flags) {
+                Ok(()) => {
+                    session.track_peer_access(peer_ctx);
+                    result_only(rid, CuResult::Success)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::CtxDisablePeerAccess => {
+            // [8B peerContext] = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let peer_ctx = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.ctx_disable_peer_access(peer_ctx) {
+                Ok(()) => {
+                    session.untrack_peer_access(peer_ctx);
+                    result_only(rid, CuResult::Success)
+                }
                 Err(e) => error_response(rid, e),
             }
         }
@@ -3040,5 +3104,172 @@ mod tests {
         let hdr = req(MessageType::CtxGetFlags, 0);
         let (_, resp) = dispatch(&gpu, &hdr, &[]);
         assert_eq!(response_result(&resp), CuResult::InvalidContext);
+    }
+
+    // --- Peer access handler tests ---
+
+    #[test]
+    fn test_device_can_access_peer_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&0i32.to_le_bytes()); // dev
+        payload[4..8].copy_from_slice(&0i32.to_le_bytes()); // peerDev
+        let hdr = req(MessageType::DeviceCanAccessPeer, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let can_access = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(can_access, 0); // self-peer returns 0
+    }
+
+    #[test]
+    fn test_device_can_access_peer_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::DeviceCanAccessPeer, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_device_can_access_peer_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&0i32.to_le_bytes());
+        payload[4..8].copy_from_slice(&99i32.to_le_bytes());
+        let hdr = req(MessageType::DeviceCanAccessPeer, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidDevice);
+    }
+
+    #[test]
+    fn test_device_get_p2p_attribute_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = [0u8; 12];
+        payload[..4].copy_from_slice(&1i32.to_le_bytes()); // ACCESS_SUPPORTED
+        payload[4..8].copy_from_slice(&0i32.to_le_bytes()); // srcDevice
+        payload[8..12].copy_from_slice(&0i32.to_le_bytes()); // dstDevice
+        let hdr = req(MessageType::DeviceGetP2PAttribute, 12);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let val = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(val, 0); // stub returns 0 for all
+    }
+
+    #[test]
+    fn test_device_get_p2p_attribute_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::DeviceGetP2PAttribute, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_ctx_enable_peer_access_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create a context to use as peer
+        let mut ctx_payload = [0u8; 8];
+        ctx_payload[..4].copy_from_slice(&0u32.to_le_bytes());
+        ctx_payload[4..8].copy_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::CtxCreate, 8);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &ctx_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let peer_ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Enable peer access
+        let mut payload = [0u8; 12];
+        payload[..8].copy_from_slice(&peer_ctx.to_le_bytes());
+        payload[8..12].copy_from_slice(&0u32.to_le_bytes()); // flags
+        let hdr = req(MessageType::CtxEnablePeerAccess, 12);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_ctx_enable_peer_access_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxEnablePeerAccess, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_ctx_enable_peer_access_already_enabled() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create context
+        let mut ctx_payload = [0u8; 8];
+        ctx_payload[..4].copy_from_slice(&0u32.to_le_bytes());
+        ctx_payload[4..8].copy_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::CtxCreate, 8);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &ctx_payload, &mut session);
+        let peer_ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Enable peer access
+        let mut payload = [0u8; 12];
+        payload[..8].copy_from_slice(&peer_ctx.to_le_bytes());
+        payload[8..12].copy_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::CtxEnablePeerAccess, 12);
+        dispatch_with(&gpu, &hdr, &payload, &mut session);
+
+        // Enable again: should fail
+        let hdr = req(MessageType::CtxEnablePeerAccess, 12);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::PeerAccessAlreadyEnabled);
+    }
+
+    #[test]
+    fn test_ctx_disable_peer_access_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create context
+        let mut ctx_payload = [0u8; 8];
+        ctx_payload[..4].copy_from_slice(&0u32.to_le_bytes());
+        ctx_payload[4..8].copy_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::CtxCreate, 8);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &ctx_payload, &mut session);
+        let peer_ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Enable then disable
+        let mut payload_enable = [0u8; 12];
+        payload_enable[..8].copy_from_slice(&peer_ctx.to_le_bytes());
+        payload_enable[8..12].copy_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::CtxEnablePeerAccess, 12);
+        dispatch_with(&gpu, &hdr, &payload_enable, &mut session);
+
+        let payload_disable = peer_ctx.to_le_bytes();
+        let hdr = req(MessageType::CtxDisablePeerAccess, 8);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload_disable, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_ctx_disable_peer_access_not_enabled() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create context
+        let mut ctx_payload = [0u8; 8];
+        ctx_payload[..4].copy_from_slice(&0u32.to_le_bytes());
+        ctx_payload[4..8].copy_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::CtxCreate, 8);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &ctx_payload, &mut session);
+        let peer_ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Disable without enable
+        let payload = peer_ctx.to_le_bytes();
+        let hdr = req(MessageType::CtxDisablePeerAccess, 8);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::PeerAccessNotEnabled);
+    }
+
+    #[test]
+    fn test_ctx_disable_peer_access_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxDisablePeerAccess, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }

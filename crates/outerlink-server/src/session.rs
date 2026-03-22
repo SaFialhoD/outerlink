@@ -41,6 +41,8 @@ pub struct ConnectionSession {
     events: HashSet<u64>,
     /// Primary contexts retained by this session: device -> ctx_handle.
     primary_ctxs: HashMap<i32, u64>,
+    /// Peer contexts enabled for P2P access by this session.
+    peer_access_ctxs: HashSet<u64>,
 }
 
 impl ConnectionSession {
@@ -55,6 +57,7 @@ impl ConnectionSession {
             streams: HashSet::new(),
             events: HashSet::new(),
             primary_ctxs: HashMap::new(),
+            peer_access_ctxs: HashSet::new(),
         }
     }
 
@@ -177,6 +180,16 @@ impl ConnectionSession {
         if let Some(ctx) = self.primary_ctxs.remove(&device) {
             self.contexts.remove(&ctx);
         }
+    }
+
+    /// Record that this session enabled peer access to `peer_ctx`.
+    pub fn track_peer_access(&mut self, peer_ctx: u64) {
+        self.peer_access_ctxs.insert(peer_ctx);
+    }
+
+    /// Remove `peer_ctx` from this session's tracked peer access set.
+    pub fn untrack_peer_access(&mut self, peer_ctx: u64) {
+        self.peer_access_ctxs.remove(&peer_ctx);
     }
 
     // --- Resource queries ---
@@ -304,6 +317,20 @@ impl ConnectionSession {
                 }
                 Err(e) => {
                     tracing::warn!(ptr = ptr, error = ?e, "session cleanup: failed to free host memory");
+                    report.failed += 1;
+                }
+            }
+        }
+
+        // 5.5. Peer access (disable before contexts are destroyed)
+        for peer_ctx in self.peer_access_ctxs.drain() {
+            match backend.ctx_disable_peer_access(peer_ctx) {
+                Ok(()) => {
+                    tracing::debug!(handle = peer_ctx, "session cleanup: disabled peer access");
+                    report.succeeded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(handle = peer_ctx, error = ?e, "session cleanup: failed to disable peer access");
                     report.failed += 1;
                 }
             }

@@ -112,6 +112,12 @@ static const hook_entry_t hook_table[] = {
     { "cuCtxGetStreamPriorityRange", (void *)hook_cuCtxGetStreamPriorityRange },
     { "cuCtxGetFlags",           (void *)hook_cuCtxGetFlags },
 
+    /* Peer access */
+    { "cuDeviceCanAccessPeer",      (void *)hook_cuDeviceCanAccessPeer },
+    { "cuDeviceGetP2PAttribute",    (void *)hook_cuDeviceGetP2PAttribute },
+    { "cuCtxEnablePeerAccess",      (void *)hook_cuCtxEnablePeerAccess },
+    { "cuCtxDisablePeerAccess",     (void *)hook_cuCtxDisablePeerAccess },
+
     /* Primary context */
     { "cuDevicePrimaryCtxRetain",       (void *)hook_cuDevicePrimaryCtxRetain },
     { "cuDevicePrimaryCtxRelease",      (void *)hook_cuDevicePrimaryCtxRelease_v2 },
@@ -286,6 +292,28 @@ CUresult hook_cuDeviceTotalMem_v2(size_t *bytes, CUdevice dev) {
 CUresult hook_cuDeviceGetUuid(CUuuid *uuid, CUdevice dev) {
     ensure_init();
     return ol_cuDeviceGetUuid((unsigned char *)uuid->bytes, dev);
+}
+
+/* -- Peer access -- */
+
+CUresult hook_cuDeviceCanAccessPeer(int *canAccessPeer, CUdevice dev, CUdevice peerDev) {
+    ensure_init();
+    return ol_cuDeviceCanAccessPeer(canAccessPeer, dev, peerDev);
+}
+
+CUresult hook_cuDeviceGetP2PAttribute(int *value, int attrib, CUdevice srcDevice, CUdevice dstDevice) {
+    ensure_init();
+    return ol_cuDeviceGetP2PAttribute(value, attrib, srcDevice, dstDevice);
+}
+
+CUresult hook_cuCtxEnablePeerAccess(CUcontext peerContext, unsigned int flags) {
+    ensure_init();
+    return ol_cuCtxEnablePeerAccess((unsigned long long)(uintptr_t)peerContext, flags);
+}
+
+CUresult hook_cuCtxDisablePeerAccess(CUcontext peerContext) {
+    ensure_init();
+    return ol_cuCtxDisablePeerAccess((unsigned long long)(uintptr_t)peerContext);
 }
 
 /* -- Context -- */

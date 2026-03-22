@@ -124,6 +124,12 @@ type FnCuMemcpyDtoD = unsafe extern "C" fn(dst: u64, src: u64, bytecount: usize)
 type FnCuMemAllocHost = unsafe extern "C" fn(pp: *mut *mut std::ffi::c_void, bytesize: usize) -> i32;
 type FnCuMemFreeHost = unsafe extern "C" fn(p: *mut std::ffi::c_void) -> i32;
 
+// Peer access
+type FnCuDeviceCanAccessPeer = unsafe extern "C" fn(can_access: *mut i32, dev: i32, peer_dev: i32) -> i32;
+type FnCuDeviceGetP2PAttribute = unsafe extern "C" fn(value: *mut i32, attrib: i32, src: i32, dst: i32) -> i32;
+type FnCuCtxEnablePeerAccess = unsafe extern "C" fn(peer_ctx: usize, flags: u32) -> i32;
+type FnCuCtxDisablePeerAccess = unsafe extern "C" fn(peer_ctx: usize) -> i32;
+
 // Stream wait event
 type FnCuStreamWaitEvent = unsafe extern "C" fn(stream: usize, event: usize, flags: u32) -> i32;
 
@@ -221,6 +227,11 @@ struct CudaApi {
     cu_event_query: Option<FnCuEventQuery>,
 
     cu_launch_kernel: Option<FnCuLaunchKernel>,
+
+    cu_device_can_access_peer: Option<FnCuDeviceCanAccessPeer>,
+    cu_device_get_p2p_attribute: Option<FnCuDeviceGetP2PAttribute>,
+    cu_ctx_enable_peer_access: Option<FnCuCtxEnablePeerAccess>,
+    cu_ctx_disable_peer_access: Option<FnCuCtxDisablePeerAccess>,
 
     cu_device_primary_ctx_retain: Option<FnCuDevicePrimaryCtxRetain>,
     cu_device_primary_ctx_release: Option<FnCuDevicePrimaryCtxRelease>,
@@ -347,6 +358,11 @@ impl CudaApi {
             cu_event_query: load_sym!(lib, b"cuEventQuery\0"),
 
             cu_launch_kernel: load_sym!(lib, b"cuLaunchKernel\0"),
+
+            cu_device_can_access_peer: load_sym!(lib, b"cuDeviceCanAccessPeer\0"),
+            cu_device_get_p2p_attribute: load_sym!(lib, b"cuDeviceGetP2PAttribute\0"),
+            cu_ctx_enable_peer_access: load_sym!(lib, b"cuCtxEnablePeerAccess\0"),
+            cu_ctx_disable_peer_access: load_sym!(lib, b"cuCtxDisablePeerAccess\0"),
 
             cu_device_primary_ctx_retain: load_sym!(lib, b"cuDevicePrimaryCtxRetain\0"),
             cu_device_primary_ctx_release: load_sym!(lib, b"cuDevicePrimaryCtxRelease_v2\0", b"cuDevicePrimaryCtxRelease\0"),
@@ -1144,6 +1160,42 @@ impl GpuBackend for CudaGpuBackend {
             map_cuda_result(func(&mut flags))?;
         }
         Ok(flags)
+    }
+
+    fn device_can_access_peer(&self, dev: i32, peer_dev: i32) -> Result<i32, CuResult> {
+        let func = require_fn(&self.api.cu_device_can_access_peer)?;
+        let dev_h = self.resolve_device(dev)?;
+        let peer_h = self.resolve_device(peer_dev)?;
+        let mut can_access: i32 = 0;
+        unsafe {
+            map_cuda_result(func(&mut can_access, dev_h, peer_h))?;
+        }
+        Ok(can_access)
+    }
+
+    fn device_get_p2p_attribute(&self, attrib: i32, src_device: i32, dst_device: i32) -> Result<i32, CuResult> {
+        let func = require_fn(&self.api.cu_device_get_p2p_attribute)?;
+        let src = self.resolve_device(src_device)?;
+        let dst = self.resolve_device(dst_device)?;
+        let mut value: i32 = 0;
+        unsafe {
+            map_cuda_result(func(&mut value, attrib, src, dst))?;
+        }
+        Ok(value)
+    }
+
+    fn ctx_enable_peer_access(&self, peer_ctx: u64, flags: u32) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_ctx_enable_peer_access)?;
+        unsafe {
+            map_cuda_result(func(peer_ctx as usize, flags))
+        }
+    }
+
+    fn ctx_disable_peer_access(&self, peer_ctx: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_ctx_disable_peer_access)?;
+        unsafe {
+            map_cuda_result(func(peer_ctx as usize))
+        }
     }
 
     fn shutdown(&self) {

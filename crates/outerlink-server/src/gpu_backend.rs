@@ -5,7 +5,7 @@
 //! memory. The stub is used for testing, CI, and development on machines
 //! without a GPU.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use outerlink_common::cuda_types::CuResult;
@@ -198,6 +198,23 @@ pub trait GpuBackend: Send + Sync {
         params: &[u8],
     ) -> Result<(), CuResult>;
 
+    // --- Peer access ---
+
+    /// Check if one device can access another's memory via P2P.
+    /// Returns `Ok(1)` if access is possible, `Ok(0)` otherwise.
+    fn device_can_access_peer(&self, dev: i32, peer_dev: i32) -> Result<i32, CuResult>;
+
+    /// Get a P2P attribute between two devices.
+    /// Returns the attribute value on success.
+    fn device_get_p2p_attribute(&self, attrib: i32, src_device: i32, dst_device: i32) -> Result<i32, CuResult>;
+
+    /// Enable peer access from the current context to a peer context.
+    /// `flags` is reserved (must be 0 in current CUDA).
+    fn ctx_enable_peer_access(&self, peer_ctx: u64, flags: u32) -> Result<(), CuResult>;
+
+    /// Disable peer access previously enabled via `ctx_enable_peer_access`.
+    fn ctx_disable_peer_access(&self, peer_ctx: u64) -> Result<(), CuResult>;
+
     // --- Lifecycle ---
 
     // --- Context stack & query operations ---
@@ -352,6 +369,8 @@ struct StubState {
     context_stack: Vec<u64>,
     /// Resource limits: CU_LIMIT_* -> value.
     context_limits: HashMap<u32, u64>,
+    /// Peer contexts currently enabled for P2P access.
+    peer_access: HashSet<u64>,
 }
 
 impl StubState {
@@ -403,6 +422,7 @@ impl StubGpuBackend {
                     m.insert(0x02, 8_388_608);   // CU_LIMIT_MALLOC_HEAP_SIZE
                     m
                 },
+                peer_access: HashSet::new(),
             }),
         }
     }
@@ -962,6 +982,50 @@ impl GpuBackend for StubGpuBackend {
             return Err(CuResult::InvalidValue);
         }
         tracing::trace!(func, stream, "stub: launch_kernel (no-op)");
+        Ok(())
+    }
+
+    // --- Peer access ---
+
+    fn device_can_access_peer(&self, dev: i32, peer_dev: i32) -> Result<i32, CuResult> {
+        Self::check_device(dev)?;
+        Self::check_device(peer_dev)?;
+        // Per CUDA spec: a device cannot peer-access itself (that's just normal access).
+        // Return 0 if dev == peer_dev.
+        // In stub single-device mode, dev and peer_dev are both 0 so we always return 0.
+        if dev == peer_dev {
+            Ok(0)
+        } else {
+            // Different devices on the same server: would be 1 if we had multiple GPUs.
+            // Single-device stub: can never reach here because check_device(dev) only allows 0.
+            Ok(0)
+        }
+    }
+
+    fn device_get_p2p_attribute(&self, _attrib: i32, src_device: i32, dst_device: i32) -> Result<i32, CuResult> {
+        Self::check_device(src_device)?;
+        Self::check_device(dst_device)?;
+        // Stub: return 0 for all attributes (no P2P support).
+        Ok(0)
+    }
+
+    fn ctx_enable_peer_access(&self, peer_ctx: u64, _flags: u32) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if !state.contexts.contains_key(&peer_ctx) {
+            return Err(CuResult::InvalidContext);
+        }
+        if state.peer_access.contains(&peer_ctx) {
+            return Err(CuResult::PeerAccessAlreadyEnabled);
+        }
+        state.peer_access.insert(peer_ctx);
+        Ok(())
+    }
+
+    fn ctx_disable_peer_access(&self, peer_ctx: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if !state.peer_access.remove(&peer_ctx) {
+            return Err(CuResult::PeerAccessNotEnabled);
+        }
         Ok(())
     }
 
@@ -2235,5 +2299,83 @@ mod tests {
     fn test_ctx_get_flags_invalid_context() {
         let gpu = StubGpuBackend::new();
         assert_eq!(gpu.ctx_get_flags(0xDEAD), Err(CuResult::InvalidContext));
+    }
+
+    // --- Peer access tests ---
+
+    #[test]
+    fn test_device_can_access_peer_same_device() {
+        let gpu = StubGpuBackend::new();
+        // Per CUDA spec: self-peer returns 0
+        assert_eq!(gpu.device_can_access_peer(0, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_device_can_access_peer_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_can_access_peer(0, 99), Err(CuResult::InvalidDevice));
+        assert_eq!(gpu.device_can_access_peer(99, 0), Err(CuResult::InvalidDevice));
+    }
+
+    #[test]
+    fn test_device_get_p2p_attribute_returns_zero() {
+        let gpu = StubGpuBackend::new();
+        // All P2P attributes return 0 in stub
+        assert_eq!(gpu.device_get_p2p_attribute(0, 0, 0).unwrap(), 0); // PERFORMANCE_RANK
+        assert_eq!(gpu.device_get_p2p_attribute(1, 0, 0).unwrap(), 0); // ACCESS_SUPPORTED
+        assert_eq!(gpu.device_get_p2p_attribute(2, 0, 0).unwrap(), 0); // NATIVE_ATOMIC_SUPPORTED
+        assert_eq!(gpu.device_get_p2p_attribute(3, 0, 0).unwrap(), 0); // CUDA_ARRAY_ACCESS_SUPPORTED
+    }
+
+    #[test]
+    fn test_device_get_p2p_attribute_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_get_p2p_attribute(0, 99, 0), Err(CuResult::InvalidDevice));
+        assert_eq!(gpu.device_get_p2p_attribute(0, 0, 99), Err(CuResult::InvalidDevice));
+    }
+
+    #[test]
+    fn test_ctx_enable_peer_access() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        assert!(gpu.ctx_enable_peer_access(ctx, 0).is_ok());
+    }
+
+    #[test]
+    fn test_ctx_enable_peer_access_already_enabled() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        gpu.ctx_enable_peer_access(ctx, 0).unwrap();
+        assert_eq!(gpu.ctx_enable_peer_access(ctx, 0), Err(CuResult::PeerAccessAlreadyEnabled));
+    }
+
+    #[test]
+    fn test_ctx_enable_peer_access_invalid_context() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_enable_peer_access(0xDEAD, 0), Err(CuResult::InvalidContext));
+    }
+
+    #[test]
+    fn test_ctx_disable_peer_access() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        gpu.ctx_enable_peer_access(ctx, 0).unwrap();
+        assert!(gpu.ctx_disable_peer_access(ctx).is_ok());
+    }
+
+    #[test]
+    fn test_ctx_disable_peer_access_not_enabled() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        assert_eq!(gpu.ctx_disable_peer_access(ctx), Err(CuResult::PeerAccessNotEnabled));
+    }
+
+    #[test]
+    fn test_ctx_disable_peer_access_double_disable() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        gpu.ctx_enable_peer_access(ctx, 0).unwrap();
+        gpu.ctx_disable_peer_access(ctx).unwrap();
+        assert_eq!(gpu.ctx_disable_peer_access(ctx), Err(CuResult::PeerAccessNotEnabled));
     }
 }

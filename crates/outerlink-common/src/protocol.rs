@@ -37,6 +37,8 @@ pub enum MessageType {
     DeviceGetAttribute = 0x0015,
     DeviceTotalMem = 0x0016,
     DeviceGetUuid = 0x0017,
+    DeviceCanAccessPeer = 0x0018,
+    DeviceGetP2PAttribute = 0x0019,
 
     // Context
     CtxCreate = 0x0020,
@@ -102,6 +104,10 @@ pub enum MessageType {
     EventElapsedTime = 0x0074,
     EventQuery = 0x0075,
 
+    // Peer access
+    CtxEnablePeerAccess = 0x0090,
+    CtxDisablePeerAccess = 0x0091,
+
     // Context (extended)
     CtxGetStreamPriorityRange = 0x00A0,
     CtxGetFlags = 0x00A1,
@@ -125,6 +131,8 @@ impl MessageType {
             0x0015 => Some(Self::DeviceGetAttribute),
             0x0016 => Some(Self::DeviceTotalMem),
             0x0017 => Some(Self::DeviceGetUuid),
+            0x0018 => Some(Self::DeviceCanAccessPeer),
+            0x0019 => Some(Self::DeviceGetP2PAttribute),
             0x0020 => Some(Self::CtxCreate),
             0x0021 => Some(Self::CtxDestroy),
             0x0022 => Some(Self::CtxSetCurrent),
@@ -177,6 +185,8 @@ impl MessageType {
             0x0073 => Some(Self::EventSynchronize),
             0x0074 => Some(Self::EventElapsedTime),
             0x0075 => Some(Self::EventQuery),
+            0x0090 => Some(Self::CtxEnablePeerAccess),
+            0x0091 => Some(Self::CtxDisablePeerAccess),
             0x00A0 => Some(Self::CtxGetStreamPriorityRange),
             0x00A1 => Some(Self::CtxGetFlags),
             0x00F0 => Some(Self::Response),
