@@ -3046,8 +3046,9 @@ pub extern "C" fn ol_cuMemsetD32Async(dst_device: u64, value: u32, count: usize,
 #[no_mangle]
 pub extern "C" fn ol_cuMemsetD16(dst_device: u64, value: u16, count: usize) -> u32 {
     let client = get_client();
+    // CUDA: zero-count memset is a successful no-op
     if count == 0 {
-        return CUDA_ERROR_INVALID_VALUE;
+        return CUDA_SUCCESS;
     }
     // Connected: send to server
     if client.connected.load(Ordering::Acquire) {
@@ -3075,8 +3076,9 @@ pub extern "C" fn ol_cuMemsetD16(dst_device: u64, value: u16, count: usize) -> u
 #[no_mangle]
 pub extern "C" fn ol_cuMemsetD16Async(dst_device: u64, value: u16, count: usize, stream: u64) -> u32 {
     let client = get_client();
+    // CUDA: zero-count memset is a successful no-op
     if count == 0 {
-        return CUDA_ERROR_INVALID_VALUE;
+        return CUDA_SUCCESS;
     }
     // Connected: send to server
     if client.connected.load(Ordering::Acquire) {
@@ -3120,9 +3122,13 @@ pub extern "C" fn ol_cuMemsetD16Async(dst_device: u64, value: u16, count: usize,
 #[no_mangle]
 pub extern "C" fn ol_cuMemcpy(dst: u64, src: u64, byte_count: usize) -> u32 {
     let client = get_client();
+    // CUDA: zero-size memcpy is a successful no-op
     if byte_count == 0 {
-        return CUDA_ERROR_INVALID_VALUE;
+        return CUDA_SUCCESS;
     }
+    // TODO(Phase 2): cuMemcpy is direction-agnostic under UVA. Currently only
+    // handles device-to-device because both pointers go through device_ptrs
+    // handle translation. Host pointer support needs a separate path.
     // Connected: translate both handles and send to server
     if client.connected.load(Ordering::Acquire) {
         let remote_dst = match client.handles.device_ptrs.to_remote(dst) {
@@ -3156,8 +3162,9 @@ pub extern "C" fn ol_cuMemcpy(dst: u64, src: u64, byte_count: usize) -> u32 {
 #[no_mangle]
 pub extern "C" fn ol_cuMemcpyAsync(dst: u64, src: u64, byte_count: usize, stream: u64) -> u32 {
     let client = get_client();
+    // CUDA: zero-size memcpy is a successful no-op
     if byte_count == 0 {
-        return CUDA_ERROR_INVALID_VALUE;
+        return CUDA_SUCCESS;
     }
     // Connected: translate all handles and send to server
     if client.connected.load(Ordering::Acquire) {
@@ -5550,7 +5557,7 @@ mod tests {
 
     #[test]
     fn test_ol_cu_memset_d16_zero_count() {
-        assert_eq!(ol_cuMemsetD16(0x1000, 0xFF, 0), CUDA_ERROR_INVALID_VALUE);
+        assert_eq!(ol_cuMemsetD16(0x1000, 0xFF, 0), CUDA_SUCCESS);
     }
 
     #[test]
@@ -5574,7 +5581,7 @@ mod tests {
 
     #[test]
     fn test_ol_cu_memset_d16_async_zero_count() {
-        assert_eq!(ol_cuMemsetD16Async(0x1000, 0xFF, 0, 0), CUDA_ERROR_INVALID_VALUE);
+        assert_eq!(ol_cuMemsetD16Async(0x1000, 0xFF, 0, 0), CUDA_SUCCESS);
     }
 
     // -- Memcpy (generic) tests --
@@ -5608,7 +5615,7 @@ mod tests {
 
     #[test]
     fn test_ol_cu_memcpy_zero_size() {
-        assert_eq!(ol_cuMemcpy(0x1000, 0x2000, 0), CUDA_ERROR_INVALID_VALUE);
+        assert_eq!(ol_cuMemcpy(0x1000, 0x2000, 0), CUDA_SUCCESS);
     }
 
     // -- MemcpyAsync (generic) tests --
@@ -5640,7 +5647,7 @@ mod tests {
 
     #[test]
     fn test_ol_cu_memcpy_async_zero_size() {
-        assert_eq!(ol_cuMemcpyAsync(0x1000, 0x2000, 0, 0), CUDA_ERROR_INVALID_VALUE);
+        assert_eq!(ol_cuMemcpyAsync(0x1000, 0x2000, 0, 0), CUDA_SUCCESS);
     }
 
     #[test]
