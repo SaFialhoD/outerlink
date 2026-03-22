@@ -84,6 +84,12 @@ fn error_response(request_id: u64, err: CuResult) -> (MessageHeader, Vec<u8>) {
 /// | CtxDisablePeerAccess    | u64 peerCtx           | (empty)                               |
 /// | FuncGetAttribute        | i32 attrib, u64 func | i32 value                             |
 /// | FuncSetAttribute        | u64 func, i32 attrib, i32 value | (empty)                      |
+/// | CtxGetCacheConfig       | (empty)              | u32 config                            |
+/// | CtxSetCacheConfig       | u32 config           | (empty)                               |
+/// | CtxGetSharedMemConfig   | (empty)              | u32 config                            |
+/// | CtxSetSharedMemConfig   | u32 config           | (empty)                               |
+/// | FuncSetCacheConfig      | u64 func, u32 config | (empty)                               |
+/// | FuncSetSharedMemConfig  | u64 func, u32 config | (empty)                               |
 /// | MemGetAddressRange      | u64 dptr             | u64 base, u64 size                    |
 /// | OccupancyMaxActiveBlocks| u64 func, i32 blockSize, u64 dynSmem = 20B | i32 numBlocks |
 /// | OccupancyMaxActiveBlocksWithFlags| u64 func, i32 blockSize, u64 dynSmem, u32 flags = 24B | i32 numBlocks |
@@ -1142,6 +1148,66 @@ pub fn handle_request(
                     }
                     success_with(rid, &data)
                 }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- Cache and shared memory configuration ---
+
+        MessageType::CtxGetCacheConfig => match backend.ctx_get_cache_config() {
+            Ok(config) => success_with(rid, &config.to_le_bytes()),
+            Err(e) => error_response(rid, e),
+        },
+
+        MessageType::CtxSetCacheConfig => {
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let config = u32::from_le_bytes(payload[..4].try_into().unwrap());
+            match backend.ctx_set_cache_config(config) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::CtxGetSharedMemConfig => match backend.ctx_get_shared_mem_config() {
+            Ok(config) => success_with(rid, &config.to_le_bytes()),
+            Err(e) => error_response(rid, e),
+        },
+
+        MessageType::CtxSetSharedMemConfig => {
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let config = u32::from_le_bytes(payload[..4].try_into().unwrap());
+            match backend.ctx_set_shared_mem_config(config) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::FuncSetCacheConfig => {
+            // Payload: 8B func (u64 LE) + 4B config (u32 LE) = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let func = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let config = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            match backend.func_set_cache_config(func, config) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::FuncSetSharedMemConfig => {
+            // Payload: 8B func (u64 LE) + 4B config (u32 LE) = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let func = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let config = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            match backend.func_set_shared_mem_config(func, config) {
+                Ok(()) => result_only(rid, CuResult::Success),
                 Err(e) => error_response(rid, e),
             }
         }
@@ -3748,6 +3814,159 @@ mod tests {
         payload.extend_from_slice(&2i32.to_le_bytes()); // only 1 attr (need 3)
         let hdr = req(MessageType::PointerGetAttributes, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- CtxGetCacheConfig / CtxSetCacheConfig handler tests ---
+
+    #[test]
+    fn test_ctx_get_cache_config_handler() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxGetCacheConfig, 0);
+        let (_, resp) = dispatch(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let config = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(config, 0); // default: PREFER_NONE
+    }
+
+    #[test]
+    fn test_ctx_set_cache_config_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        // Set to PREFER_SHARED (0x01)
+        let payload = 0x01u32.to_le_bytes();
+        let hdr = req(MessageType::CtxSetCacheConfig, 4);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        // Verify
+        let hdr = req(MessageType::CtxGetCacheConfig, 0);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &[], &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let config = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(config, 0x01);
+    }
+
+    #[test]
+    fn test_ctx_set_cache_config_invalid() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0x04u32.to_le_bytes();
+        let hdr = req(MessageType::CtxSetCacheConfig, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_ctx_set_cache_config_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxSetCacheConfig, 2);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 2]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- CtxGetSharedMemConfig / CtxSetSharedMemConfig handler tests ---
+
+    #[test]
+    fn test_ctx_get_shared_mem_config_handler() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxGetSharedMemConfig, 0);
+        let (_, resp) = dispatch(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let config = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(config, 0); // default
+    }
+
+    #[test]
+    fn test_ctx_set_shared_mem_config_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let payload = 0x02u32.to_le_bytes(); // EIGHT_BYTE_BANK_SIZE
+        let hdr = req(MessageType::CtxSetSharedMemConfig, 4);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        // Verify
+        let hdr = req(MessageType::CtxGetSharedMemConfig, 0);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &[], &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let config = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(config, 0x02);
+    }
+
+    #[test]
+    fn test_ctx_set_shared_mem_config_invalid() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0x03u32.to_le_bytes();
+        let hdr = req(MessageType::CtxSetSharedMemConfig, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_ctx_set_shared_mem_config_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::CtxSetSharedMemConfig, 2);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 2]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- FuncSetCacheConfig handler tests ---
+
+    #[test]
+    fn test_func_set_cache_config_handler() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0x02u32.to_le_bytes()); // PREFER_L1
+        let hdr = req(MessageType::FuncSetCacheConfig, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_func_set_cache_config_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 0xDEADu64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0x01u32.to_le_bytes());
+        let hdr = req(MessageType::FuncSetCacheConfig, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_func_set_cache_config_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::FuncSetCacheConfig, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- FuncSetSharedMemConfig handler tests ---
+
+    #[test]
+    fn test_func_set_shared_mem_config_handler() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0x01u32.to_le_bytes()); // FOUR_BYTE
+        let hdr = req(MessageType::FuncSetSharedMemConfig, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_func_set_shared_mem_config_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 0xDEADu64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0x01u32.to_le_bytes());
+        let hdr = req(MessageType::FuncSetSharedMemConfig, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_func_set_shared_mem_config_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::FuncSetSharedMemConfig, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 8]);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }

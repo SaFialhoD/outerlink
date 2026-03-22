@@ -121,6 +121,14 @@ pub enum MessageType {
     // Context (extended)
     CtxGetStreamPriorityRange = 0x00A0,
     CtxGetFlags = 0x00A1,
+    CtxGetCacheConfig = 0x00A2,
+    CtxSetCacheConfig = 0x00A3,
+    CtxGetSharedMemConfig = 0x00A4,
+    CtxSetSharedMemConfig = 0x00A5,
+
+    // Function configuration
+    FuncSetCacheConfig = 0x0047,
+    FuncSetSharedMemConfig = 0x0048,
 
     // Pointer attributes
     PointerGetAttribute = 0x00B0,
@@ -207,8 +215,14 @@ impl MessageType {
             0x0090 => Some(Self::CtxEnablePeerAccess),
             0x0091 => Some(Self::CtxDisablePeerAccess),
             0x00B2 => Some(Self::MemGetAddressRange),
+            0x0047 => Some(Self::FuncSetCacheConfig),
+            0x0048 => Some(Self::FuncSetSharedMemConfig),
             0x00A0 => Some(Self::CtxGetStreamPriorityRange),
             0x00A1 => Some(Self::CtxGetFlags),
+            0x00A2 => Some(Self::CtxGetCacheConfig),
+            0x00A3 => Some(Self::CtxSetCacheConfig),
+            0x00A4 => Some(Self::CtxGetSharedMemConfig),
+            0x00A5 => Some(Self::CtxSetSharedMemConfig),
             0x00B0 => Some(Self::PointerGetAttribute),
             0x00B1 => Some(Self::PointerGetAttributes),
             0x00F0 => Some(Self::Response),

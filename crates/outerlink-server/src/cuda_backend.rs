@@ -84,6 +84,12 @@ type FnCuModuleGetGlobal =
     unsafe extern "C" fn(dptr: *mut u64, size: *mut usize, module: usize, name: *const u8) -> i32;
 type FnCuFuncGetAttribute = unsafe extern "C" fn(pi: *mut i32, attrib: i32, hfunc: usize) -> i32;
 type FnCuFuncSetAttribute = unsafe extern "C" fn(hfunc: usize, attrib: i32, value: i32) -> i32;
+type FnCuCtxGetCacheConfig = unsafe extern "C" fn(pconfig: *mut i32) -> i32;
+type FnCuCtxSetCacheConfig = unsafe extern "C" fn(config: i32) -> i32;
+type FnCuCtxGetSharedMemConfig = unsafe extern "C" fn(pconfig: *mut i32) -> i32;
+type FnCuCtxSetSharedMemConfig = unsafe extern "C" fn(config: i32) -> i32;
+type FnCuFuncSetCacheConfig = unsafe extern "C" fn(hfunc: usize, config: i32) -> i32;
+type FnCuFuncSetSharedMemConfig = unsafe extern "C" fn(hfunc: usize, config: i32) -> i32;
 
 // Memory address range query
 type FnCuMemGetAddressRange = unsafe extern "C" fn(pbase: *mut u64, psize: *mut usize, dptr: u64) -> i32;
@@ -244,6 +250,12 @@ struct CudaApi {
     cu_module_get_global: Option<FnCuModuleGetGlobal>,
     cu_func_get_attribute: Option<FnCuFuncGetAttribute>,
     cu_func_set_attribute: Option<FnCuFuncSetAttribute>,
+    cu_ctx_get_cache_config: Option<FnCuCtxGetCacheConfig>,
+    cu_ctx_set_cache_config: Option<FnCuCtxSetCacheConfig>,
+    cu_ctx_get_shared_mem_config: Option<FnCuCtxGetSharedMemConfig>,
+    cu_ctx_set_shared_mem_config: Option<FnCuCtxSetSharedMemConfig>,
+    cu_func_set_cache_config: Option<FnCuFuncSetCacheConfig>,
+    cu_func_set_shared_mem_config: Option<FnCuFuncSetSharedMemConfig>,
     cu_mem_get_address_range: Option<FnCuMemGetAddressRange>,
 
     cu_stream_create: Option<FnCuStreamCreate>,
@@ -385,6 +397,12 @@ impl CudaApi {
             cu_module_get_global: load_sym!(lib, b"cuModuleGetGlobal_v2\0", b"cuModuleGetGlobal\0"),
             cu_func_get_attribute: load_sym!(lib, b"cuFuncGetAttribute\0"),
             cu_func_set_attribute: load_sym!(lib, b"cuFuncSetAttribute\0"),
+            cu_ctx_get_cache_config: load_sym!(lib, b"cuCtxGetCacheConfig\0"),
+            cu_ctx_set_cache_config: load_sym!(lib, b"cuCtxSetCacheConfig\0"),
+            cu_ctx_get_shared_mem_config: load_sym!(lib, b"cuCtxGetSharedMemConfig\0"),
+            cu_ctx_set_shared_mem_config: load_sym!(lib, b"cuCtxSetSharedMemConfig\0"),
+            cu_func_set_cache_config: load_sym!(lib, b"cuFuncSetCacheConfig\0"),
+            cu_func_set_shared_mem_config: load_sym!(lib, b"cuFuncSetSharedMemConfig\0"),
             cu_mem_get_address_range: load_sym!(lib, b"cuMemGetAddressRange_v2\0", b"cuMemGetAddressRange\0"),
 
             cu_stream_create: load_sym!(lib, b"cuStreamCreate\0"),
@@ -871,6 +889,52 @@ impl GpuBackend for CudaGpuBackend {
         }
         tracing::trace!(func, attrib, value, "CUDA func attribute set");
         Ok(())
+    }
+
+    fn ctx_get_cache_config(&self) -> Result<u32, CuResult> {
+        let f = require_fn(&self.api.cu_ctx_get_cache_config)?;
+        let mut config: i32 = 0;
+        unsafe {
+            map_cuda_result(f(&mut config))?;
+        }
+        Ok(config as u32)
+    }
+
+    fn ctx_set_cache_config(&self, config: u32) -> Result<(), CuResult> {
+        let f = require_fn(&self.api.cu_ctx_set_cache_config)?;
+        unsafe {
+            map_cuda_result(f(config as i32))
+        }
+    }
+
+    fn ctx_get_shared_mem_config(&self) -> Result<u32, CuResult> {
+        let f = require_fn(&self.api.cu_ctx_get_shared_mem_config)?;
+        let mut config: i32 = 0;
+        unsafe {
+            map_cuda_result(f(&mut config))?;
+        }
+        Ok(config as u32)
+    }
+
+    fn ctx_set_shared_mem_config(&self, config: u32) -> Result<(), CuResult> {
+        let f = require_fn(&self.api.cu_ctx_set_shared_mem_config)?;
+        unsafe {
+            map_cuda_result(f(config as i32))
+        }
+    }
+
+    fn func_set_cache_config(&self, func: u64, config: u32) -> Result<(), CuResult> {
+        let f = require_fn(&self.api.cu_func_set_cache_config)?;
+        unsafe {
+            map_cuda_result(f(func as usize, config as i32))
+        }
+    }
+
+    fn func_set_shared_mem_config(&self, func: u64, config: u32) -> Result<(), CuResult> {
+        let f = require_fn(&self.api.cu_func_set_shared_mem_config)?;
+        unsafe {
+            map_cuda_result(f(func as usize, config as i32))
+        }
     }
 
     fn mem_get_address_range(&self, dptr: u64) -> Result<(u64, usize), CuResult> {

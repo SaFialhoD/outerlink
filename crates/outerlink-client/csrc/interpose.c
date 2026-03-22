@@ -111,6 +111,10 @@ static const hook_entry_t hook_table[] = {
     { "cuCtxSetLimit",           (void *)hook_cuCtxSetLimit },
     { "cuCtxGetStreamPriorityRange", (void *)hook_cuCtxGetStreamPriorityRange },
     { "cuCtxGetFlags",           (void *)hook_cuCtxGetFlags },
+    { "cuCtxGetCacheConfig",     (void *)hook_cuCtxGetCacheConfig },
+    { "cuCtxSetCacheConfig",     (void *)hook_cuCtxSetCacheConfig },
+    { "cuCtxGetSharedMemConfig", (void *)hook_cuCtxGetSharedMemConfig },
+    { "cuCtxSetSharedMemConfig", (void *)hook_cuCtxSetSharedMemConfig },
 
     /* Peer access */
     { "cuDeviceCanAccessPeer",      (void *)hook_cuDeviceCanAccessPeer },
@@ -162,6 +166,8 @@ static const hook_entry_t hook_table[] = {
     { "cuModuleGetGlobal_v2",    (void *)hook_cuModuleGetGlobal },
     { "cuFuncGetAttribute",      (void *)hook_cuFuncGetAttribute },
     { "cuFuncSetAttribute",      (void *)hook_cuFuncSetAttribute },
+    { "cuFuncSetCacheConfig",    (void *)hook_cuFuncSetCacheConfig },
+    { "cuFuncSetSharedMemConfig",(void *)hook_cuFuncSetSharedMemConfig },
     { "cuMemGetAddressRange",    (void *)hook_cuMemGetAddressRange },
     { "cuMemGetAddressRange_v2", (void *)hook_cuMemGetAddressRange },
 
@@ -417,6 +423,26 @@ CUresult hook_cuCtxGetStreamPriorityRange(int *leastPriority, int *greatestPrior
 CUresult hook_cuCtxGetFlags(unsigned int *flags) {
     ensure_init();
     return ol_cuCtxGetFlags(flags);
+}
+
+CUresult hook_cuCtxGetCacheConfig(int *pconfig) {
+    ensure_init();
+    return ol_cuCtxGetCacheConfig((unsigned int *)pconfig);
+}
+
+CUresult hook_cuCtxSetCacheConfig(int config) {
+    ensure_init();
+    return ol_cuCtxSetCacheConfig((unsigned int)config);
+}
+
+CUresult hook_cuCtxGetSharedMemConfig(int *pConfig) {
+    ensure_init();
+    return ol_cuCtxGetSharedMemConfig((unsigned int *)pConfig);
+}
+
+CUresult hook_cuCtxSetSharedMemConfig(int config) {
+    ensure_init();
+    return ol_cuCtxSetSharedMemConfig((unsigned int)config);
 }
 
 /* -- Primary context -- */
@@ -688,6 +714,16 @@ CUresult hook_cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunctio
 CUresult hook_cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) {
     ensure_init();
     return ol_cuFuncSetAttribute((unsigned long long)(uintptr_t)hfunc, (int)attrib, value);
+}
+
+CUresult hook_cuFuncSetCacheConfig(CUfunction hfunc, int config) {
+    ensure_init();
+    return ol_cuFuncSetCacheConfig((unsigned long long)(uintptr_t)hfunc, (unsigned int)config);
+}
+
+CUresult hook_cuFuncSetSharedMemConfig(CUfunction hfunc, int config) {
+    ensure_init();
+    return ol_cuFuncSetSharedMemConfig((unsigned long long)(uintptr_t)hfunc, (unsigned int)config);
 }
 
 CUresult hook_cuMemGetAddressRange(CUdeviceptr *pbase, size_t *psize, CUdeviceptr dptr) {

@@ -130,6 +130,21 @@ typedef enum {
     CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE = 15,
 } CUfunction_attribute;
 
+/* Cache configuration */
+typedef enum {
+    CU_FUNC_CACHE_PREFER_NONE = 0x00,
+    CU_FUNC_CACHE_PREFER_SHARED = 0x01,
+    CU_FUNC_CACHE_PREFER_L1 = 0x02,
+    CU_FUNC_CACHE_PREFER_EQUAL = 0x03,
+} CUfunc_cache;
+
+/* Shared memory configuration */
+typedef enum {
+    CU_SHARED_MEM_CONFIG_DEFAULT_BANK_SIZE = 0x00,
+    CU_SHARED_MEM_CONFIG_FOUR_BYTE_BANK_SIZE = 0x01,
+    CU_SHARED_MEM_CONFIG_EIGHT_BYTE_BANK_SIZE = 0x02,
+} CUsharedconfig;
+
 /* Pointer attributes */
 typedef enum {
     CU_POINTER_ATTRIBUTE_CONTEXT = 1,
