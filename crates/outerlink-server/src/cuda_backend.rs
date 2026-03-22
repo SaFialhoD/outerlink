@@ -1683,6 +1683,18 @@ impl GpuBackend for CudaGpuBackend {
         }
     }
 
+    fn stream_add_callback(&self, _stream: u64, _callback_id: u64, _flags: u32) -> Result<(), CuResult> {
+        // In the real backend, we would use cuLaunchHostFunc to enqueue a
+        // notification-sender on the real GPU stream. For now, callbacks fire
+        // immediately (the handler sends CallbackReady right after the response).
+        Ok(())
+    }
+
+    fn launch_host_func(&self, _stream: u64, _callback_id: u64) -> Result<(), CuResult> {
+        // Same as stream_add_callback -- immediate notification in Phase 1.
+        Ok(())
+    }
+
     fn shutdown(&self) {
         // The CUDA driver cleans up all resources when the process exits,
         // but we log explicitly so operators know cleanup was intentional.

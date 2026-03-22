@@ -403,6 +403,21 @@ pub trait GpuBackend: Send + Sync {
     /// In stub mode, delegates to `mem_alloc` (pool and stream are ignored).
     fn mem_alloc_from_pool_async(&self, size: usize, pool: u64, stream: u64) -> Result<u64, CuResult>;
 
+    // --- Callback operations ---
+
+    /// Register a stream callback (cuStreamAddCallback).
+    ///
+    /// In the stub, callbacks fire immediately (no real stream ordering).
+    /// The handler is responsible for sending CallbackReady to the client.
+    /// Returns Ok(()) on success.
+    fn stream_add_callback(&self, stream: u64, callback_id: u64, flags: u32) -> Result<(), CuResult>;
+
+    /// Enqueue a host function on a stream (cuLaunchHostFunc).
+    ///
+    /// In the stub, this behaves identically to stream_add_callback.
+    /// Returns Ok(()) on success.
+    fn launch_host_func(&self, stream: u64, callback_id: u64) -> Result<(), CuResult>;
+
     // --- Lifecycle ---
 
     /// Clean up all GPU resources held by this backend.
@@ -1569,6 +1584,24 @@ impl GpuBackend for StubGpuBackend {
             None => return Err(CuResult::InvalidValue),
         };
         stub_fn.attributes.insert(-2, config as i32); // -2 = shared mem config
+        Ok(())
+    }
+
+    fn stream_add_callback(&self, stream: u64, _callback_id: u64, _flags: u32) -> Result<(), CuResult> {
+        // Stub: validate stream exists, callback fires immediately (handler sends CallbackReady).
+        let state = self.state.lock().unwrap();
+        if stream != 0 && !state.streams.contains_key(&stream) {
+            return Err(CuResult::InvalidValue);
+        }
+        Ok(())
+    }
+
+    fn launch_host_func(&self, stream: u64, _callback_id: u64) -> Result<(), CuResult> {
+        // Stub: validate stream exists, callback fires immediately (handler sends CallbackReady).
+        let state = self.state.lock().unwrap();
+        if stream != 0 && !state.streams.contains_key(&stream) {
+            return Err(CuResult::InvalidValue);
+        }
         Ok(())
     }
 
@@ -3828,5 +3861,74 @@ mod tests {
         let p1 = gpu.mem_pool_create(1, 1, 0).unwrap();
         let p2 = gpu.mem_pool_create(1, 1, 0).unwrap();
         assert_ne!(p1, p2);
+    }
+
+    // ----- Callback operation tests -----
+
+    #[test]
+    fn test_stream_add_callback_valid_stream() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        assert!(gpu.stream_add_callback(stream, 1, 0).is_ok());
+    }
+
+    #[test]
+    fn test_stream_add_callback_default_stream() {
+        let gpu = StubGpuBackend::new();
+        // Stream 0 (default) is always valid.
+        assert!(gpu.stream_add_callback(0, 1, 0).is_ok());
+    }
+
+    #[test]
+    fn test_stream_add_callback_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.stream_add_callback(0xDEAD_BEEF, 1, 0),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_launch_host_func_valid_stream() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        assert!(gpu.launch_host_func(stream, 1).is_ok());
+    }
+
+    #[test]
+    fn test_launch_host_func_default_stream() {
+        let gpu = StubGpuBackend::new();
+        assert!(gpu.launch_host_func(0, 1).is_ok());
+    }
+
+    #[test]
+    fn test_launch_host_func_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.launch_host_func(0xDEAD_BEEF, 1),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_stream_add_callback_after_destroy() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        gpu.stream_destroy(stream).unwrap();
+        assert_eq!(
+            gpu.stream_add_callback(stream, 1, 0),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_launch_host_func_after_destroy() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        gpu.stream_destroy(stream).unwrap();
+        assert_eq!(
+            gpu.launch_host_func(stream, 1),
+            Err(CuResult::InvalidValue)
+        );
     }
 }

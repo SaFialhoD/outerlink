@@ -20,6 +20,8 @@ use outerlink_common::retry::RetryConfig;
 use outerlink_common::tcp_transport::TcpTransportConnection;
 use outerlink_common::transport::TransportConnection;
 
+use crate::callback::CallbackRegistry;
+
 /// Global client state, initialized on first CUDA call.
 pub struct OuterLinkClient {
     /// Handle translation tables
@@ -47,6 +49,18 @@ pub struct OuterLinkClient {
     /// connections. Only one thread can execute the reconnect loop at a time;
     /// others wait and then check if already connected.
     reconnect_in_progress: std::sync::Mutex<()>,
+    /// Session ID assigned by the server during handshake.
+    /// Used by the callback channel to identify which session it belongs to.
+    session_id: AtomicU64,
+    /// Client-side callback registry (cuStreamAddCallback / cuLaunchHostFunc).
+    /// Stores callback_id -> (fn_ptr, user_data). Only callback_id crosses the wire.
+    pub callback_registry: Arc<CallbackRegistry>,
+    /// Dedicated TCP connection for receiving CallbackReady notifications.
+    /// Established lazily on first callback registration. Protected by a Mutex
+    /// to prevent concurrent initialization.
+    callback_connection: std::sync::Mutex<Option<Arc<TcpTransportConnection>>>,
+    /// Handle for the callback listener thread. Kept to detect if it's running.
+    callback_listener_running: AtomicBool,
 }
 
 impl OuterLinkClient {
@@ -68,6 +82,10 @@ impl OuterLinkClient {
             current_remote_ctx: AtomicU64::new(0),
             retry_config: RetryConfig::default(),
             reconnect_in_progress: std::sync::Mutex::new(()),
+            session_id: AtomicU64::new(0),
+            callback_registry: Arc::new(CallbackRegistry::new()),
+            callback_connection: std::sync::Mutex::new(None),
+            callback_listener_running: AtomicBool::new(false),
         }
     }
 
@@ -89,6 +107,10 @@ impl OuterLinkClient {
             current_remote_ctx: AtomicU64::new(0),
             retry_config,
             reconnect_in_progress: std::sync::Mutex::new(()),
+            session_id: AtomicU64::new(0),
+            callback_registry: Arc::new(CallbackRegistry::new()),
+            callback_connection: std::sync::Mutex::new(None),
+            callback_listener_running: AtomicBool::new(false),
         }
     }
 
@@ -150,6 +172,12 @@ impl OuterLinkClient {
                         format!("handshake rejected by server (code {})", result),
                     ));
                 }
+            }
+            // Parse session_id from extended handshake response (bytes 4..12).
+            // Backward compatible: if server doesn't send it, session_id stays 0.
+            if resp_payload.len() >= 12 {
+                let sid = u64::from_le_bytes(resp_payload[4..12].try_into().unwrap());
+                self.session_id.store(sid, Ordering::Release);
             }
 
             // Handshake succeeded — now store the connection and mark as connected.
@@ -471,8 +499,143 @@ impl OuterLinkClient {
             }
         })
     }
+
+    /// Get the session ID assigned by the server during handshake.
+    pub fn session_id(&self) -> u64 {
+        self.session_id.load(Ordering::Acquire)
+    }
+
+    /// Ensure the callback channel is established. Lazily connects a second
+    /// TCP connection to the server and sends a `CallbackChannelInit` message
+    /// with the session_id so the server can associate it with the right session.
+    ///
+    /// Also spawns a background listener thread that receives `CallbackReady`
+    /// messages and fires the corresponding callbacks in the registry.
+    ///
+    /// Returns Ok(()) if the channel is already established or was just created.
+    pub fn ensure_callback_channel(&self) -> Result<(), OuterLinkError> {
+        // Fast path: already established
+        if self.callback_listener_running.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let mut guard = self.callback_connection.lock().unwrap();
+        // Double-check after acquiring lock
+        if guard.is_some() {
+            return Ok(());
+        }
+
+        let sid = self.session_id.load(Ordering::Acquire);
+        if sid == 0 {
+            return Err(OuterLinkError::Connection(
+                "cannot establish callback channel: no session_id (handshake incomplete)".into(),
+            ));
+        }
+
+        // Connect a second TCP connection to the same server.
+        let conn = self.runtime.block_on(async {
+            let timeout_dur = std::time::Duration::from_secs(Self::CONNECT_TIMEOUT_SECS);
+            let stream = match tokio::time::timeout(
+                timeout_dur,
+                tokio::net::TcpStream::connect(&self.server_addr),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    return Err(OuterLinkError::Connection(format!(
+                        "callback channel connect failed: {}",
+                        e
+                    )));
+                }
+                Err(_elapsed) => {
+                    return Err(OuterLinkError::Timeout(Self::CONNECT_TIMEOUT_SECS * 1000));
+                }
+            };
+            let conn = TcpTransportConnection::new(stream).map_err(|e| {
+                OuterLinkError::Connection(format!(
+                    "callback channel init failed: {}",
+                    e
+                ))
+            })?;
+            Ok(Arc::new(conn))
+        })?;
+
+        // Send CallbackChannelInit with session_id
+        self.runtime.block_on(async {
+            let payload = sid.to_le_bytes();
+            let header = MessageHeader::new_request(
+                0, // request_id irrelevant for callback channel init
+                MessageType::CallbackChannelInit,
+                payload.len() as u32,
+            );
+            conn.send_message(&header, &payload).await.map_err(|e| {
+                OuterLinkError::Connection(format!("callback channel init send failed: {}", e))
+            })?;
+
+            // Wait for CallbackChannelAck
+            let (_resp_hdr, resp_payload) = conn.recv_message().await.map_err(|e| {
+                OuterLinkError::Connection(format!("callback channel ack recv failed: {}", e))
+            })?;
+            if resp_payload.len() >= 4 {
+                let result = u32::from_le_bytes(resp_payload[0..4].try_into().unwrap());
+                if result != 0 {
+                    return Err(OuterLinkError::Connection(format!(
+                        "callback channel rejected by server (code {})",
+                        result
+                    )));
+                }
+            }
+            Ok(())
+        })?;
+
+        *guard = Some(Arc::clone(&conn));
+        drop(guard); // Release lock before spawning thread
+
+        // Spawn background listener thread
+        let registry = Arc::clone(&self.callback_registry);
+        let cb_conn = Arc::clone(&conn);
+        let running_flag = &self.callback_listener_running as *const AtomicBool;
+        // SAFETY: The AtomicBool lives in OuterLinkClient which is 'static (OnceLock).
+        let running_flag = unsafe { &*running_flag };
+        running_flag.store(true, Ordering::Release);
+
+        self.runtime.spawn(async move {
+            loop {
+                match cb_conn.recv_message().await {
+                    Ok((hdr, payload)) => {
+                        if hdr.msg_type == MessageType::CallbackReady && payload.len() >= 12 {
+                            let callback_id =
+                                u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                            let cuda_status =
+                                u32::from_le_bytes(payload[8..12].try_into().unwrap());
+                            registry.fire(callback_id, cuda_status);
+                        } else {
+                            tracing::warn!(
+                                msg_type = ?hdr.msg_type,
+                                payload_len = payload.len(),
+                                "unexpected message on callback channel"
+                            );
+                        }
+                    }
+                    Err(OuterLinkError::ConnectionClosed) => {
+                        tracing::debug!("callback channel closed by server");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "callback channel recv error");
+                        break;
+                    }
+                }
+            }
+            running_flag.store(false, Ordering::Release);
+        });
+
+        Ok(())
+    }
 }
 
+pub mod callback;
 pub mod ffi;
 
 // ---------------------------------------------------------------------------

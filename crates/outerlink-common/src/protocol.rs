@@ -157,6 +157,13 @@ pub enum MessageType {
     PointerGetAttribute = 0x00B0,
     PointerGetAttributes = 0x00B1,
 
+    // Callback (client <-> server)
+    StreamAddCallback = 0x00D0,
+    LaunchHostFunc = 0x00D1,
+    CallbackReady = 0x00D2,
+    CallbackChannelInit = 0x00D3,
+    CallbackChannelAck = 0x00D4,
+
     // Response (server -> client)
     Response = 0x00F0,
     Error = 0x00FF,
@@ -269,6 +276,11 @@ impl MessageType {
             0x00A5 => Some(Self::CtxSetSharedMemConfig),
             0x00B0 => Some(Self::PointerGetAttribute),
             0x00B1 => Some(Self::PointerGetAttributes),
+            0x00D0 => Some(Self::StreamAddCallback),
+            0x00D1 => Some(Self::LaunchHostFunc),
+            0x00D2 => Some(Self::CallbackReady),
+            0x00D3 => Some(Self::CallbackChannelInit),
+            0x00D4 => Some(Self::CallbackChannelAck),
             0x00F0 => Some(Self::Response),
             0x00FF => Some(Self::Error),
             _ => None,
@@ -393,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_message_type_roundtrip() {
-        for raw in [0x0001u16, 0x0010, 0x0020, 0x0030, 0x0050, 0x00F0, 0x00FF] {
+        for raw in [0x0001u16, 0x0010, 0x0020, 0x0030, 0x0050, 0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00F0, 0x00FF] {
             let mt = MessageType::from_raw(raw).unwrap();
             assert_eq!(mt as u16, raw);
         }

@@ -10,8 +10,10 @@
 //! connection drops (gracefully or not).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use outerlink_common::cuda_types::CuResult;
+use outerlink_common::tcp_transport::TcpTransportConnection;
 use crate::gpu_backend::GpuBackend;
 
 /// Per-connection state that is NOT shared between connections.
@@ -24,6 +26,8 @@ use crate::gpu_backend::GpuBackend;
 /// Tracks all GPU resources allocated by this connection so they can be
 /// cleaned up when the connection drops.
 pub struct ConnectionSession {
+    /// Unique session ID assigned at handshake time.
+    session_id: u64,
     /// The current CUDA context handle for this connection (0 = none).
     current_ctx: u64,
 
@@ -47,12 +51,21 @@ pub struct ConnectionSession {
     peer_access_ctxs: HashSet<u64>,
     /// Memory pools created by this session.
     mem_pools: HashSet<u64>,
+    /// Dedicated callback channel connection (set when client connects
+    /// a second TCP stream with CallbackChannelInit).
+    callback_channel: Option<Arc<TcpTransportConnection>>,
 }
 
 impl ConnectionSession {
     /// Create a new session with no current context and no tracked resources.
     pub fn new() -> Self {
+        Self::with_session_id(0)
+    }
+
+    /// Create a new session with a specific session_id.
+    pub fn with_session_id(session_id: u64) -> Self {
         Self {
+            session_id,
             current_ctx: 0,
             mem_allocations: HashSet::new(),
             host_allocations: HashSet::new(),
@@ -64,7 +77,23 @@ impl ConnectionSession {
             registered_host: HashSet::new(),
             peer_access_ctxs: HashSet::new(),
             mem_pools: HashSet::new(),
+            callback_channel: None,
         }
+    }
+
+    /// Get the session ID.
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Set the callback channel connection.
+    pub fn set_callback_channel(&mut self, conn: Arc<TcpTransportConnection>) {
+        self.callback_channel = Some(conn);
+    }
+
+    /// Get a reference to the callback channel connection, if established.
+    pub fn callback_channel(&self) -> Option<&Arc<TcpTransportConnection>> {
+        self.callback_channel.as_ref()
     }
 
     // --- Current context management (unchanged) ---
@@ -839,6 +868,24 @@ mod tests {
 
         // Should be unregistered now -- re-unregister fails.
         assert!(backend.mem_host_unregister(0x3000).is_err());
+    }
+
+    #[test]
+    fn test_session_id() {
+        let session = ConnectionSession::with_session_id(42);
+        assert_eq!(session.session_id(), 42);
+    }
+
+    #[test]
+    fn test_default_session_id_is_zero() {
+        let session = ConnectionSession::new();
+        assert_eq!(session.session_id(), 0);
+    }
+
+    #[test]
+    fn test_callback_channel_initially_none() {
+        let session = ConnectionSession::new();
+        assert!(session.callback_channel().is_none());
     }
 
     #[test]

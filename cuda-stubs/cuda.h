@@ -270,6 +270,8 @@ CUresult cuStreamDestroy_v2(CUstream hStream);
 CUresult cuStreamSynchronize(CUstream hStream);
 CUresult cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int Flags);
 CUresult cuStreamQuery(CUstream hStream);
+CUresult cuStreamAddCallback(CUstream hStream, void *callback, void *userData, unsigned int flags);
+CUresult cuLaunchHostFunc(CUstream hStream, void *fn, void *userData);
 
 /* Function declarations - Event */
 CUresult cuEventCreate(CUevent *phEvent, unsigned int Flags);

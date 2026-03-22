@@ -216,6 +216,8 @@ static const hook_entry_t hook_table[] = {
     { "cuStreamGetCtx",          (void *)hook_cuStreamGetCtx },
     { "cuStreamGetCtx_v2",       (void *)hook_cuStreamGetCtx },
     { "cuStreamWaitEvent",       (void *)hook_cuStreamWaitEvent },
+    { "cuStreamAddCallback",     (void *)hook_cuStreamAddCallback },
+    { "cuLaunchHostFunc",        (void *)hook_cuLaunchHostFunc },
 
     /* Event */
     { "cuEventCreate",           (void *)hook_cuEventCreate },
@@ -676,15 +678,33 @@ CUresult hook_cuMemPoolGetAttribute(CUmemoryPool pool, int attr, void *value) {
     ensure_init();
     if (!value)
         return CUDA_ERROR_INVALID_VALUE;
-    return ol_cuMemPoolGetAttribute((unsigned long long)(uintptr_t)pool, attr,
-                                     (unsigned long long *)value);
+    /* Attributes 1-3 (REUSE_*) are int (4 bytes), 4+ are u64 (8 bytes).
+       We always pass u64 to the Rust FFI; size-aware read-back here. */
+    unsigned long long val_u64 = 0;
+    CUresult r = ol_cuMemPoolGetAttribute((unsigned long long)(uintptr_t)pool, attr,
+                                           &val_u64);
+    if (r == CUDA_SUCCESS) {
+        if (attr >= 1 && attr <= 3) {
+            *(int *)value = (int)val_u64;
+        } else {
+            *(unsigned long long *)value = val_u64;
+        }
+    }
+    return r;
 }
 
 CUresult hook_cuMemPoolSetAttribute(CUmemoryPool pool, int attr, void *value) {
     ensure_init();
     if (!value)
         return CUDA_ERROR_INVALID_VALUE;
-    unsigned long long val = *(unsigned long long *)value;
+    /* Attributes 1-3 (REUSE_*) are int (4 bytes), 4+ are u64 (8 bytes).
+       Read size-aware, pass u64 to Rust FFI. */
+    unsigned long long val;
+    if (attr >= 1 && attr <= 3) {
+        val = (unsigned long long)(*(int *)value);
+    } else {
+        val = *(unsigned long long *)value;
+    }
     return ol_cuMemPoolSetAttribute((unsigned long long)(uintptr_t)pool, attr, val);
 }
 
@@ -1010,6 +1030,21 @@ CUresult hook_cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int F
     return ol_cuStreamWaitEvent((unsigned long long)(uintptr_t)hStream,
                                 (unsigned long long)(uintptr_t)hEvent,
                                 Flags);
+}
+
+CUresult hook_cuStreamAddCallback(CUstream hStream, void *callback, void *userData, unsigned int flags) {
+    ensure_init();
+    return ol_cuStreamAddCallback((unsigned long long)(uintptr_t)hStream,
+                                   (unsigned long long)(uintptr_t)callback,
+                                   (unsigned long long)(uintptr_t)userData,
+                                   flags);
+}
+
+CUresult hook_cuLaunchHostFunc(CUstream hStream, void *fn_ptr, void *userData) {
+    ensure_init();
+    return ol_cuLaunchHostFunc((unsigned long long)(uintptr_t)hStream,
+                                (unsigned long long)(uintptr_t)fn_ptr,
+                                (unsigned long long)(uintptr_t)userData);
 }
 
 /* -- Event -- */

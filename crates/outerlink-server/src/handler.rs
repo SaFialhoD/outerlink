@@ -16,28 +16,54 @@ use outerlink_common::protocol::{MessageHeader, MessageType};
 use crate::gpu_backend::GpuBackend;
 use crate::session::ConnectionSession;
 
+/// Result of handling a request. Contains the main response and optionally
+/// a callback notification to send on the session's callback channel.
+pub struct HandleResult {
+    /// The response header and payload to send on the main connection.
+    pub response: (MessageHeader, Vec<u8>),
+    /// Optional callback notification to send on the callback channel.
+    /// Contains (callback_id, cuda_status).
+    pub callback_notification: Option<(u64, u32)>,
+}
+
+impl HandleResult {
+    fn response_only(header: MessageHeader, payload: Vec<u8>) -> Self {
+        Self {
+            response: (header, payload),
+            callback_notification: None,
+        }
+    }
+
+    fn with_callback(header: MessageHeader, payload: Vec<u8>, callback_id: u64, cuda_status: u32) -> Self {
+        Self {
+            response: (header, payload),
+            callback_notification: Some((callback_id, cuda_status)),
+        }
+    }
+}
+
 /// Encode a `CuResult` as 4 little-endian bytes.
 fn encode_result(r: CuResult) -> [u8; 4] {
     (r as u32).to_le_bytes()
 }
 
 /// Build a response that carries only a `CuResult` (no extra data).
-fn result_only(request_id: u64, r: CuResult) -> (MessageHeader, Vec<u8>) {
+fn result_only(request_id: u64, r: CuResult) -> HandleResult {
     let payload = encode_result(r).to_vec();
     let header = MessageHeader::new_response(request_id, payload.len() as u32);
-    (header, payload)
+    HandleResult::response_only(header, payload)
 }
 
 /// Build a response with a `CuResult::Success` prefix followed by `data`.
-fn success_with(request_id: u64, data: &[u8]) -> (MessageHeader, Vec<u8>) {
+fn success_with(request_id: u64, data: &[u8]) -> HandleResult {
     let mut payload = encode_result(CuResult::Success).to_vec();
     payload.extend_from_slice(data);
     let header = MessageHeader::new_response(request_id, payload.len() as u32);
-    (header, payload)
+    HandleResult::response_only(header, payload)
 }
 
 /// Build an error response from a `Result<T, CuResult>` that failed.
-fn error_response(request_id: u64, err: CuResult) -> (MessageHeader, Vec<u8>) {
+fn error_response(request_id: u64, err: CuResult) -> HandleResult {
     result_only(request_id, err)
 }
 
@@ -95,18 +121,40 @@ fn error_response(request_id: u64, err: CuResult) -> (MessageHeader, Vec<u8>) {
 /// | OccupancyMaxActiveBlocksWithFlags| u64 func, i32 blockSize, u64 dynSmem, u32 flags = 24B | i32 numBlocks |
 /// | OccupancyMaxPotentialBlockSize| u64 func, u64 dynSmem, i32 limit = 20B | i32 minGridSize, i32 blockSize |
 /// | OccupancyMaxPotentialBlockSizeWithFlags| u64 func, u64 dynSmem, i32 limit, u32 flags = 24B | i32 minGridSize, i32 blockSize |
+/// Dispatch a single request, returning only the main response.
+///
+/// This is a convenience wrapper around [`handle_request_full`] for callers
+/// that do not need callback notifications (e.g. tests, simple servers).
 pub fn handle_request(
     backend: &dyn GpuBackend,
     header: &MessageHeader,
     payload: &[u8],
     session: &mut ConnectionSession,
 ) -> (MessageHeader, Vec<u8>) {
+    let result = handle_request_full(backend, header, payload, session);
+    result.response
+}
+
+/// Dispatch a single request to the `GpuBackend` and return a [`HandleResult`].
+///
+/// The result contains the main response to send on the primary connection,
+/// plus an optional callback notification to send on the callback channel.
+pub fn handle_request_full(
+    backend: &dyn GpuBackend,
+    header: &MessageHeader,
+    payload: &[u8],
+    session: &mut ConnectionSession,
+) -> HandleResult {
     let rid = header.request_id;
 
     match header.msg_type {
         MessageType::Handshake => {
-            tracing::info!("client handshake received");
-            result_only(rid, CuResult::Success)
+            tracing::info!("client handshake received (session_id={})", session.session_id());
+            // Extended handshake response: [4B CuResult][8B session_id]
+            let mut resp_data = encode_result(CuResult::Success).to_vec();
+            resp_data.extend_from_slice(&session.session_id().to_le_bytes());
+            let header = MessageHeader::new_response(rid, resp_data.len() as u32);
+            HandleResult::response_only(header, resp_data)
         }
 
         MessageType::Init => {
@@ -1546,6 +1594,63 @@ pub fn handle_request(
                 }
                 Err(e) => error_response(rid, e),
             }
+        }
+
+        // --- Callback operations ---
+
+        MessageType::StreamAddCallback => {
+            // Payload: u64 stream, u64 callback_id, u32 flags (20B)
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let stream = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let callback_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            let flags = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+            match backend.stream_add_callback(stream, callback_id, flags) {
+                Ok(()) => {
+                    // In the stub, callback fires immediately.
+                    // Return success on main channel + schedule CallbackReady on callback channel.
+                    let resp = result_only(rid, CuResult::Success);
+                    HandleResult::with_callback(
+                        resp.response.0,
+                        resp.response.1,
+                        callback_id,
+                        CuResult::Success as u32,
+                    )
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::LaunchHostFunc => {
+            // Payload: u64 stream, u64 callback_id (16B)
+            if payload.len() < 16 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let stream = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let callback_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            match backend.launch_host_func(stream, callback_id) {
+                Ok(()) => {
+                    let resp = result_only(rid, CuResult::Success);
+                    HandleResult::with_callback(
+                        resp.response.0,
+                        resp.response.1,
+                        callback_id,
+                        CuResult::Success as u32,
+                    )
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // CallbackReady, CallbackChannelInit, CallbackChannelAck are not
+        // valid client->server request types on the main connection.
+        // They are handled in the accept loop (server.rs).
+        MessageType::CallbackReady
+        | MessageType::CallbackChannelInit
+        | MessageType::CallbackChannelAck => {
+            tracing::warn!(msg_type = ?header.msg_type, "callback protocol message received on main connection");
+            error_response(rid, CuResult::InvalidValue)
         }
 
         // Anything else is unimplemented for the PoC.
@@ -4970,5 +5075,236 @@ mod tests {
         let hdr = req(MessageType::MemPoolSetAttribute, 8);
         let (_, resp) = dispatch(&gpu, &hdr, &[0; 8]);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- Callback operation tests -----
+
+    /// Dispatch using handle_request_full (returns HandleResult).
+    fn dispatch_full(
+        gpu: &StubGpuBackend,
+        hdr: &MessageHeader,
+        payload: &[u8],
+    ) -> super::HandleResult {
+        let mut session = ConnectionSession::new();
+        handle_request_full(gpu, hdr, payload, &mut session)
+    }
+
+    fn dispatch_full_with(
+        gpu: &StubGpuBackend,
+        hdr: &MessageHeader,
+        payload: &[u8],
+        session: &mut ConnectionSession,
+    ) -> super::HandleResult {
+        handle_request_full(gpu, hdr, payload, session)
+    }
+
+    #[test]
+    fn test_stream_add_callback_success() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create a stream first.
+        let create_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::StreamCreate, create_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &create_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // StreamAddCallback: u64 stream, u64 callback_id, u32 flags
+        let callback_id: u64 = 42;
+        let flags: u32 = 0;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&stream.to_le_bytes());
+        payload.extend_from_slice(&callback_id.to_le_bytes());
+        payload.extend_from_slice(&flags.to_le_bytes());
+
+        let hdr = req(MessageType::StreamAddCallback, payload.len() as u32);
+        let result = dispatch_full_with(&gpu, &hdr, &payload, &mut session);
+
+        // Main response should be Success
+        assert_eq!(response_result(&result.response.1), CuResult::Success);
+
+        // Should have a callback notification
+        assert!(result.callback_notification.is_some());
+        let (cb_id, cb_status) = result.callback_notification.unwrap();
+        assert_eq!(cb_id, 42);
+        assert_eq!(cb_status, CuResult::Success as u32);
+    }
+
+    #[test]
+    fn test_stream_add_callback_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+
+        // Use a non-existent stream handle.
+        let callback_id: u64 = 99;
+        let flags: u32 = 0;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // Invalid stream
+        payload.extend_from_slice(&callback_id.to_le_bytes());
+        payload.extend_from_slice(&flags.to_le_bytes());
+
+        let hdr = req(MessageType::StreamAddCallback, payload.len() as u32);
+        let result = dispatch_full(&gpu, &hdr, &payload);
+
+        assert_eq!(response_result(&result.response.1), CuResult::InvalidValue);
+        assert!(result.callback_notification.is_none());
+    }
+
+    #[test]
+    fn test_stream_add_callback_default_stream() {
+        let gpu = StubGpuBackend::new();
+
+        // Stream 0 (default stream) should always be valid.
+        let callback_id: u64 = 7;
+        let flags: u32 = 0;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u64.to_le_bytes()); // Default stream
+        payload.extend_from_slice(&callback_id.to_le_bytes());
+        payload.extend_from_slice(&flags.to_le_bytes());
+
+        let hdr = req(MessageType::StreamAddCallback, payload.len() as u32);
+        let result = dispatch_full(&gpu, &hdr, &payload);
+
+        assert_eq!(response_result(&result.response.1), CuResult::Success);
+        assert!(result.callback_notification.is_some());
+    }
+
+    #[test]
+    fn test_stream_add_callback_short_payload() {
+        let gpu = StubGpuBackend::new();
+
+        // Payload too short (< 20 bytes).
+        let hdr = req(MessageType::StreamAddCallback, 10);
+        let result = dispatch_full(&gpu, &hdr, &[0; 10]);
+
+        assert_eq!(response_result(&result.response.1), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_launch_host_func_success() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create a stream.
+        let create_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::StreamCreate, create_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &create_payload, &mut session);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // LaunchHostFunc: u64 stream, u64 callback_id
+        let callback_id: u64 = 55;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&stream.to_le_bytes());
+        payload.extend_from_slice(&callback_id.to_le_bytes());
+
+        let hdr = req(MessageType::LaunchHostFunc, payload.len() as u32);
+        let result = dispatch_full_with(&gpu, &hdr, &payload, &mut session);
+
+        assert_eq!(response_result(&result.response.1), CuResult::Success);
+        assert!(result.callback_notification.is_some());
+        let (cb_id, cb_status) = result.callback_notification.unwrap();
+        assert_eq!(cb_id, 55);
+        assert_eq!(cb_status, 0);
+    }
+
+    #[test]
+    fn test_launch_host_func_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+
+        let callback_id: u64 = 10;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0xBAD0_0000_0000u64.to_le_bytes());
+        payload.extend_from_slice(&callback_id.to_le_bytes());
+
+        let hdr = req(MessageType::LaunchHostFunc, payload.len() as u32);
+        let result = dispatch_full(&gpu, &hdr, &payload);
+
+        assert_eq!(response_result(&result.response.1), CuResult::InvalidValue);
+        assert!(result.callback_notification.is_none());
+    }
+
+    #[test]
+    fn test_launch_host_func_default_stream() {
+        let gpu = StubGpuBackend::new();
+
+        let callback_id: u64 = 3;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&callback_id.to_le_bytes());
+
+        let hdr = req(MessageType::LaunchHostFunc, payload.len() as u32);
+        let result = dispatch_full(&gpu, &hdr, &payload);
+
+        assert_eq!(response_result(&result.response.1), CuResult::Success);
+        assert!(result.callback_notification.is_some());
+    }
+
+    #[test]
+    fn test_launch_host_func_short_payload() {
+        let gpu = StubGpuBackend::new();
+
+        let hdr = req(MessageType::LaunchHostFunc, 8);
+        let result = dispatch_full(&gpu, &hdr, &[0; 8]);
+
+        assert_eq!(response_result(&result.response.1), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_callback_protocol_on_main_connection_rejected() {
+        let gpu = StubGpuBackend::new();
+
+        // CallbackReady should be rejected on main connection.
+        let hdr = req(MessageType::CallbackReady, 0);
+        let result = dispatch_full(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&result.response.1), CuResult::InvalidValue);
+
+        // CallbackChannelInit should be rejected on main connection.
+        let hdr = req(MessageType::CallbackChannelInit, 0);
+        let result = dispatch_full(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&result.response.1), CuResult::InvalidValue);
+
+        // CallbackChannelAck should be rejected on main connection.
+        let hdr = req(MessageType::CallbackChannelAck, 0);
+        let result = dispatch_full(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&result.response.1), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_handshake_returns_session_id() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::with_session_id(12345);
+        let hdr = req(MessageType::Handshake, 0);
+        let result = dispatch_full_with(&gpu, &hdr, &[], &mut session);
+
+        let resp = &result.response.1;
+        assert_eq!(response_result(resp), CuResult::Success);
+        // Extended response should contain session_id at bytes 4..12.
+        assert!(resp.len() >= 12);
+        let session_id = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(session_id, 12345);
+    }
+
+    #[test]
+    fn test_handle_request_wrapper_drops_callback_notification() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create a stream.
+        let create_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::StreamCreate, create_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &create_payload, &mut session);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Use the convenience wrapper (handle_request, not handle_request_full)
+        let callback_id: u64 = 1;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&stream.to_le_bytes());
+        payload.extend_from_slice(&callback_id.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+
+        let hdr = req(MessageType::StreamAddCallback, payload.len() as u32);
+        let (_, resp) = handle_request(&gpu, &hdr, &payload, &mut session);
+        // Should still return Success (callback notification is dropped by wrapper)
+        assert_eq!(response_result(&resp), CuResult::Success);
     }
 }

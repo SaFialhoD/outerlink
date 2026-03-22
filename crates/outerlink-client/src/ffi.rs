@@ -2464,13 +2464,160 @@ pub extern "C" fn ol_cuStreamSynchronize(stream: u64) -> u32 {
         if let Ok((_hdr, resp)) =
             client.send_request(MessageType::StreamSynchronize, &payload)
         {
-            return parse_result(&resp);
+            let server_result = parse_result(&resp);
+            if server_result != CUDA_SUCCESS {
+                return server_result;
+            }
+            // Phase 2: Wait for all pending callbacks on this stream to complete.
+            // The server sync ensures all GPU work is done and CallbackReady
+            // notifications have been sent. Now wait for the client-side
+            // callback invocations to finish.
+            if client.callback_registry.has_pending(stream) {
+                client.callback_registry.wait_all_completed(
+                    stream,
+                    std::time::Duration::from_secs(30),
+                );
+            }
+            return CUDA_SUCCESS;
         }
         // Transport error -- fall through to stub
     }
     // Stub: validate handle (stream 0 = default stream, always valid)
     if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+/// `cuStreamAddCallback` -- register a host callback to be invoked when all
+/// preceding work on the stream completes.
+///
+/// The callback function pointer and user_data are stored locally in the
+/// CallbackRegistry. Only a unique callback_id is sent to the server.
+/// When the server signals that the callback should fire (via CallbackReady
+/// on the callback channel), the client invokes the function locally.
+#[no_mangle]
+pub extern "C" fn ol_cuStreamAddCallback(
+    stream: u64,
+    callback: u64, // CUstreamCallback fn ptr
+    user_data: u64,
+    flags: u32,
+) -> u32 {
+    let client = get_client();
+
+    // Connected: register locally and send to server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+
+        // Ensure callback channel is established before sending the request
+        if let Err(e) = client.ensure_callback_channel() {
+            tracing::warn!(error = %e, "failed to establish callback channel, falling back to immediate execution");
+            // Fall through to stub-mode immediate execution
+        } else {
+            // Register in local registry
+            let callback_id = client.callback_registry.register(
+                crate::callback::CallbackKind::StreamAddCallback,
+                callback,
+                user_data,
+                stream,
+            );
+
+            // Send to server: u64 stream, u64 callback_id, u32 flags
+            let mut payload = Vec::with_capacity(20);
+            payload.extend_from_slice(&remote_stream.to_le_bytes());
+            payload.extend_from_slice(&callback_id.to_le_bytes());
+            payload.extend_from_slice(&flags.to_le_bytes());
+
+            if let Ok((_hdr, resp)) =
+                client.send_request(MessageType::StreamAddCallback, &payload)
+            {
+                return parse_result(&resp);
+            }
+
+            // Transport error -- fire immediately as fallback
+            client.callback_registry.fire(callback_id, CUDA_SUCCESS);
+            return CUDA_SUCCESS;
+        }
+    }
+
+    // Stub: fire callback immediately (synchronous execution)
+    if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if callback != 0 {
+        type StreamCb = unsafe extern "C" fn(u64, u32, u64);
+        let cb: StreamCb = unsafe { std::mem::transmute(callback) };
+        unsafe { cb(stream, CUDA_SUCCESS, user_data) };
+    }
+    CUDA_SUCCESS
+}
+
+/// `cuLaunchHostFunc` -- enqueue a host function to execute on the host when
+/// all preceding work on the stream completes.
+///
+/// Similar to cuStreamAddCallback but with a simpler signature (no stream/status args).
+#[no_mangle]
+pub extern "C" fn ol_cuLaunchHostFunc(
+    stream: u64,
+    func: u64, // CUhostFn fn ptr
+    user_data: u64,
+) -> u32 {
+    let client = get_client();
+
+    // Connected: register locally and send to server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+
+        // Ensure callback channel is established
+        if let Err(e) = client.ensure_callback_channel() {
+            tracing::warn!(error = %e, "failed to establish callback channel, falling back to immediate execution");
+        } else {
+            let callback_id = client.callback_registry.register(
+                crate::callback::CallbackKind::LaunchHostFunc,
+                func,
+                user_data,
+                stream,
+            );
+
+            // Send to server: u64 stream, u64 callback_id
+            let mut payload = Vec::with_capacity(16);
+            payload.extend_from_slice(&remote_stream.to_le_bytes());
+            payload.extend_from_slice(&callback_id.to_le_bytes());
+
+            if let Ok((_hdr, resp)) =
+                client.send_request(MessageType::LaunchHostFunc, &payload)
+            {
+                return parse_result(&resp);
+            }
+
+            // Transport error -- fire immediately as fallback
+            client.callback_registry.fire(callback_id, CUDA_SUCCESS);
+            return CUDA_SUCCESS;
+        }
+    }
+
+    // Stub: fire function immediately
+    if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if func != 0 {
+        type HostFn = unsafe extern "C" fn(u64);
+        let cb: HostFn = unsafe { std::mem::transmute(func) };
+        unsafe { cb(user_data) };
     }
     CUDA_SUCCESS
 }
@@ -6683,5 +6830,150 @@ mod tests {
         let mut dptr: u64 = 0;
         let result = ol_cuMemAllocFromPoolAsync(&mut dptr, 0, pool, 0);
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // ----- Callback tests (stub mode) -----
+
+    #[test]
+    fn test_ol_cu_stream_add_callback_stub_fires_immediately() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CB_CALLED: AtomicU32 = AtomicU32::new(0);
+        static CB_STATUS: AtomicU32 = AtomicU32::new(u32::MAX);
+
+        unsafe extern "C" fn my_callback(_stream: u64, status: u32, _user_data: u64) {
+            CB_CALLED.store(1, Ordering::SeqCst);
+            CB_STATUS.store(status, Ordering::SeqCst);
+        }
+
+        CB_CALLED.store(0, Ordering::SeqCst);
+        CB_STATUS.store(u32::MAX, Ordering::SeqCst);
+
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+
+        let result = ol_cuStreamAddCallback(
+            stream,
+            my_callback as *const () as u64,
+            0, // user_data
+            0, // flags
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(CB_CALLED.load(Ordering::SeqCst), 1);
+        assert_eq!(CB_STATUS.load(Ordering::SeqCst), CUDA_SUCCESS);
+
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_add_callback_default_stream() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CB_CALLED2: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "C" fn my_callback2(_stream: u64, _status: u32, _user_data: u64) {
+            CB_CALLED2.store(1, Ordering::SeqCst);
+        }
+
+        CB_CALLED2.store(0, Ordering::SeqCst);
+
+        let result = ol_cuStreamAddCallback(0, my_callback2 as *const () as u64, 0, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(CB_CALLED2.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_add_callback_invalid_stream() {
+        let result = ol_cuStreamAddCallback(0xDEAD, 0, 0, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_add_callback_null_callback() {
+        // Null callback pointer should succeed but not crash.
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        let result = ol_cuStreamAddCallback(stream, 0, 0, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_launch_host_func_stub_fires_immediately() {
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        static HF_CALLED: AtomicU32 = AtomicU32::new(0);
+        static HF_USERDATA: AtomicU64 = AtomicU64::new(0);
+
+        unsafe extern "C" fn my_host_fn(user_data: u64) {
+            HF_CALLED.store(1, Ordering::SeqCst);
+            HF_USERDATA.store(user_data, Ordering::SeqCst);
+        }
+
+        HF_CALLED.store(0, Ordering::SeqCst);
+        HF_USERDATA.store(0, Ordering::SeqCst);
+
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+
+        let result = ol_cuLaunchHostFunc(stream, my_host_fn as *const () as u64, 0xCAFE);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(HF_CALLED.load(Ordering::SeqCst), 1);
+        assert_eq!(HF_USERDATA.load(Ordering::SeqCst), 0xCAFE);
+
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_launch_host_func_default_stream() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static HF_CALLED2: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "C" fn my_host_fn2(_user_data: u64) {
+            HF_CALLED2.store(1, Ordering::SeqCst);
+        }
+
+        HF_CALLED2.store(0, Ordering::SeqCst);
+
+        let result = ol_cuLaunchHostFunc(0, my_host_fn2 as *const () as u64, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(HF_CALLED2.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_ol_cu_launch_host_func_invalid_stream() {
+        let result = ol_cuLaunchHostFunc(0xDEAD, 0, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_launch_host_func_null_func() {
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        let result = ol_cuLaunchHostFunc(stream, 0, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_add_callback_passes_user_data() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
+        static UD_VALUE: AtomicU64 = AtomicU64::new(0);
+
+        unsafe extern "C" fn cb_with_data(_stream: u64, _status: u32, user_data: u64) {
+            UD_VALUE.store(user_data, AtomOrdering::SeqCst);
+        }
+
+        UD_VALUE.store(0, AtomOrdering::SeqCst);
+
+        let result = ol_cuStreamAddCallback(0, cb_with_data as *const () as u64, 0xBEEF_CAFE, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(UD_VALUE.load(AtomOrdering::SeqCst), 0xBEEF_CAFE);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_synchronize_with_no_pending_callbacks() {
+        // StreamSynchronize should succeed even when callback system is unused.
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuStreamSynchronize(stream), CUDA_SUCCESS);
+        let _ = ol_cuStreamDestroy(stream);
     }
 }

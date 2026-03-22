@@ -141,6 +141,8 @@ extern CUresult ol_cuStreamGetPriority(unsigned long long stream, int *priority)
 extern CUresult ol_cuStreamGetFlags(unsigned long long stream, unsigned int *flags);
 extern CUresult ol_cuStreamGetCtx(unsigned long long stream, unsigned long long *pctx);
 extern CUresult ol_cuStreamWaitEvent(unsigned long long stream, unsigned long long event, unsigned int flags);
+extern CUresult ol_cuStreamAddCallback(unsigned long long stream, unsigned long long callback, unsigned long long userData, unsigned int flags);
+extern CUresult ol_cuLaunchHostFunc(unsigned long long stream, unsigned long long fn_ptr, unsigned long long userData);
 
 /* Event management */
 extern CUresult ol_cuEventCreate(unsigned long long *event, unsigned int flags);
@@ -303,6 +305,8 @@ CUresult hook_cuStreamGetPriority(CUstream hStream, int *priority);
 CUresult hook_cuStreamGetFlags(CUstream hStream, unsigned int *flags);
 CUresult hook_cuStreamGetCtx(CUstream hStream, CUcontext *pctx);
 CUresult hook_cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int Flags);
+CUresult hook_cuStreamAddCallback(CUstream hStream, void *callback, void *userData, unsigned int flags);
+CUresult hook_cuLaunchHostFunc(CUstream hStream, void *fn_ptr, void *userData);
 
 /* Event */
 CUresult hook_cuEventCreate(CUevent *phEvent, unsigned int Flags);
