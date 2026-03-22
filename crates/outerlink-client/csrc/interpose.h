@@ -93,6 +93,37 @@ extern CUresult ol_cuMemcpy(unsigned long long dst, unsigned long long src, size
 extern CUresult ol_cuMemcpyAsync(unsigned long long dst, unsigned long long src, size_t ByteCount, unsigned long long hStream);
 extern CUresult ol_cuMemGetInfo_v2(size_t *free, size_t *total);
 
+/* D-to-D async, host alloc, pitch alloc */
+extern CUresult ol_cuMemcpyDtoDAsync_v2(unsigned long long dst, unsigned long long src, size_t ByteCount, unsigned long long hStream);
+extern CUresult ol_cuMemHostAlloc(unsigned char **pp, size_t bytesize, unsigned int flags);
+extern CUresult ol_cuMemAllocPitch_v2(unsigned long long *dptr, size_t *pitch, size_t widthInBytes, size_t height, unsigned int elementSize);
+
+/* Module load (file path), fat binary */
+extern CUresult ol_cuModuleLoad(unsigned long long *module, const unsigned char *fname);
+extern CUresult ol_cuModuleLoadFatBinary(unsigned long long *module, const unsigned char *fatCubin);
+
+/* Device mem pool get/set, allocation granularity */
+extern CUresult ol_cuDeviceGetMemPool(unsigned long long *pool, int dev);
+extern CUresult ol_cuDeviceSetMemPool(int dev, unsigned long long pool);
+extern CUresult ol_cuMemGetAllocationGranularity(size_t *granularity, const unsigned char *prop, int option);
+
+/* Graph stubs */
+extern CUresult ol_cuStreamBeginCapture_v2(unsigned long long stream, int mode);
+extern CUresult ol_cuStreamEndCapture(unsigned long long stream, unsigned long long *graph);
+extern CUresult ol_cuStreamIsCapturing(unsigned long long stream, int *captureStatus);
+extern CUresult ol_cuStreamGetCaptureInfo_v2(unsigned long long stream, int *captureStatus,
+                                              unsigned long long *id, unsigned long long *graph,
+                                              const unsigned long long **deps, size_t *numDeps);
+extern CUresult ol_cuGraphCreate(unsigned long long *graph, unsigned int flags);
+extern CUresult ol_cuGraphInstantiate_v2(unsigned long long *graphExec, unsigned long long graph,
+                                          unsigned long long *errNode, unsigned char *logBuffer, size_t bufferSize);
+extern CUresult ol_cuGraphInstantiate(unsigned long long *graphExec, unsigned long long graph,
+                                       unsigned long long *errNode, unsigned char *logBuffer, size_t bufferSize);
+extern CUresult ol_cuGraphInstantiateWithFlags(unsigned long long *graphExec, unsigned long long graph, unsigned long long flags);
+extern CUresult ol_cuGraphLaunch(unsigned long long graphExec, unsigned long long stream);
+extern CUresult ol_cuGraphExecDestroy(unsigned long long graphExec);
+extern CUresult ol_cuGraphDestroy(unsigned long long graph);
+
 /* Stream-ordered memory / pool (CUDA 11.2+) */
 extern CUresult ol_cuMemAllocAsync(unsigned long long *dptr, size_t bytesize, unsigned long long hStream);
 extern CUresult ol_cuMemFreeAsync(unsigned long long dptr, unsigned long long hStream);
@@ -365,6 +396,38 @@ CUresult hook_cuLaunchCooperativeKernel(CUfunction f,
 
 /* cuGetExportTable -- passthrough to real libcuda.so */
 CUresult hook_cuGetExportTable(const void **ppExportTable, const void *pExportTableId);
+
+/* Batch 2: D-to-D async, host alloc, pitch alloc, module load, fat binary,
+ * device mem pool get/set, allocation granularity */
+CUresult hook_cuMemcpyDtoDAsync_v2(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream);
+CUresult hook_cuMemHostAlloc(void **pp, size_t bytesize, unsigned int Flags);
+CUresult hook_cuMemAllocPitch_v2(CUdeviceptr *dptr, size_t *pPitch, size_t WidthInBytes, size_t Height, unsigned int ElementSizeBytes);
+CUresult hook_cuModuleLoad(CUmodule *module, const char *fname);
+CUresult hook_cuModuleLoadFatBinary(CUmodule *module, const void *fatCubin);
+CUresult hook_cuDeviceGetMemPool(CUmemoryPool *pool, CUdevice dev);
+CUresult hook_cuDeviceSetMemPool(CUdevice dev, CUmemoryPool pool);
+CUresult hook_cuMemGetAllocationGranularity(size_t *granularity, const void *prop, int option);
+
+/* Graph stubs */
+CUresult hook_cuStreamBeginCapture_v2(CUstream hStream, int mode);
+CUresult hook_cuStreamEndCapture(CUstream hStream, CUgraph *phGraph);
+CUresult hook_cuStreamIsCapturing(CUstream hStream, int *captureStatus);
+CUresult hook_cuStreamGetCaptureInfo_v2(CUstream hStream, int *captureStatus,
+                                         unsigned long long *id, CUgraph *graph,
+                                         const void **deps, size_t *numDeps);
+CUresult hook_cuGraphCreate(CUgraph *phGraph, unsigned int flags);
+CUresult hook_cuGraphInstantiate_v2(CUgraphExec *phGraphExec, CUgraph hGraph,
+                                     void *phErrorNode, char *logBuffer, size_t bufferSize);
+CUresult hook_cuGraphInstantiate(CUgraphExec *phGraphExec, CUgraph hGraph,
+                                  void *phErrorNode, char *logBuffer, size_t bufferSize);
+CUresult hook_cuGraphInstantiateWithFlags(CUgraphExec *phGraphExec, CUgraph hGraph, unsigned long long flags);
+CUresult hook_cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream);
+CUresult hook_cuGraphExecDestroy(CUgraphExec hGraphExec);
+CUresult hook_cuGraphDestroy(CUgraph hGraph);
+
+/* cuLaunchKernelEx (CUDA 12+) */
+CUresult hook_cuLaunchKernelEx(const void *config, CUfunction f,
+                                void **kernelParams, void **extra);
 
 /* cuGetProcAddress hooks */
 CUresult hook_cuGetProcAddress(const char *symbol, void **pfn,

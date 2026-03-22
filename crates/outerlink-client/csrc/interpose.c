@@ -247,6 +247,40 @@ static const hook_entry_t hook_table[] = {
     { "cuLinkComplete",          (void *)hook_cuLinkComplete },
     { "cuLinkDestroy",           (void *)hook_cuLinkDestroy },
 
+    /* Batch 2: D-to-D async, host alloc, pitch alloc */
+    { "cuMemcpyDtoDAsync",      (void *)hook_cuMemcpyDtoDAsync_v2 },
+    { "cuMemcpyDtoDAsync_v2",   (void *)hook_cuMemcpyDtoDAsync_v2 },
+    { "cuMemHostAlloc",          (void *)hook_cuMemHostAlloc },
+    { "cuMemAllocPitch",         (void *)hook_cuMemAllocPitch_v2 },
+    { "cuMemAllocPitch_v2",      (void *)hook_cuMemAllocPitch_v2 },
+
+    /* Module load (file path), fat binary */
+    { "cuModuleLoad",            (void *)hook_cuModuleLoad },
+    { "cuModuleLoadFatBinary",   (void *)hook_cuModuleLoadFatBinary },
+
+    /* Device mem pool get/set, allocation granularity */
+    { "cuDeviceGetMemPool",      (void *)hook_cuDeviceGetMemPool },
+    { "cuDeviceSetMemPool",      (void *)hook_cuDeviceSetMemPool },
+    { "cuMemGetAllocationGranularity", (void *)hook_cuMemGetAllocationGranularity },
+
+    /* Graph stubs (torch.compile reduce-overhead) */
+    { "cuStreamBeginCapture",    (void *)hook_cuStreamBeginCapture_v2 },
+    { "cuStreamBeginCapture_v2", (void *)hook_cuStreamBeginCapture_v2 },
+    { "cuStreamEndCapture",      (void *)hook_cuStreamEndCapture },
+    { "cuStreamIsCapturing",     (void *)hook_cuStreamIsCapturing },
+    { "cuStreamGetCaptureInfo",  (void *)hook_cuStreamGetCaptureInfo_v2 },
+    { "cuStreamGetCaptureInfo_v2", (void *)hook_cuStreamGetCaptureInfo_v2 },
+    { "cuGraphCreate",           (void *)hook_cuGraphCreate },
+    { "cuGraphInstantiate",      (void *)hook_cuGraphInstantiate },
+    { "cuGraphInstantiate_v2",   (void *)hook_cuGraphInstantiate_v2 },
+    { "cuGraphInstantiateWithFlags", (void *)hook_cuGraphInstantiateWithFlags },
+    { "cuGraphLaunch",           (void *)hook_cuGraphLaunch },
+    { "cuGraphExecDestroy",      (void *)hook_cuGraphExecDestroy },
+    { "cuGraphDestroy",          (void *)hook_cuGraphDestroy },
+
+    /* cuLaunchKernelEx (CUDA 12+) */
+    { "cuLaunchKernelEx",        (void *)hook_cuLaunchKernelEx },
+
     /* Export table -- passthrough to real libcuda.so (in-process vtables) */
     { "cuGetExportTable",        (void *)hook_cuGetExportTable },
 
@@ -1463,6 +1497,213 @@ CUresult hook_cuDeviceGetPCIBusId(char *pciBusId, int len, CUdevice dev) {
 CUresult hook_cuDeviceGetByPCIBusId(CUdevice *dev, const char *pciBusId) {
     ensure_init();
     return ol_cuDeviceGetByPCIBusId((int *)dev, (const unsigned char *)pciBusId);
+}
+
+/* -- Batch 2: D-to-D async, host alloc, pitch alloc -- */
+
+CUresult hook_cuMemcpyDtoDAsync_v2(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream) {
+    ensure_init();
+    return ol_cuMemcpyDtoDAsync_v2((unsigned long long)dst, (unsigned long long)src, ByteCount,
+                                    (unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuMemHostAlloc(void **pp, size_t bytesize, unsigned int Flags) {
+    ensure_init();
+    return ol_cuMemHostAlloc((unsigned char **)pp, bytesize, Flags);
+}
+
+CUresult hook_cuMemAllocPitch_v2(CUdeviceptr *dptr, size_t *pPitch, size_t WidthInBytes, size_t Height, unsigned int ElementSizeBytes) {
+    ensure_init();
+    return ol_cuMemAllocPitch_v2((unsigned long long *)dptr, pPitch, WidthInBytes, Height, ElementSizeBytes);
+}
+
+/* -- Module load (file path), fat binary -- */
+
+CUresult hook_cuModuleLoad(CUmodule *module, const char *fname) {
+    ensure_init();
+    unsigned long long mod_u64 = 0;
+    CUresult r = ol_cuModuleLoad(&mod_u64, (const unsigned char *)fname);
+    if (r == CUDA_SUCCESS && module) {
+        *module = (CUmodule)(uintptr_t)mod_u64;
+    }
+    return r;
+}
+
+CUresult hook_cuModuleLoadFatBinary(CUmodule *module, const void *fatCubin) {
+    ensure_init();
+    unsigned long long mod_u64 = 0;
+    CUresult r = ol_cuModuleLoadFatBinary(&mod_u64, (const unsigned char *)fatCubin);
+    if (r == CUDA_SUCCESS && module) {
+        *module = (CUmodule)(uintptr_t)mod_u64;
+    }
+    return r;
+}
+
+/* -- Device mem pool get/set, allocation granularity -- */
+
+CUresult hook_cuDeviceGetMemPool(CUmemoryPool *pool, CUdevice dev) {
+    ensure_init();
+    unsigned long long pool_u64 = 0;
+    CUresult r = ol_cuDeviceGetMemPool(&pool_u64, dev);
+    if (r == CUDA_SUCCESS && pool)
+        *pool = (CUmemoryPool)(uintptr_t)pool_u64;
+    return r;
+}
+
+CUresult hook_cuDeviceSetMemPool(CUdevice dev, CUmemoryPool pool) {
+    ensure_init();
+    return ol_cuDeviceSetMemPool(dev, (unsigned long long)(uintptr_t)pool);
+}
+
+CUresult hook_cuMemGetAllocationGranularity(size_t *granularity, const void *prop, int option) {
+    ensure_init();
+    return ol_cuMemGetAllocationGranularity(granularity, (const unsigned char *)prop, option);
+}
+
+/* -- Graph stubs -- */
+
+CUresult hook_cuStreamBeginCapture_v2(CUstream hStream, int mode) {
+    ensure_init();
+    return ol_cuStreamBeginCapture_v2((unsigned long long)(uintptr_t)hStream, mode);
+}
+
+CUresult hook_cuStreamEndCapture(CUstream hStream, CUgraph *phGraph) {
+    ensure_init();
+    unsigned long long graph_u64 = 0;
+    CUresult r = ol_cuStreamEndCapture((unsigned long long)(uintptr_t)hStream, &graph_u64);
+    if (r == CUDA_SUCCESS && phGraph)
+        *phGraph = (CUgraph)(uintptr_t)graph_u64;
+    return r;
+}
+
+CUresult hook_cuStreamIsCapturing(CUstream hStream, int *captureStatus) {
+    ensure_init();
+    return ol_cuStreamIsCapturing((unsigned long long)(uintptr_t)hStream, captureStatus);
+}
+
+CUresult hook_cuStreamGetCaptureInfo_v2(CUstream hStream, int *captureStatus,
+                                         unsigned long long *id, CUgraph *graph,
+                                         const void **deps, size_t *numDeps) {
+    ensure_init();
+    unsigned long long graph_u64 = 0;
+    CUresult r = ol_cuStreamGetCaptureInfo_v2(
+        (unsigned long long)(uintptr_t)hStream,
+        captureStatus, id, &graph_u64,
+        (const unsigned long long **)deps, numDeps);
+    if (r == CUDA_SUCCESS && graph)
+        *graph = (CUgraph)(uintptr_t)graph_u64;
+    return r;
+}
+
+CUresult hook_cuGraphCreate(CUgraph *phGraph, unsigned int flags) {
+    ensure_init();
+    unsigned long long graph_u64 = 0;
+    CUresult r = ol_cuGraphCreate(&graph_u64, flags);
+    if (r == CUDA_SUCCESS && phGraph)
+        *phGraph = (CUgraph)(uintptr_t)graph_u64;
+    return r;
+}
+
+CUresult hook_cuGraphInstantiate_v2(CUgraphExec *phGraphExec, CUgraph hGraph,
+                                     void *phErrorNode, char *logBuffer, size_t bufferSize) {
+    ensure_init();
+    unsigned long long exec_u64 = 0;
+    CUresult r = ol_cuGraphInstantiate_v2(
+        &exec_u64, (unsigned long long)(uintptr_t)hGraph,
+        (unsigned long long *)phErrorNode, (unsigned char *)logBuffer, bufferSize);
+    if (r == CUDA_SUCCESS && phGraphExec)
+        *phGraphExec = (CUgraphExec)(uintptr_t)exec_u64;
+    return r;
+}
+
+CUresult hook_cuGraphInstantiate(CUgraphExec *phGraphExec, CUgraph hGraph,
+                                  void *phErrorNode, char *logBuffer, size_t bufferSize) {
+    ensure_init();
+    unsigned long long exec_u64 = 0;
+    CUresult r = ol_cuGraphInstantiate(
+        &exec_u64, (unsigned long long)(uintptr_t)hGraph,
+        (unsigned long long *)phErrorNode, (unsigned char *)logBuffer, bufferSize);
+    if (r == CUDA_SUCCESS && phGraphExec)
+        *phGraphExec = (CUgraphExec)(uintptr_t)exec_u64;
+    return r;
+}
+
+CUresult hook_cuGraphInstantiateWithFlags(CUgraphExec *phGraphExec, CUgraph hGraph,
+                                           unsigned long long flags) {
+    ensure_init();
+    unsigned long long exec_u64 = 0;
+    CUresult r = ol_cuGraphInstantiateWithFlags(
+        &exec_u64, (unsigned long long)(uintptr_t)hGraph, flags);
+    if (r == CUDA_SUCCESS && phGraphExec)
+        *phGraphExec = (CUgraphExec)(uintptr_t)exec_u64;
+    return r;
+}
+
+CUresult hook_cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream) {
+    ensure_init();
+    return ol_cuGraphLaunch((unsigned long long)(uintptr_t)hGraphExec,
+                             (unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuGraphExecDestroy(CUgraphExec hGraphExec) {
+    ensure_init();
+    return ol_cuGraphExecDestroy((unsigned long long)(uintptr_t)hGraphExec);
+}
+
+CUresult hook_cuGraphDestroy(CUgraph hGraph) {
+    ensure_init();
+    return ol_cuGraphDestroy((unsigned long long)(uintptr_t)hGraph);
+}
+
+/* -- cuLaunchKernelEx (CUDA 12+) -- */
+/*
+ * The real CUDA cuLaunchKernelEx takes (CUlaunchConfig*, CUfunction, void**, void**).
+ * We extract grid/block/shared/stream from the CUlaunchConfig struct and delegate
+ * to ol_cuLaunchKernel, using the same param introspection as hook_cuLaunchKernel.
+ *
+ * CUlaunchConfig layout (x86_64):
+ *   offset 0:  gridDimX   (u32)
+ *   offset 4:  gridDimY   (u32)
+ *   offset 8:  gridDimZ   (u32)
+ *   offset 12: blockDimX  (u32)
+ *   offset 16: blockDimY  (u32)
+ *   offset 20: blockDimZ  (u32)
+ *   offset 24: sharedMemBytes (u32)
+ *   offset 28: padding    (4 bytes)
+ *   offset 32: hStream    (void*, 8 bytes)
+ *   offset 40: attrs      (void*, 8 bytes)
+ *   offset 48: numAttrs   (u32)
+ */
+
+CUresult hook_cuLaunchKernelEx(const void *config, CUfunction f,
+                                void **kernelParams, void **extra) {
+    ensure_init();
+
+    if (!config)
+        return CUDA_ERROR_INVALID_VALUE;
+
+    const unsigned char *cfg = (const unsigned char *)config;
+    unsigned int gridDimX, gridDimY, gridDimZ;
+    unsigned int blockDimX, blockDimY, blockDimZ;
+    unsigned int sharedMemBytes;
+    CUstream hStream;
+
+    memcpy(&gridDimX,       cfg + 0,  4);
+    memcpy(&gridDimY,       cfg + 4,  4);
+    memcpy(&gridDimZ,       cfg + 8,  4);
+    memcpy(&blockDimX,      cfg + 12, 4);
+    memcpy(&blockDimY,      cfg + 16, 4);
+    memcpy(&blockDimZ,      cfg + 20, 4);
+    memcpy(&sharedMemBytes, cfg + 24, 4);
+    memcpy(&hStream,        cfg + 32, sizeof(void *));
+
+    /* Delegate to hook_cuLaunchKernel which handles both extra and
+     * kernelParams paths with param introspection. */
+    return hook_cuLaunchKernel(f,
+        gridDimX, gridDimY, gridDimZ,
+        blockDimX, blockDimY, blockDimZ,
+        sharedMemBytes, hStream,
+        kernelParams, extra);
 }
 
 /* -----------------------------------------------------------------------

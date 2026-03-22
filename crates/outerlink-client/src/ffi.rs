@@ -4771,22 +4771,69 @@ pub extern "C" fn ol_cuModuleLoadFatBinary(module: *mut u64, fat_cubin: *const u
     if module.is_null() || fat_cubin.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // Fat binary size detection: read the magic + header to determine size.
-    // The __cudaFatMAGIC2 header has a headerSize field at offset 8 (u64).
-    // For simplicity in Phase 1, we treat this like ModuleLoadData with a
-    // fixed-size probe. Real fat binaries start with 0x466243B1 magic.
-    // We send the first 8 bytes to detect; the server does the real loading.
+    // Determine fat binary size by parsing the header.
     //
-    // Connected: send the fat binary data to the server.
-    // Since we don't know the size of a fat binary from a raw pointer,
-    // we delegate to ModuleLoadData-style handling. The caller is expected
-    // to pass a valid fat cubin pointer; we send a probe request.
-    if client.connected.load(Ordering::Acquire) {
-        // Fat binary header: first 4 bytes are magic, offset 8 is u64 length.
-        // For safety, read magic only and let server handle via cuModuleLoadFatBinary.
-        // Since we can't determine size from a raw pointer in a generic way,
-        // fall through to stub for now. Server-side implementation uses the
-        // real CUDA API which accepts the pointer directly.
+    // CUDA fat binaries start with magic 0x466243B1 (little-endian).
+    // Header layout:
+    //   offset 0: magic     (u32) = 0x466243B1
+    //   offset 4: version   (u16)
+    //   offset 6: header_size (u16)
+    //   offset 8: fat_size  (u64) -- total size of the fat binary
+    //
+    // If magic doesn't match, try ELF (raw cubin): 0x7f454c46.
+    // If neither matches, we can't determine size -- fall through to stub.
+    let data_len: usize = unsafe {
+        let magic = u32::from_le_bytes(std::slice::from_raw_parts(fat_cubin, 4).try_into().unwrap());
+        if magic == 0x466243B1 {
+            // CUDA fat binary -- read fat_size at offset 8
+            let fat_size = u64::from_le_bytes(
+                std::slice::from_raw_parts(fat_cubin.add(8), 8).try_into().unwrap(),
+            );
+            fat_size as usize
+        } else if magic == 0x464c457f {
+            // ELF magic (0x7f 'E' 'L' 'F') -- parse like cuModuleLoadData does
+            let p = fat_cubin;
+            // Verify EI_CLASS=2 (64-bit) and EI_DATA=1 (little-endian)
+            if *p.add(4) == 2 && *p.add(5) == 1 {
+                let mut e_shoff: u64 = 0;
+                let mut e_shentsize: u16 = 0;
+                let mut e_shnum: u16 = 0;
+                std::ptr::copy_nonoverlapping(p.add(0x28), &mut e_shoff as *mut u64 as *mut u8, 8);
+                std::ptr::copy_nonoverlapping(p.add(0x3A), &mut e_shentsize as *mut u16 as *mut u8, 2);
+                std::ptr::copy_nonoverlapping(p.add(0x3C), &mut e_shnum as *mut u16 as *mut u8, 2);
+                let sh_table_size = (e_shnum as u64) * (e_shentsize as u64);
+                if e_shoff <= (usize::MAX as u64) - sh_table_size {
+                    (e_shoff + sh_table_size) as usize
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    };
+
+    if client.connected.load(Ordering::Acquire) && data_len > 0 {
+        // Send the fat binary data as ModuleLoadData payload (same wire format).
+        let data_slice = unsafe { std::slice::from_raw_parts(fat_cubin, data_len) };
+        let mut payload = Vec::with_capacity(8 + data_len);
+        payload.extend_from_slice(&(data_len as u64).to_le_bytes());
+        payload.extend_from_slice(data_slice);
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::ModuleLoadFatBinary, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.modules.insert(remote_module);
+                unsafe { *module = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
     }
     // Stub: generate a local-only handle
     let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

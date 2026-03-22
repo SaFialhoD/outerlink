@@ -23,6 +23,8 @@ typedef struct CUstream_st *CUstream;
 typedef struct CUevent_st *CUevent;
 typedef unsigned long long CUdeviceptr;
 typedef struct CUmemPoolHandle_st *CUmemoryPool;
+typedef struct CUgraph_st *CUgraph;
+typedef struct CUgraphExec_st *CUgraphExec;
 typedef uint64_t cuuint64_t;
 
 /* Occupancy callback type: maps block size to dynamic shared memory size */
@@ -89,6 +91,7 @@ typedef enum {
     CUDA_ERROR_STREAM_CAPTURE_WRONG_THREAD = 908,
     CUDA_ERROR_TIMEOUT = 909,
     CUDA_ERROR_SYSTEM_NOT_READY = 910,
+    CUDA_ERROR_NOT_SUPPORTED = 801,
     CUDA_ERROR_UNKNOWN = 999,
     /* OuterLink extensions -- not present in NVIDIA headers */
     OUTERLINK_ERROR_TRANSPORT        = 10000,
