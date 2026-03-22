@@ -33,6 +33,12 @@ const CUDA_ERROR_NOT_FOUND: u32 = 500;
 // Returned by server when cuDevicePrimaryCtxSetFlags is called on an active context
 #[allow(dead_code)]
 const CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE: u32 = 708;
+// Returned by server when peer access was already enabled
+#[allow(dead_code)]
+const CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED: u32 = 704;
+// Returned by server when peer access was not previously enabled
+#[allow(dead_code)]
+const CUDA_ERROR_PEER_ACCESS_NOT_ENABLED: u32 = 705;
 const CUDA_ERROR_UNKNOWN: u32 = 999;
 
 // ---------------------------------------------------------------------------
@@ -2733,6 +2739,148 @@ pub extern "C" fn ol_cuStreamWaitEvent(stream: u64, event: u64, flags: u32) -> u
     CUDA_SUCCESS
 }
 
+// ---------------------------------------------------------------------------
+// Peer access
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuDeviceCanAccessPeer(
+    can_access_peer: *mut i32,
+    dev: i32,
+    peer_dev: i32,
+) -> u32 {
+    let client = get_client();
+    if can_access_peer.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&dev.to_le_bytes());
+        payload[4..8].copy_from_slice(&peer_dev.to_le_bytes());
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::DeviceCanAccessPeer, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe {
+                    *can_access_peer = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: self-peer returns 0 per CUDA spec, invalid devices return error
+    if dev < 0 || dev >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    if peer_dev < 0 || peer_dev >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    // Single-device stub: dev == peer_dev == 0 -> 0 per spec
+    unsafe { *can_access_peer = 0 };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuDeviceGetP2PAttribute(
+    value: *mut i32,
+    attrib: i32,
+    src_device: i32,
+    dst_device: i32,
+) -> u32 {
+    let client = get_client();
+    if value.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = [0u8; 12];
+        payload[..4].copy_from_slice(&attrib.to_le_bytes());
+        payload[4..8].copy_from_slice(&src_device.to_le_bytes());
+        payload[8..12].copy_from_slice(&dst_device.to_le_bytes());
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::DeviceGetP2PAttribute, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe {
+                    *value = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate devices, return 0 for all attributes
+    if src_device < 0 || src_device >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    if dst_device < 0 || dst_device >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    unsafe { *value = 0 };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxEnablePeerAccess(peer_ctx: u64, flags: u32) -> u32 {
+    let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_ctx = match client.handles.contexts.to_remote(peer_ctx) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_CONTEXT,
+        };
+        let mut payload = [0u8; 12];
+        payload[..8].copy_from_slice(&remote_ctx.to_le_bytes());
+        payload[8..12].copy_from_slice(&flags.to_le_bytes());
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::CtxEnablePeerAccess, &payload)
+        {
+            return parse_result(&resp);
+        }
+        return CUDA_ERROR_UNKNOWN;
+    }
+    // Stub: validate context handle
+    if client.handles.contexts.to_remote(peer_ctx).is_none() {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxDisablePeerAccess(peer_ctx: u64) -> u32 {
+    let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_ctx = match client.handles.contexts.to_remote(peer_ctx) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_CONTEXT,
+        };
+        let payload = remote_ctx.to_le_bytes();
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::CtxDisablePeerAccess, &payload)
+        {
+            return parse_result(&resp);
+        }
+        return CUDA_ERROR_UNKNOWN;
+    }
+    // Stub: validate context handle
+    if client.handles.contexts.to_remote(peer_ctx).is_none() {
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
+    // In stub mode, peer access was never really enabled, so this is a best-effort success
+    CUDA_SUCCESS
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -4181,5 +4329,80 @@ mod tests {
             0,
         );
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // --- Peer access tests ---
+
+    #[test]
+    fn test_ol_cu_device_can_access_peer_same_device() {
+        let mut can_access: i32 = -1;
+        let result = ol_cuDeviceCanAccessPeer(&mut can_access, 0, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(can_access, 0); // self-peer returns 0
+    }
+
+    #[test]
+    fn test_ol_cu_device_can_access_peer_null_ptr() {
+        let result = ol_cuDeviceCanAccessPeer(ptr::null_mut(), 0, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_device_can_access_peer_invalid_device() {
+        let mut can_access: i32 = -1;
+        assert_eq!(ol_cuDeviceCanAccessPeer(&mut can_access, 99, 0), CUDA_ERROR_INVALID_DEVICE);
+        assert_eq!(ol_cuDeviceCanAccessPeer(&mut can_access, 0, 99), CUDA_ERROR_INVALID_DEVICE);
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_p2p_attribute_stub() {
+        let mut value: i32 = -1;
+        let result = ol_cuDeviceGetP2PAttribute(&mut value, 0, 0, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(value, 0); // stub returns 0 for all
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_p2p_attribute_null_ptr() {
+        let result = ol_cuDeviceGetP2PAttribute(ptr::null_mut(), 0, 0, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_p2p_attribute_invalid_device() {
+        let mut value: i32 = -1;
+        assert_eq!(ol_cuDeviceGetP2PAttribute(&mut value, 0, 99, 0), CUDA_ERROR_INVALID_DEVICE);
+        assert_eq!(ol_cuDeviceGetP2PAttribute(&mut value, 0, 0, 99), CUDA_ERROR_INVALID_DEVICE);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_enable_peer_access_valid() {
+        let mut ctx: u64 = 0;
+        assert_eq!(ol_cuCtxCreate_v2(&mut ctx, 0, 0), CUDA_SUCCESS);
+        let result = ol_cuCtxEnablePeerAccess(ctx, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuCtxDestroy_v2(ctx);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_enable_peer_access_invalid_context() {
+        let result = ol_cuCtxEnablePeerAccess(0xDEAD_BEEF, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_CONTEXT);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_disable_peer_access_valid() {
+        let mut ctx: u64 = 0;
+        assert_eq!(ol_cuCtxCreate_v2(&mut ctx, 0, 0), CUDA_SUCCESS);
+        // In stub mode, disable should succeed (best-effort)
+        let result = ol_cuCtxDisablePeerAccess(ctx);
+        assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuCtxDestroy_v2(ctx);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_disable_peer_access_invalid_context() {
+        let result = ol_cuCtxDisablePeerAccess(0xDEAD_BEEF);
+        assert_eq!(result, CUDA_ERROR_INVALID_CONTEXT);
     }
 }

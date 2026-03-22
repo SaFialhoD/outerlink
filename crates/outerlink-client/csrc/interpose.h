@@ -59,6 +59,12 @@ extern CUresult ol_cuDevicePrimaryCtxGetState(int dev, unsigned int *flags, int 
 extern CUresult ol_cuDevicePrimaryCtxSetFlags(int dev, unsigned int flags);
 extern CUresult ol_cuDevicePrimaryCtxReset(int dev);
 
+/* Peer access */
+extern CUresult ol_cuDeviceCanAccessPeer(int *canAccessPeer, int dev, int peerDev);
+extern CUresult ol_cuDeviceGetP2PAttribute(int *value, int attrib, int srcDevice, int dstDevice);
+extern CUresult ol_cuCtxEnablePeerAccess(unsigned long long peerContext, unsigned int flags);
+extern CUresult ol_cuCtxDisablePeerAccess(unsigned long long peerContext);
+
 /* Memory management -- CUdeviceptr is unsigned long long */
 extern CUresult ol_cuMemAlloc_v2(unsigned long long *dptr, size_t bytesize);
 extern CUresult ol_cuMemFree_v2(unsigned long long dptr);
@@ -174,6 +180,12 @@ CUresult hook_cuDevicePrimaryCtxRelease_v2(CUdevice dev);
 CUresult hook_cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int *flags, int *active);
 CUresult hook_cuDevicePrimaryCtxSetFlags_v2(CUdevice dev, unsigned int flags);
 CUresult hook_cuDevicePrimaryCtxReset_v2(CUdevice dev);
+
+/* Peer access */
+CUresult hook_cuDeviceCanAccessPeer(int *canAccessPeer, CUdevice dev, CUdevice peerDev);
+CUresult hook_cuDeviceGetP2PAttribute(int *value, int attrib, CUdevice srcDevice, CUdevice dstDevice);
+CUresult hook_cuCtxEnablePeerAccess(CUcontext peerContext, unsigned int flags);
+CUresult hook_cuCtxDisablePeerAccess(CUcontext peerContext);
 
 /* Memory */
 CUresult hook_cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize);
