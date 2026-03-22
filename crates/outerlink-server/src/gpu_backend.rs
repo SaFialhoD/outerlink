@@ -203,6 +203,19 @@ pub trait GpuBackend: Send + Sync {
     /// Free pinned host memory.
     fn mem_free_host(&self, ptr: u64) -> Result<(), CuResult>;
 
+    /// Get the device-accessible pointer for a host allocation (UVA).
+    /// Under UVA, the device pointer equals the host pointer.
+    fn mem_host_get_device_pointer(&self, host_ptr: u64, flags: u32) -> Result<u64, CuResult>;
+
+    /// Get the flags used when a host allocation was created.
+    fn mem_host_get_flags(&self, ptr: u64) -> Result<u32, CuResult>;
+
+    /// Register existing host memory for use with CUDA (pin it).
+    fn mem_host_register(&self, ptr: u64, size: usize, flags: u32) -> Result<(), CuResult>;
+
+    /// Unregister previously registered host memory.
+    fn mem_host_unregister(&self, ptr: u64) -> Result<(), CuResult>;
+
     // --- Memory: async copy ---
 
     /// Async host-to-device copy (takes stream parameter).
@@ -439,6 +452,8 @@ struct StubState {
     host_allocations: HashMap<u64, Vec<u8>>,
     /// Counter for generating host memory handles.
     next_host_ptr: u64,
+    /// Registered host memory: ptr -> (size, flags).
+    registered_host: HashMap<u64, (usize, u32)>,
     /// Primary contexts: device ordinal -> primary context state.
     primary_contexts: HashMap<i32, PrimaryCtxState>,
     /// Context stack for push/pop operations.
@@ -489,6 +504,7 @@ impl StubGpuBackend {
                 event_timestamp_counter: 1000,
                 host_allocations: HashMap::new(),
                 next_host_ptr: 0x0000_CAFE_0000_0000,
+                registered_host: HashMap::new(),
                 primary_contexts: HashMap::new(),
                 context_stack: Vec::new(),
                 context_limits: {
@@ -831,7 +847,8 @@ impl GpuBackend for StubGpuBackend {
     fn pointer_get_attribute(&self, attribute: i32, ptr: u64) -> Result<u64, CuResult> {
         let state = self.state.lock().unwrap();
         let is_device = state.allocations.contains_key(&ptr);
-        let is_host = state.host_allocations.contains_key(&ptr);
+        let is_host = state.host_allocations.contains_key(&ptr)
+            || state.registered_host.contains_key(&ptr);
         if !is_device && !is_host {
             return Err(CuResult::InvalidValue);
         }
@@ -852,7 +869,8 @@ impl GpuBackend for StubGpuBackend {
         {
             let state = self.state.lock().unwrap();
             let is_device = state.allocations.contains_key(&ptr);
-            let is_host = state.host_allocations.contains_key(&ptr);
+            let is_host = state.host_allocations.contains_key(&ptr)
+                || state.registered_host.contains_key(&ptr);
             if !is_device && !is_host {
                 return Err(CuResult::InvalidValue);
             }
@@ -1030,6 +1048,52 @@ impl GpuBackend for StubGpuBackend {
     fn mem_free_host(&self, ptr: u64) -> Result<(), CuResult> {
         let mut state = self.state.lock().unwrap();
         if state.host_allocations.remove(&ptr).is_none() {
+            return Err(CuResult::InvalidValue);
+        }
+        Ok(())
+    }
+
+    fn mem_host_get_device_pointer(&self, host_ptr: u64, _flags: u32) -> Result<u64, CuResult> {
+        let state = self.state.lock().unwrap();
+        // Valid if allocated via cuMemAllocHost or registered via cuMemHostRegister.
+        if state.host_allocations.contains_key(&host_ptr)
+            || state.registered_host.contains_key(&host_ptr)
+        {
+            // UVA: device pointer == host pointer.
+            return Ok(host_ptr);
+        }
+        Err(CuResult::InvalidValue)
+    }
+
+    fn mem_host_get_flags(&self, ptr: u64) -> Result<u32, CuResult> {
+        let state = self.state.lock().unwrap();
+        // cuMemAllocHost allocations have implicit flags = 0 (portable).
+        if state.host_allocations.contains_key(&ptr) {
+            return Ok(0);
+        }
+        // Registered memory stores its flags.
+        if let Some(&(_size, flags)) = state.registered_host.get(&ptr) {
+            return Ok(flags);
+        }
+        Err(CuResult::InvalidValue)
+    }
+
+    fn mem_host_register(&self, ptr: u64, size: usize, flags: u32) -> Result<(), CuResult> {
+        if size == 0 || ptr == 0 {
+            return Err(CuResult::InvalidValue);
+        }
+        let mut state = self.state.lock().unwrap();
+        // Cannot register if already registered or already allocated via cuMemAllocHost.
+        if state.registered_host.contains_key(&ptr) || state.host_allocations.contains_key(&ptr) {
+            return Err(CuResult::InvalidValue);
+        }
+        state.registered_host.insert(ptr, (size, flags));
+        Ok(())
+    }
+
+    fn mem_host_unregister(&self, ptr: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if state.registered_host.remove(&ptr).is_none() {
             return Err(CuResult::InvalidValue);
         }
         Ok(())
@@ -1328,6 +1392,7 @@ impl GpuBackend for StubGpuBackend {
             streams = state.streams.len(),
             events = state.events.len(),
             host_allocations = state.host_allocations.len(),
+            registered_host = state.registered_host.len(),
             "stub: shutdown — releasing all resources"
         );
         state.contexts.clear();
@@ -1337,6 +1402,7 @@ impl GpuBackend for StubGpuBackend {
         state.streams.clear();
         state.events.clear();
         state.host_allocations.clear();
+        state.registered_host.clear();
         state.primary_contexts.clear();
         state.context_stack.clear();
         state.context_limits.clear();
@@ -3012,5 +3078,145 @@ mod tests {
         assert_eq!(gpu.memcpy_htod(src, &data), CuResult::Success);
         // Stream 0 (default) should always be valid.
         assert!(gpu.memcpy_async(dst, src, 64, 0).is_ok());
+    }
+
+    // --- MemHostGetDevicePointer tests ---
+
+    #[test]
+    fn test_mem_host_get_device_pointer_alloc_host() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_host(4096).unwrap();
+        // UVA: device pointer == host pointer.
+        let dev_ptr = gpu.mem_host_get_device_pointer(ptr, 0).unwrap();
+        assert_eq!(dev_ptr, ptr);
+        let _ = gpu.mem_free_host(ptr);
+    }
+
+    #[test]
+    fn test_mem_host_get_device_pointer_registered() {
+        let gpu = StubGpuBackend::new();
+        gpu.mem_host_register(0x1000, 4096, 0).unwrap();
+        let dev_ptr = gpu.mem_host_get_device_pointer(0x1000, 0).unwrap();
+        assert_eq!(dev_ptr, 0x1000);
+        let _ = gpu.mem_host_unregister(0x1000);
+    }
+
+    #[test]
+    fn test_mem_host_get_device_pointer_unknown() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.mem_host_get_device_pointer(0xBAD, 0),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    // --- MemHostGetFlags tests ---
+
+    #[test]
+    fn test_mem_host_get_flags_alloc_host() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_host(1024).unwrap();
+        // cuMemAllocHost => flags = 0 (portable).
+        assert_eq!(gpu.mem_host_get_flags(ptr), Ok(0));
+        let _ = gpu.mem_free_host(ptr);
+    }
+
+    #[test]
+    fn test_mem_host_get_flags_registered() {
+        let gpu = StubGpuBackend::new();
+        gpu.mem_host_register(0x2000, 512, 0x03).unwrap();
+        assert_eq!(gpu.mem_host_get_flags(0x2000), Ok(0x03));
+        let _ = gpu.mem_host_unregister(0x2000);
+    }
+
+    #[test]
+    fn test_mem_host_get_flags_unknown() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_host_get_flags(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    // --- MemHostRegister tests ---
+
+    #[test]
+    fn test_mem_host_register_and_unregister() {
+        let gpu = StubGpuBackend::new();
+        assert!(gpu.mem_host_register(0x3000, 4096, 0).is_ok());
+        assert!(gpu.mem_host_unregister(0x3000).is_ok());
+    }
+
+    #[test]
+    fn test_mem_host_register_zero_size() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.mem_host_register(0x3000, 0, 0),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_mem_host_register_null_ptr() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.mem_host_register(0, 4096, 0),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_mem_host_register_double_register() {
+        let gpu = StubGpuBackend::new();
+        gpu.mem_host_register(0x4000, 4096, 0).unwrap();
+        assert_eq!(
+            gpu.mem_host_register(0x4000, 4096, 0),
+            Err(CuResult::InvalidValue)
+        );
+        let _ = gpu.mem_host_unregister(0x4000);
+    }
+
+    #[test]
+    fn test_mem_host_register_already_alloc_host() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_alloc_host(1024).unwrap();
+        // Cannot register memory already allocated by cuMemAllocHost.
+        assert_eq!(
+            gpu.mem_host_register(ptr, 1024, 0),
+            Err(CuResult::InvalidValue)
+        );
+        let _ = gpu.mem_free_host(ptr);
+    }
+
+    // --- MemHostUnregister tests ---
+
+    #[test]
+    fn test_mem_host_unregister_not_registered() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.mem_host_unregister(0xBAD),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_mem_host_unregister_double() {
+        let gpu = StubGpuBackend::new();
+        gpu.mem_host_register(0x5000, 1024, 0).unwrap();
+        assert!(gpu.mem_host_unregister(0x5000).is_ok());
+        assert_eq!(
+            gpu.mem_host_unregister(0x5000),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    // --- Registered host memory visible to pointer_get_attribute ---
+
+    #[test]
+    fn test_pointer_get_attribute_registered_host() {
+        let gpu = StubGpuBackend::new();
+        gpu.mem_host_register(0x6000, 2048, 0).unwrap();
+        // MEMORY_TYPE = 1 (HOST)
+        assert_eq!(gpu.pointer_get_attribute(2, 0x6000), Ok(1));
+        // HOST_POINTER returns the pointer itself
+        assert_eq!(gpu.pointer_get_attribute(4, 0x6000), Ok(0x6000));
+        let _ = gpu.mem_host_unregister(0x6000);
     }
 }

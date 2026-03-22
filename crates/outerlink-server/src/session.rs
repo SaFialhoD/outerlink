@@ -41,6 +41,8 @@ pub struct ConnectionSession {
     events: HashSet<u64>,
     /// Primary contexts retained by this session: device -> ctx_handle.
     primary_ctxs: HashMap<i32, u64>,
+    /// Registered host memory pointers owned by this session.
+    registered_host: HashSet<u64>,
     /// Peer contexts enabled for P2P access by this session.
     peer_access_ctxs: HashSet<u64>,
 }
@@ -57,6 +59,7 @@ impl ConnectionSession {
             streams: HashSet::new(),
             events: HashSet::new(),
             primary_ctxs: HashMap::new(),
+            registered_host: HashSet::new(),
             peer_access_ctxs: HashSet::new(),
         }
     }
@@ -125,6 +128,21 @@ impl ConnectionSession {
     /// Remove `ptr` from this session's tracked host memory.
     pub fn untrack_host_alloc(&mut self, ptr: u64) {
         self.host_allocations.remove(&ptr);
+    }
+
+    /// Record that this session registered host memory at `ptr`.
+    pub fn track_registered_host(&mut self, ptr: u64) {
+        self.registered_host.insert(ptr);
+    }
+
+    /// Remove `ptr` from this session's tracked registered host memory.
+    pub fn untrack_registered_host(&mut self, ptr: u64) {
+        self.registered_host.remove(&ptr);
+    }
+
+    /// Number of registered host memory entries tracked by this session.
+    pub fn registered_host_count(&self) -> usize {
+        self.registered_host.len()
     }
 
     /// Record that this session created a CUDA context with handle `ctx`.
@@ -228,6 +246,7 @@ impl ConnectionSession {
     pub fn total_tracked_resources(&self) -> usize {
         self.mem_allocations.len()
             + self.host_allocations.len()
+            + self.registered_host.len()
             + self.contexts.len()
             + self.modules.len()
             + self.streams.len()
@@ -322,7 +341,21 @@ impl ConnectionSession {
             }
         }
 
-        // 5.5. Peer access (disable before contexts are destroyed)
+        // 5.5. Registered host memory
+        for ptr in self.registered_host.drain() {
+            match backend.mem_host_unregister(ptr) {
+                Ok(()) => {
+                    tracing::debug!(ptr = ptr, "session cleanup: unregistered host memory");
+                    report.succeeded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(ptr = ptr, error = ?e, "session cleanup: failed to unregister host memory");
+                    report.failed += 1;
+                }
+            }
+        }
+
+        // 5.6. Peer access (disable before contexts are destroyed)
         // Note: ctx_disable_peer_access may fail if the peer context was already
         // destroyed by another session closing concurrently. That is expected
         // behavior -- we log the warning but do not treat it as fatal.
@@ -735,6 +768,42 @@ mod tests {
         // Verify context was released (inactive now).
         let (_, active) = backend.primary_ctx_get_state(0).unwrap();
         assert_eq!(active, 0);
+    }
+
+    // --- Registered host memory tracking tests ---
+
+    #[test]
+    fn test_track_and_untrack_registered_host() {
+        let mut session = ConnectionSession::new();
+        session.track_registered_host(0x1000);
+        assert_eq!(session.registered_host_count(), 1);
+        session.untrack_registered_host(0x1000);
+        assert_eq!(session.registered_host_count(), 0);
+    }
+
+    #[test]
+    fn test_registered_host_counted_in_total() {
+        let mut session = ConnectionSession::new();
+        session.track_registered_host(0x2000);
+        assert_eq!(session.total_tracked_resources(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_unregisters_host_memory() {
+        let backend = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Register via backend and track.
+        backend.mem_host_register(0x3000, 4096, 0).unwrap();
+        session.track_registered_host(0x3000);
+
+        let report = session.cleanup(&backend);
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(session.registered_host_count(), 0);
+
+        // Should be unregistered now -- re-unregister fails.
+        assert!(backend.mem_host_unregister(0x3000).is_err());
     }
 
     #[test]

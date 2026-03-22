@@ -118,6 +118,10 @@ pub enum MessageType {
     CtxDisablePeerAccess = 0x0091,
 
     // Memory (extended)
+    MemHostGetDevicePointer = 0x00B3,
+    MemHostGetFlags = 0x00B4,
+    MemHostRegister = 0x00B5,
+    MemHostUnregister = 0x00B6,
     MemGetAddressRange = 0x00B2,
     Memcpy = 0x00B7,
     MemcpyAsync = 0x00B8,
@@ -213,6 +217,10 @@ impl MessageType {
             0x0090 => Some(Self::CtxEnablePeerAccess),
             0x0091 => Some(Self::CtxDisablePeerAccess),
             0x00B2 => Some(Self::MemGetAddressRange),
+            0x00B3 => Some(Self::MemHostGetDevicePointer),
+            0x00B4 => Some(Self::MemHostGetFlags),
+            0x00B5 => Some(Self::MemHostRegister),
+            0x00B6 => Some(Self::MemHostUnregister),
             0x00B7 => Some(Self::Memcpy),
             0x00B8 => Some(Self::MemcpyAsync),
             0x00A0 => Some(Self::CtxGetStreamPriorityRange),

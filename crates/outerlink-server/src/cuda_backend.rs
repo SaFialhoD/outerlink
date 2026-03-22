@@ -137,6 +137,10 @@ type FnCuMemcpyAsync =
 // Host pinned memory
 type FnCuMemAllocHost = unsafe extern "C" fn(pp: *mut *mut std::ffi::c_void, bytesize: usize) -> i32;
 type FnCuMemFreeHost = unsafe extern "C" fn(p: *mut std::ffi::c_void) -> i32;
+type FnCuMemHostGetDevicePointer = unsafe extern "C" fn(pdptr: *mut u64, p: *mut std::ffi::c_void, flags: u32) -> i32;
+type FnCuMemHostGetFlags = unsafe extern "C" fn(p_flags: *mut u32, p: *mut std::ffi::c_void) -> i32;
+type FnCuMemHostRegister = unsafe extern "C" fn(p: *mut std::ffi::c_void, bytesize: usize, flags: u32) -> i32;
+type FnCuMemHostUnregister = unsafe extern "C" fn(p: *mut std::ffi::c_void) -> i32;
 
 // Peer access
 type FnCuDeviceCanAccessPeer = unsafe extern "C" fn(can_access: *mut i32, dev: i32, peer_dev: i32) -> i32;
@@ -250,6 +254,10 @@ struct CudaApi {
     cu_memset_d16_async: Option<FnCuMemsetD16Async>,
     cu_mem_alloc_host: Option<FnCuMemAllocHost>,
     cu_mem_free_host: Option<FnCuMemFreeHost>,
+    cu_mem_host_get_device_pointer: Option<FnCuMemHostGetDevicePointer>,
+    cu_mem_host_get_flags: Option<FnCuMemHostGetFlags>,
+    cu_mem_host_register: Option<FnCuMemHostRegister>,
+    cu_mem_host_unregister: Option<FnCuMemHostUnregister>,
 
     cu_module_load_data: Option<FnCuModuleLoadData>,
     cu_module_load_data_ex: Option<FnCuModuleLoadDataEx>,
@@ -395,6 +403,10 @@ impl CudaApi {
             cu_memset_d16_async: load_sym!(lib, b"cuMemsetD16Async\0"),
             cu_mem_alloc_host: load_sym!(lib, b"cuMemAllocHost_v2\0", b"cuMemAllocHost\0"),
             cu_mem_free_host: load_sym!(lib, b"cuMemFreeHost\0"),
+            cu_mem_host_get_device_pointer: load_sym!(lib, b"cuMemHostGetDevicePointer_v2\0", b"cuMemHostGetDevicePointer\0"),
+            cu_mem_host_get_flags: load_sym!(lib, b"cuMemHostGetFlags\0"),
+            cu_mem_host_register: load_sym!(lib, b"cuMemHostRegister_v2\0", b"cuMemHostRegister\0"),
+            cu_mem_host_unregister: load_sym!(lib, b"cuMemHostUnregister\0"),
 
             cu_module_load_data: load_sym!(lib, b"cuModuleLoadData\0"),
             cu_module_load_data_ex: load_sym!(lib, b"cuModuleLoadDataEx\0"),
@@ -1168,6 +1180,40 @@ impl GpuBackend for CudaGpuBackend {
             map_cuda_result(func(ptr as *mut std::ffi::c_void))?;
         }
         tracing::trace!(ptr, "pinned host memory freed");
+        Ok(())
+    }
+
+    fn mem_host_get_device_pointer(&self, host_ptr: u64, flags: u32) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_mem_host_get_device_pointer)?;
+        let mut dev_ptr: u64 = 0;
+        unsafe {
+            map_cuda_result(func(&mut dev_ptr, host_ptr as *mut std::ffi::c_void, flags))?;
+        }
+        Ok(dev_ptr)
+    }
+
+    fn mem_host_get_flags(&self, ptr: u64) -> Result<u32, CuResult> {
+        let func = require_fn(&self.api.cu_mem_host_get_flags)?;
+        let mut flags: u32 = 0;
+        unsafe {
+            map_cuda_result(func(&mut flags, ptr as *mut std::ffi::c_void))?;
+        }
+        Ok(flags)
+    }
+
+    fn mem_host_register(&self, ptr: u64, size: usize, flags: u32) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_mem_host_register)?;
+        unsafe {
+            map_cuda_result(func(ptr as *mut std::ffi::c_void, size, flags))?;
+        }
+        Ok(())
+    }
+
+    fn mem_host_unregister(&self, ptr: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_mem_host_unregister)?;
+        unsafe {
+            map_cuda_result(func(ptr as *mut std::ffi::c_void))?;
+        }
         Ok(())
     }
 

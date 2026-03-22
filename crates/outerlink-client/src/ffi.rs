@@ -3154,6 +3154,136 @@ pub extern "C" fn ol_cuMemFreeHost(p: *mut u8) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Host memory utilities
+// ---------------------------------------------------------------------------
+
+/// Tracking map for registered host memory: ptr -> (size, flags) (stub mode).
+static REGISTERED_HOST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, (usize, u32)>>> =
+    std::sync::OnceLock::new();
+
+fn registered_host() -> &'static std::sync::Mutex<std::collections::HashMap<u64, (usize, u32)>> {
+    REGISTERED_HOST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemHostGetDevicePointer(pdptr: *mut u64, p: *mut u8, flags: u32) -> u32 {
+    let client = get_client();
+    if pdptr.is_null() || p.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let host_ptr = p as u64;
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = host_ptr.to_le_bytes().to_vec();
+        payload.extend_from_slice(&flags.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemHostGetDevicePointer, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let dev_ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                unsafe { *pdptr = dev_ptr };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: UVA means device pointer == host pointer, if known.
+    let known = host_allocs().lock().unwrap().contains(&host_ptr)
+        || registered_host().lock().unwrap().contains_key(&host_ptr);
+    if !known {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *pdptr = host_ptr };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemHostGetFlags(p_flags: *mut u32, p: *mut u8) -> u32 {
+    let client = get_client();
+    if p_flags.is_null() || p.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let host_ptr = p as u64;
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let payload = host_ptr.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemHostGetFlags, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                let flags = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+                unsafe { *p_flags = flags };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: check registered host (has explicit flags), then host_allocs (flags = 0).
+    if let Some(&(_size, flags)) = registered_host().lock().unwrap().get(&host_ptr) {
+        unsafe { *p_flags = flags };
+        return CUDA_SUCCESS;
+    }
+    if host_allocs().lock().unwrap().contains(&host_ptr) {
+        unsafe { *p_flags = 0 };
+        return CUDA_SUCCESS;
+    }
+    CUDA_ERROR_INVALID_VALUE
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemHostRegister(p: *mut u8, byte_size: usize, flags: u32) -> u32 {
+    let client = get_client();
+    if p.is_null() || byte_size == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let host_ptr = p as u64;
+    // Connected: tell the server
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = host_ptr.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(byte_size as u64).to_le_bytes());
+        payload.extend_from_slice(&flags.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemHostRegister, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: track in local map.
+    let mut map = registered_host().lock().unwrap();
+    if map.contains_key(&host_ptr) || host_allocs().lock().unwrap().contains(&host_ptr) {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    map.insert(host_ptr, (byte_size, flags));
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuMemHostUnregister(p: *mut u8) -> u32 {
+    let client = get_client();
+    if p.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let host_ptr = p as u64;
+    // Connected: tell the server
+    if client.connected.load(Ordering::Acquire) {
+        let payload = host_ptr.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::MemHostUnregister, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: remove from local map.
+    let mut map = registered_host().lock().unwrap();
+    if map.remove(&host_ptr).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // StreamWaitEvent
 // ---------------------------------------------------------------------------
 
@@ -5387,5 +5517,124 @@ mod tests {
         assert_eq!(ol_cuMemcpyAsync(dst, src, 512, 0), CUDA_SUCCESS);
         let _ = ol_cuMemFree_v2(src);
         let _ = ol_cuMemFree_v2(dst);
+    }
+
+    // -- MemHostGetDevicePointer tests --
+
+    #[test]
+    fn test_ol_cu_mem_host_get_device_pointer() {
+        let mut ptr: *mut u8 = ptr::null_mut();
+        assert_eq!(ol_cuMemAllocHost(&mut ptr, 256), CUDA_SUCCESS);
+        let mut dev_ptr: u64 = 0;
+        assert_eq!(ol_cuMemHostGetDevicePointer(&mut dev_ptr, ptr, 0), CUDA_SUCCESS);
+        assert_eq!(dev_ptr, ptr as u64);
+        let _ = ol_cuMemFreeHost(ptr);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_host_get_device_pointer_null_out() {
+        let fake = 0x1000 as *mut u8;
+        assert_eq!(ol_cuMemHostGetDevicePointer(ptr::null_mut(), fake, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_host_get_device_pointer_null_input() {
+        let mut dev_ptr: u64 = 0;
+        assert_eq!(ol_cuMemHostGetDevicePointer(&mut dev_ptr, ptr::null_mut(), 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_host_get_device_pointer_unknown() {
+        let mut dev_ptr: u64 = 0;
+        assert_eq!(ol_cuMemHostGetDevicePointer(&mut dev_ptr, 0xDEAD as *mut u8, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- MemHostGetFlags tests --
+
+    #[test]
+    fn test_ol_cu_mem_host_get_flags_alloc() {
+        let mut ptr: *mut u8 = ptr::null_mut();
+        assert_eq!(ol_cuMemAllocHost(&mut ptr, 128), CUDA_SUCCESS);
+        let mut flags: u32 = 0xFF;
+        assert_eq!(ol_cuMemHostGetFlags(&mut flags, ptr), CUDA_SUCCESS);
+        assert_eq!(flags, 0); // default for cuMemAllocHost
+        let _ = ol_cuMemFreeHost(ptr);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_host_get_flags_null_out() {
+        let fake = 0x1000 as *mut u8;
+        assert_eq!(ol_cuMemHostGetFlags(ptr::null_mut(), fake), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_host_get_flags_unknown() {
+        let mut flags: u32 = 0;
+        assert_eq!(ol_cuMemHostGetFlags(&mut flags, 0xDEAD as *mut u8), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- MemHostRegister / MemHostUnregister tests --
+
+    #[test]
+    fn test_ol_cu_mem_host_register_and_unregister() {
+        // Allocate real memory so the pointer is valid.
+        let layout = std::alloc::Layout::from_size_align(4096, 8).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+
+        assert_eq!(ol_cuMemHostRegister(ptr, 4096, 0), CUDA_SUCCESS);
+
+        // Should be visible to GetDevicePointer.
+        let mut dev_ptr: u64 = 0;
+        assert_eq!(ol_cuMemHostGetDevicePointer(&mut dev_ptr, ptr, 0), CUDA_SUCCESS);
+        assert_eq!(dev_ptr, ptr as u64);
+
+        // Should be visible to GetFlags (flags = 0).
+        let mut flags: u32 = 0xFF;
+        assert_eq!(ol_cuMemHostGetFlags(&mut flags, ptr), CUDA_SUCCESS);
+        assert_eq!(flags, 0);
+
+        assert_eq!(ol_cuMemHostUnregister(ptr), CUDA_SUCCESS);
+
+        // After unregister, should fail.
+        assert_eq!(ol_cuMemHostGetDevicePointer(&mut dev_ptr, ptr, 0), CUDA_ERROR_INVALID_VALUE);
+
+        unsafe { std::alloc::dealloc(ptr, layout) };
+    }
+
+    #[test]
+    fn test_ol_cu_mem_host_register_null() {
+        assert_eq!(ol_cuMemHostRegister(ptr::null_mut(), 4096, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_host_register_zero_size() {
+        let fake = 0x1000 as *mut u8;
+        assert_eq!(ol_cuMemHostRegister(fake, 0, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_host_unregister_null() {
+        assert_eq!(ol_cuMemHostUnregister(ptr::null_mut()), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_host_unregister_not_registered() {
+        assert_eq!(ol_cuMemHostUnregister(0xDEAD as *mut u8), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_mem_host_register_with_flags() {
+        let layout = std::alloc::Layout::from_size_align(1024, 8).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+
+        assert_eq!(ol_cuMemHostRegister(ptr, 1024, 0x03), CUDA_SUCCESS);
+        let mut flags: u32 = 0;
+        assert_eq!(ol_cuMemHostGetFlags(&mut flags, ptr), CUDA_SUCCESS);
+        assert_eq!(flags, 0x03);
+
+        assert_eq!(ol_cuMemHostUnregister(ptr), CUDA_SUCCESS);
+        unsafe { std::alloc::dealloc(ptr, layout) };
     }
 }
