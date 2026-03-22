@@ -182,6 +182,10 @@ pub trait GpuBackend: Send + Sync {
     /// Record an event on a stream.
     fn event_record(&self, event: u64, stream: u64) -> Result<(), CuResult>;
 
+    /// Record an event on a stream with flags.
+    /// Delegates to event_record (flags are driver-internal).
+    fn event_record_with_flags(&self, event: u64, stream: u64, flags: u32) -> Result<(), CuResult>;
+
     /// Block until an event has been recorded (completed).
     fn event_synchronize(&self, event: u64) -> Result<(), CuResult>;
 
@@ -269,6 +273,26 @@ pub trait GpuBackend: Send + Sync {
         stream: u64,
         params: &[u8],
     ) -> Result<(), CuResult>;
+
+    /// Launch a cooperative kernel. Same as launch_kernel -- the cooperative
+    /// flag is transparent to our proxy layer.
+    fn launch_cooperative_kernel(
+        &self,
+        func: u64,
+        grid_dim: [u32; 3],
+        block_dim: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        params: &[u8],
+    ) -> Result<(), CuResult>;
+
+    // --- Device PCI ID ---
+
+    /// Get a synthetic PCI bus ID string for a device.
+    fn device_get_pci_bus_id(&self, device: i32) -> Result<String, CuResult>;
+
+    /// Get the device ordinal from a PCI bus ID string.
+    fn device_get_by_pci_bus_id(&self, pci_bus_id: &str) -> Result<i32, CuResult>;
 
     // --- Peer access ---
 
@@ -1013,6 +1037,11 @@ impl GpuBackend for StubGpuBackend {
         }
     }
 
+    fn event_record_with_flags(&self, event: u64, stream: u64, _flags: u32) -> Result<(), CuResult> {
+        // Flags are driver-internal; delegate to event_record.
+        self.event_record(event, stream)
+    }
+
     fn event_synchronize(&self, event: u64) -> Result<(), CuResult> {
         let state = self.state.lock().unwrap();
         if !state.events.contains_key(&event) {
@@ -1312,6 +1341,40 @@ impl GpuBackend for StubGpuBackend {
         }
         tracing::trace!(func, stream, "stub: launch_kernel (no-op)");
         Ok(())
+    }
+
+    fn launch_cooperative_kernel(
+        &self,
+        func: u64,
+        grid_dim: [u32; 3],
+        block_dim: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        params: &[u8],
+    ) -> Result<(), CuResult> {
+        // Cooperative launches are transparent to the proxy layer.
+        self.launch_kernel(func, grid_dim, block_dim, shared_mem, stream, params)
+    }
+
+    fn device_get_pci_bus_id(&self, device: i32) -> Result<String, CuResult> {
+        Self::check_device(device)?;
+        // Synthetic PCI bus ID: bus number = device + 1.
+        Ok(format!("0000:{:02x}:00.0", device + 1))
+    }
+
+    fn device_get_by_pci_bus_id(&self, pci_bus_id: &str) -> Result<i32, CuResult> {
+        // Parse the bus number from a PCI bus ID like "0000:01:00.0".
+        let parts: Vec<&str> = pci_bus_id.split(':').collect();
+        if parts.len() != 3 {
+            return Err(CuResult::InvalidValue);
+        }
+        let bus = u8::from_str_radix(parts[1], 16).map_err(|_| CuResult::InvalidValue)?;
+        if bus == 0 {
+            return Err(CuResult::InvalidValue);
+        }
+        let device = (bus as i32) - 1;
+        Self::check_device(device)?;
+        Ok(device)
     }
 
     // --- Peer access ---
@@ -3393,5 +3456,108 @@ mod tests {
         let module = gpu.module_load_data(b"ptx").unwrap();
         let func = gpu.module_get_function(module, "my_kernel").unwrap();
         assert_eq!(gpu.func_set_shared_mem_config(func, 0x03), Err(CuResult::InvalidValue));
+    }
+
+    // --- EventRecordWithFlags tests ---
+
+    #[test]
+    fn test_event_record_with_flags() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        // Record with flags=0 on default stream
+        gpu.event_record_with_flags(event, 0, 0).unwrap();
+    }
+
+    #[test]
+    fn test_event_record_with_flags_nonzero() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        // Non-zero flags should still succeed (ignored in stub)
+        gpu.event_record_with_flags(event, 0, 0x01).unwrap();
+    }
+
+    #[test]
+    fn test_event_record_with_flags_invalid_event() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.event_record_with_flags(0xDEAD, 0, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_event_record_with_flags_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        assert_eq!(gpu.event_record_with_flags(event, 0xDEAD, 0), Err(CuResult::InvalidValue));
+    }
+
+    // --- LaunchCooperativeKernel tests ---
+
+    #[test]
+    fn test_launch_cooperative_kernel() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "kern").unwrap();
+        gpu.launch_cooperative_kernel(func, [1, 1, 1], [32, 1, 1], 0, 0, &[]).unwrap();
+    }
+
+    #[test]
+    fn test_launch_cooperative_kernel_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.launch_cooperative_kernel(0xDEAD, [1, 1, 1], [32, 1, 1], 0, 0, &[]),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_launch_cooperative_kernel_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "kern").unwrap();
+        assert_eq!(
+            gpu.launch_cooperative_kernel(func, [1, 1, 1], [32, 1, 1], 0, 0xDEAD, &[]),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    // --- DeviceGetPCIBusId tests ---
+
+    #[test]
+    fn test_device_get_pci_bus_id() {
+        let gpu = StubGpuBackend::new();
+        let id = gpu.device_get_pci_bus_id(0).unwrap();
+        assert_eq!(id, "0000:01:00.0");
+    }
+
+    #[test]
+    fn test_device_get_pci_bus_id_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_get_pci_bus_id(1), Err(CuResult::InvalidDevice));
+    }
+
+    // --- DeviceGetByPCIBusId tests ---
+
+    #[test]
+    fn test_device_get_by_pci_bus_id() {
+        let gpu = StubGpuBackend::new();
+        let dev = gpu.device_get_by_pci_bus_id("0000:01:00.0").unwrap();
+        assert_eq!(dev, 0);
+    }
+
+    #[test]
+    fn test_device_get_by_pci_bus_id_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_get_by_pci_bus_id("0000:02:00.0"), Err(CuResult::InvalidDevice));
+    }
+
+    #[test]
+    fn test_device_get_by_pci_bus_id_bad_format() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_get_by_pci_bus_id("invalid"), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_device_get_by_pci_bus_id_zero_bus() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_get_by_pci_bus_id("0000:00:00.0"), Err(CuResult::InvalidValue));
     }
 }

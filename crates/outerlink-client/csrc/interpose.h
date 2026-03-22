@@ -135,6 +135,7 @@ extern CUresult ol_cuStreamWaitEvent(unsigned long long stream, unsigned long lo
 extern CUresult ol_cuEventCreate(unsigned long long *event, unsigned int flags);
 extern CUresult ol_cuEventDestroy(unsigned long long event);
 extern CUresult ol_cuEventRecord(unsigned long long event, unsigned long long stream);
+extern CUresult ol_cuEventRecordWithFlags(unsigned long long event, unsigned long long stream, unsigned int flags);
 extern CUresult ol_cuEventSynchronize(unsigned long long event);
 extern CUresult ol_cuEventElapsedTime(float *ms, unsigned long long start, unsigned long long end);
 extern CUresult ol_cuEventQuery(unsigned long long event);
@@ -151,6 +152,16 @@ extern CUresult ol_cuEventQuery(unsigned long long event);
  *      via dlsym) to introspect per-parameter sizes. Results are cached
  *      per CUfunction. Falls back to NULL if unavailable (old drivers).
  */
+extern CUresult ol_cuLaunchCooperativeKernel(unsigned long long func,
+                                   unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                                   unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+                                   unsigned int sharedMemBytes, unsigned long long hStream,
+                                   const unsigned char *const *kernelParams,
+                                   unsigned int numParams,
+                                   const unsigned int *paramSizes);
+extern CUresult ol_cuDeviceGetPCIBusId(unsigned char *pciBusId, int len, int dev);
+extern CUresult ol_cuDeviceGetByPCIBusId(int *dev, const unsigned char *pciBusId);
+
 extern CUresult ol_cuLaunchKernel(unsigned long long func,
                                    unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                                    unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
@@ -275,9 +286,14 @@ CUresult hook_cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int F
 CUresult hook_cuEventCreate(CUevent *phEvent, unsigned int Flags);
 CUresult hook_cuEventDestroy(CUevent hEvent);
 CUresult hook_cuEventRecord(CUevent hEvent, CUstream hStream);
+CUresult hook_cuEventRecordWithFlags(CUevent hEvent, CUstream hStream, unsigned int flags);
 CUresult hook_cuEventSynchronize(CUevent hEvent);
 CUresult hook_cuEventElapsedTime(float *pMilliseconds, CUevent hStart, CUevent hEnd);
 CUresult hook_cuEventQuery(CUevent hEvent);
+
+/* Device PCI ID */
+CUresult hook_cuDeviceGetPCIBusId(char *pciBusId, int len, CUdevice dev);
+CUresult hook_cuDeviceGetByPCIBusId(CUdevice *dev, const char *pciBusId);
 
 /* Kernel launch */
 CUresult hook_cuLaunchKernel(CUfunction f,
@@ -285,6 +301,11 @@ CUresult hook_cuLaunchKernel(CUfunction f,
                               unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
                               unsigned int sharedMemBytes, CUstream hStream,
                               void **kernelParams, void **extra);
+CUresult hook_cuLaunchCooperativeKernel(CUfunction f,
+                              unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                              unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+                              unsigned int sharedMemBytes, CUstream hStream,
+                              void **kernelParams);
 
 /* cuGetProcAddress hooks */
 CUresult hook_cuGetProcAddress(const char *symbol, void **pfn,

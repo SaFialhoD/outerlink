@@ -211,12 +211,18 @@ static const hook_entry_t hook_table[] = {
     { "cuEventDestroy",          (void *)hook_cuEventDestroy },
     { "cuEventDestroy_v2",       (void *)hook_cuEventDestroy },
     { "cuEventRecord",           (void *)hook_cuEventRecord },
+    { "cuEventRecordWithFlags",  (void *)hook_cuEventRecordWithFlags },
     { "cuEventSynchronize",      (void *)hook_cuEventSynchronize },
     { "cuEventElapsedTime",      (void *)hook_cuEventElapsedTime },
     { "cuEventQuery",            (void *)hook_cuEventQuery },
 
+    /* Device PCI ID */
+    { "cuDeviceGetPCIBusId",     (void *)hook_cuDeviceGetPCIBusId },
+    { "cuDeviceGetByPCIBusId",   (void *)hook_cuDeviceGetByPCIBusId },
+
     /* Kernel launch */
     { "cuLaunchKernel",          (void *)hook_cuLaunchKernel },
+    { "cuLaunchCooperativeKernel", (void *)hook_cuLaunchCooperativeKernel },
 
     /* cuGetProcAddress itself -- we hook the hooking mechanism */
     { "cuGetProcAddress",        (void *)hook_cuGetProcAddress },
@@ -938,6 +944,13 @@ CUresult hook_cuEventRecord(CUevent hEvent, CUstream hStream) {
                             (unsigned long long)(uintptr_t)hStream);
 }
 
+CUresult hook_cuEventRecordWithFlags(CUevent hEvent, CUstream hStream, unsigned int flags) {
+    ensure_init();
+    return ol_cuEventRecordWithFlags((unsigned long long)(uintptr_t)hEvent,
+                                      (unsigned long long)(uintptr_t)hStream,
+                                      flags);
+}
+
 CUresult hook_cuEventSynchronize(CUevent hEvent) {
     ensure_init();
     return ol_cuEventSynchronize((unsigned long long)(uintptr_t)hEvent);
@@ -1174,6 +1187,57 @@ CUresult hook_cuLaunchKernel(CUfunction f,
         sharedMemBytes,
         (unsigned long long)(uintptr_t)hStream,
         NULL, 0, NULL);
+}
+
+/* ---- hook_cuLaunchCooperativeKernel ---- */
+
+CUresult hook_cuLaunchCooperativeKernel(CUfunction f,
+                              unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                              unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+                              unsigned int sharedMemBytes, CUstream hStream,
+                              void **kernelParams) {
+    ensure_init();
+
+    /*
+     * cuLaunchCooperativeKernel uses kernelParams only (no extra).
+     * We use the same param introspection as cuLaunchKernel.
+     */
+    if (kernelParams != NULL) {
+        const param_cache_entry_t *info = get_func_param_info(f);
+        if (info != NULL && info->num_params > 0) {
+            return ol_cuLaunchCooperativeKernel(
+                (unsigned long long)(uintptr_t)f,
+                gridDimX, gridDimY, gridDimZ,
+                blockDimX, blockDimY, blockDimZ,
+                sharedMemBytes,
+                (unsigned long long)(uintptr_t)hStream,
+                (const unsigned char *const *)kernelParams,
+                info->num_params,
+                info->param_sizes);
+        }
+    }
+
+    return ol_cuLaunchCooperativeKernel(
+        (unsigned long long)(uintptr_t)f,
+        gridDimX, gridDimY, gridDimZ,
+        blockDimX, blockDimY, blockDimZ,
+        sharedMemBytes,
+        (unsigned long long)(uintptr_t)hStream,
+        NULL, 0, NULL);
+}
+
+/* ---- hook_cuDeviceGetPCIBusId ---- */
+
+CUresult hook_cuDeviceGetPCIBusId(char *pciBusId, int len, CUdevice dev) {
+    ensure_init();
+    return ol_cuDeviceGetPCIBusId((unsigned char *)pciBusId, len, (int)dev);
+}
+
+/* ---- hook_cuDeviceGetByPCIBusId ---- */
+
+CUresult hook_cuDeviceGetByPCIBusId(CUdevice *dev, const char *pciBusId) {
+    ensure_init();
+    return ol_cuDeviceGetByPCIBusId((int *)dev, (const unsigned char *)pciBusId);
 }
 
 /* -----------------------------------------------------------------------

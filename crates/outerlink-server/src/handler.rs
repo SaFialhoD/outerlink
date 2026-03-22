@@ -769,6 +769,20 @@ pub fn handle_request(
             }
         }
 
+        MessageType::EventRecordWithFlags => {
+            // Payload: [8B event][8B stream][4B flags] = 20 bytes
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let event = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let stream = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            let flags = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+            match backend.event_record_with_flags(event, stream, flags) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         MessageType::EventSynchronize => {
             if payload.len() < 8 {
                 return error_response(rid, CuResult::InvalidValue);
@@ -822,6 +836,34 @@ pub fn handle_request(
             let stream = u64::from_le_bytes(payload[36..44].try_into().unwrap());
             let params = &payload[44..];
             match backend.launch_kernel(
+                func,
+                [grid_x, grid_y, grid_z],
+                [block_x, block_y, block_z],
+                shared_mem,
+                stream,
+                params,
+            ) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::LaunchCooperativeKernel => {
+            // Same wire format as LaunchKernel (44B header + params).
+            if payload.len() < 44 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let func = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let grid_x = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let grid_y = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+            let grid_z = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+            let block_x = u32::from_le_bytes(payload[20..24].try_into().unwrap());
+            let block_y = u32::from_le_bytes(payload[24..28].try_into().unwrap());
+            let block_z = u32::from_le_bytes(payload[28..32].try_into().unwrap());
+            let shared_mem = u32::from_le_bytes(payload[32..36].try_into().unwrap());
+            let stream = u64::from_le_bytes(payload[36..44].try_into().unwrap());
+            let params = &payload[44..];
+            match backend.launch_cooperative_kernel(
                 func,
                 [grid_x, grid_y, grid_z],
                 [block_x, block_y, block_z],
@@ -1103,6 +1145,47 @@ pub fn handle_request(
                     data.extend_from_slice(&block_sz.to_le_bytes());
                     success_with(rid, &data)
                 }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        // --- Device PCI ID ---
+
+        MessageType::DeviceGetPCIBusId => {
+            // Payload: [4B len (i32)][4B dev (i32)] = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let len = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            let dev = i32::from_le_bytes(payload[4..8].try_into().unwrap());
+            if len < 13 {
+                // CUDA requires at least 13 chars for a PCI bus ID
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            match backend.device_get_pci_bus_id(dev) {
+                Ok(bus_id) => {
+                    let mut data = Vec::new();
+                    data.extend_from_slice(bus_id.as_bytes());
+                    data.push(0); // NUL terminator
+                    success_with(rid, &data)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::DeviceGetByPCIBusId => {
+            // Payload: NUL-terminated string bytes
+            if payload.is_empty() {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            // Find NUL terminator or use entire payload
+            let nul_pos = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+            let bus_id = match std::str::from_utf8(&payload[..nul_pos]) {
+                Ok(s) => s,
+                Err(_) => return error_response(rid, CuResult::InvalidValue),
+            };
+            match backend.device_get_by_pci_bus_id(bus_id) {
+                Ok(dev) => success_with(rid, &dev.to_le_bytes()),
                 Err(e) => error_response(rid, e),
             }
         }
@@ -4451,6 +4534,136 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let hdr = req(MessageType::FuncSetSharedMemConfig, 8);
         let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- EventRecordWithFlags handler tests ---
+
+    #[test]
+    fn test_handler_event_record_with_flags() {
+        let gpu = StubGpuBackend::new();
+        let event = gpu.event_create(0).unwrap();
+        let mut payload = event.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u64.to_le_bytes()); // stream=0
+        payload.extend_from_slice(&0u32.to_le_bytes()); // flags=0
+        let hdr = req(MessageType::EventRecordWithFlags, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_handler_event_record_with_flags_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::EventRecordWithFlags, 16);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 16]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_handler_event_record_with_flags_invalid_event() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 0xBADu64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::EventRecordWithFlags, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- LaunchCooperativeKernel handler tests ---
+
+    #[test]
+    fn test_handler_launch_cooperative_kernel() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "kern").unwrap();
+        // 44B minimum: [8B func][12B grid][12B block][4B shared][8B stream]
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // grid_x
+        payload.extend_from_slice(&1u32.to_le_bytes()); // grid_y
+        payload.extend_from_slice(&1u32.to_le_bytes()); // grid_z
+        payload.extend_from_slice(&32u32.to_le_bytes()); // block_x
+        payload.extend_from_slice(&1u32.to_le_bytes());  // block_y
+        payload.extend_from_slice(&1u32.to_le_bytes());  // block_z
+        payload.extend_from_slice(&0u32.to_le_bytes());  // shared_mem
+        payload.extend_from_slice(&0u64.to_le_bytes());  // stream
+        let hdr = req(MessageType::LaunchCooperativeKernel, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_handler_launch_cooperative_kernel_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::LaunchCooperativeKernel, 40);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 40]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- DeviceGetPCIBusId handler tests ---
+
+    #[test]
+    fn test_handler_device_get_pci_bus_id() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 13i32.to_le_bytes().to_vec(); // len=13
+        payload.extend_from_slice(&0i32.to_le_bytes());  // dev=0
+        let hdr = req(MessageType::DeviceGetPCIBusId, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        // Data after 4B result: NUL-terminated PCI bus ID
+        let data = &resp[4..];
+        let nul_pos = data.iter().position(|&b| b == 0).unwrap();
+        let bus_id = std::str::from_utf8(&data[..nul_pos]).unwrap();
+        assert_eq!(bus_id, "0000:01:00.0");
+    }
+
+    #[test]
+    fn test_handler_device_get_pci_bus_id_short_len() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 10i32.to_le_bytes().to_vec(); // len < 13
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::DeviceGetPCIBusId, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_handler_device_get_pci_bus_id_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 32i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&5i32.to_le_bytes()); // dev=5, invalid
+        let hdr = req(MessageType::DeviceGetPCIBusId, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidDevice);
+    }
+
+    // --- DeviceGetByPCIBusId handler tests ---
+
+    #[test]
+    fn test_handler_device_get_by_pci_bus_id() {
+        let gpu = StubGpuBackend::new();
+        let payload = b"0000:01:00.0\0";
+        let hdr = req(MessageType::DeviceGetByPCIBusId, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let dev = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(dev, 0);
+    }
+
+    #[test]
+    fn test_handler_device_get_by_pci_bus_id_invalid() {
+        let gpu = StubGpuBackend::new();
+        let payload = b"0000:02:00.0\0"; // bus 02 -> device 1, invalid for stub
+        let hdr = req(MessageType::DeviceGetByPCIBusId, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidDevice);
+    }
+
+    #[test]
+    fn test_handler_device_get_by_pci_bus_id_empty() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::DeviceGetByPCIBusId, 0);
+        let (_, resp) = dispatch(&gpu, &hdr, &[]);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }

@@ -2288,6 +2288,48 @@ pub extern "C" fn ol_cuEventRecord(event: u64, stream: u64) -> u32 {
     CUDA_SUCCESS
 }
 
+// ---------------------------------------------------------------------------
+// cuEventRecordWithFlags
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuEventRecordWithFlags(event: u64, stream: u64, flags: u32) -> u32 {
+    let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_event = match client.handles.events.to_remote(event) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        // Payload: [8B remote_event][8B remote_stream][4B flags]
+        let mut payload = [0u8; 20];
+        payload[0..8].copy_from_slice(&remote_event.to_le_bytes());
+        payload[8..16].copy_from_slice(&remote_stream.to_le_bytes());
+        payload[16..20].copy_from_slice(&flags.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::EventRecordWithFlags, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate event handle
+    if client.handles.events.to_remote(event).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Validate stream handle (0 = default stream, always valid)
+    if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
 #[no_mangle]
 pub extern "C" fn ol_cuEventSynchronize(event: u64) -> u32 {
     let client = get_client();
@@ -2731,6 +2773,189 @@ pub extern "C" fn ol_cuLaunchKernel(
         return CUDA_ERROR_INVALID_VALUE;
     }
     // Stub: accept the launch without executing
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// cuLaunchCooperativeKernel
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuLaunchCooperativeKernel(
+    func: u64,
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
+    shared_mem: u32,
+    stream: u64,
+    kernel_params: *const *const u8,
+    num_params: u32,
+    param_sizes: *const u32,
+) -> u32 {
+    let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let remote_stream = if stream == 0 {
+            0u64
+        } else {
+            match client.handles.streams.to_remote(stream) {
+                Some(r) => r,
+                None => return CUDA_ERROR_INVALID_VALUE,
+            }
+        };
+        // Same payload format as LaunchKernel
+        let mut payload = Vec::with_capacity(44 + 4);
+        payload.extend_from_slice(&remote_func.to_le_bytes());
+        payload.extend_from_slice(&grid_x.to_le_bytes());
+        payload.extend_from_slice(&grid_y.to_le_bytes());
+        payload.extend_from_slice(&grid_z.to_le_bytes());
+        payload.extend_from_slice(&block_x.to_le_bytes());
+        payload.extend_from_slice(&block_y.to_le_bytes());
+        payload.extend_from_slice(&block_z.to_le_bytes());
+        payload.extend_from_slice(&shared_mem.to_le_bytes());
+        payload.extend_from_slice(&remote_stream.to_le_bytes());
+
+        // Serialize kernel parameters (same logic as cuLaunchKernel).
+        const MAX_KERNEL_PARAMS: u32 = 1024;
+        let n = num_params;
+        if n > MAX_KERNEL_PARAMS {
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+        payload.extend_from_slice(&n.to_le_bytes());
+        if n > 0 && !kernel_params.is_null() && !param_sizes.is_null() {
+            for i in 0..n as usize {
+                unsafe {
+                    let size = *param_sizes.add(i);
+                    let ptr = *kernel_params.add(i);
+                    if size > 0 && ptr.is_null() {
+                        return CUDA_ERROR_INVALID_VALUE;
+                    }
+                    payload.extend_from_slice(&size.to_le_bytes());
+                    if size > 0 {
+                        let bytes = std::slice::from_raw_parts(ptr, size as usize);
+                        payload.extend_from_slice(bytes);
+                    }
+                }
+            }
+        }
+
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::LaunchCooperativeKernel, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate function handle
+    if client.handles.functions.to_remote(func).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Validate stream handle (0 = default stream, always valid)
+    if stream != 0 && client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Stub: accept the cooperative launch without executing
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// cuDeviceGetPCIBusId
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuDeviceGetPCIBusId(pci_bus_id: *mut u8, len: i32, dev: i32) -> u32 {
+    if pci_bus_id.is_null() || len < 13 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        // Payload: [4B len (i32 LE)][4B dev (i32 LE)]
+        let mut payload = [0u8; 8];
+        payload[0..4].copy_from_slice(&len.to_le_bytes());
+        payload[4..8].copy_from_slice(&dev.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DeviceGetPCIBusId, &payload) {
+            let result = parse_result(&resp);
+            if result == CUDA_SUCCESS && resp.len() > 4 {
+                let data = &resp[4..];
+                let copy_len = data.len().min(len as usize);
+                unsafe {
+                    ptr::copy_nonoverlapping(data.as_ptr(), pci_bus_id, copy_len);
+                }
+            }
+            return result;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: generate synthetic PCI bus ID
+    if dev < 0 || dev >= 1 {
+        return CUDA_ERROR_INVALID_DEVICE;
+    }
+    let bus_id = format!("0000:{:02x}:00.0\0", dev + 1);
+    let bytes = bus_id.as_bytes();
+    if (len as usize) < bytes.len() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), pci_bus_id, bytes.len());
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// cuDeviceGetByPCIBusId
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuDeviceGetByPCIBusId(dev: *mut i32, pci_bus_id: *const u8) -> u32 {
+    if dev.is_null() || pci_bus_id.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        // Payload: NUL-terminated string
+        let c_str = unsafe { std::ffi::CStr::from_ptr(pci_bus_id as *const i8) };
+        let mut payload = c_str.to_bytes().to_vec();
+        payload.push(0); // NUL terminator
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::DeviceGetByPCIBusId, &payload) {
+            let result = parse_result(&resp);
+            if result == CUDA_SUCCESS && resp.len() >= 8 {
+                let device = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                unsafe { *dev = device; }
+            }
+            return result;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: parse the PCI bus ID
+    let c_str = unsafe { std::ffi::CStr::from_ptr(pci_bus_id as *const i8) };
+    let bus_id_str = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return CUDA_ERROR_INVALID_VALUE,
+    };
+    let parts: Vec<&str> = bus_id_str.split(':').collect();
+    if parts.len() != 3 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let bus = match u8::from_str_radix(parts[1], 16) {
+        Ok(b) => b,
+        Err(_) => return CUDA_ERROR_INVALID_VALUE,
+    };
+    if bus == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let device = (bus as i32) - 1;
+    // Stub only has 1 device (device 0)
+    if device < 0 || device >= 1 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *dev = device; }
     CUDA_SUCCESS
 }
 
@@ -5907,5 +6132,121 @@ mod tests {
         let result = ol_cuFuncSetSharedMemConfig(func, 0x03);
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
         let _ = ol_cuModuleUnload(module);
+    }
+
+    // --- cuEventRecordWithFlags tests ---
+
+    #[test]
+    fn test_ol_cu_event_record_with_flags() {
+        let mut event: u64 = 0;
+        assert_eq!(ol_cuEventCreate(&mut event, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuEventRecordWithFlags(event, 0, 0), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_event_record_with_flags_nonzero() {
+        let mut event: u64 = 0;
+        assert_eq!(ol_cuEventCreate(&mut event, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuEventRecordWithFlags(event, 0, 0x01), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_event_record_with_flags_invalid_event() {
+        assert_eq!(ol_cuEventRecordWithFlags(0xDEAD, 0, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_event_record_with_flags_with_stream() {
+        let mut event: u64 = 0;
+        assert_eq!(ol_cuEventCreate(&mut event, 0), CUDA_SUCCESS);
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuEventRecordWithFlags(event, stream, 0), CUDA_SUCCESS);
+    }
+
+    // --- cuLaunchCooperativeKernel tests ---
+
+    #[test]
+    fn test_ol_cu_launch_cooperative_kernel() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"kern\0";
+        assert_eq!(ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8), CUDA_SUCCESS);
+
+        let result = ol_cuLaunchCooperativeKernel(
+            func, 1, 1, 1, 32, 1, 1, 0, 0,
+            std::ptr::null(), 0, std::ptr::null(),
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_ol_cu_launch_cooperative_kernel_invalid_func() {
+        let result = ol_cuLaunchCooperativeKernel(
+            0xDEAD, 1, 1, 1, 32, 1, 1, 0, 0,
+            std::ptr::null(), 0, std::ptr::null(),
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // --- cuDeviceGetPCIBusId tests ---
+
+    #[test]
+    fn test_ol_cu_device_get_pci_bus_id() {
+        let mut buf = [0u8; 32];
+        let result = ol_cuDeviceGetPCIBusId(buf.as_mut_ptr(), 32, 0);
+        assert_eq!(result, CUDA_SUCCESS);
+        let nul_pos = buf.iter().position(|&b| b == 0).unwrap();
+        let id = std::str::from_utf8(&buf[..nul_pos]).unwrap();
+        assert_eq!(id, "0000:01:00.0");
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_pci_bus_id_short_buffer() {
+        let mut buf = [0u8; 10];
+        let result = ol_cuDeviceGetPCIBusId(buf.as_mut_ptr(), 10, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_pci_bus_id_null() {
+        let result = ol_cuDeviceGetPCIBusId(std::ptr::null_mut(), 32, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_pci_bus_id_invalid_device() {
+        let mut buf = [0u8; 32];
+        let result = ol_cuDeviceGetPCIBusId(buf.as_mut_ptr(), 32, 5);
+        assert_eq!(result, CUDA_ERROR_INVALID_DEVICE);
+    }
+
+    // --- cuDeviceGetByPCIBusId tests ---
+
+    #[test]
+    fn test_ol_cu_device_get_by_pci_bus_id() {
+        let mut dev: i32 = -1;
+        let bus_id = b"0000:01:00.0\0";
+        let result = ol_cuDeviceGetByPCIBusId(&mut dev, bus_id.as_ptr());
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(dev, 0);
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_by_pci_bus_id_invalid() {
+        let mut dev: i32 = -1;
+        let bus_id = b"0000:02:00.0\0"; // bus 02 -> device 1, invalid for stub
+        let result = ol_cuDeviceGetByPCIBusId(&mut dev, bus_id.as_ptr());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_device_get_by_pci_bus_id_null() {
+        let mut dev: i32 = -1;
+        let result = ol_cuDeviceGetByPCIBusId(&mut dev, std::ptr::null());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
     }
 }
