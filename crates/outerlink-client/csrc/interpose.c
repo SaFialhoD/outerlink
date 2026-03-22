@@ -162,6 +162,10 @@ static const hook_entry_t hook_table[] = {
     { "cuModuleGetGlobal_v2",    (void *)hook_cuModuleGetGlobal },
     { "cuFuncGetAttribute",      (void *)hook_cuFuncGetAttribute },
 
+    /* Pointer attributes */
+    { "cuPointerGetAttribute",   (void *)hook_cuPointerGetAttribute },
+    { "cuPointerGetAttributes",  (void *)hook_cuPointerGetAttributes },
+
     /* Occupancy */
     { "cuOccupancyMaxActiveBlocksPerMultiprocessor", (void *)hook_cuOccupancyMaxActiveBlocksPerMultiprocessor },
     { "cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags", (void *)hook_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags },
@@ -676,6 +680,18 @@ CUresult hook_cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod,
 CUresult hook_cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc) {
     ensure_init();
     return ol_cuFuncGetAttribute(pi, (int)attrib, (unsigned long long)(uintptr_t)hfunc);
+}
+
+/* -- Pointer attributes -- */
+
+CUresult hook_cuPointerGetAttribute(void *data, CUpointer_attribute attribute, CUdeviceptr devPtr) {
+    ensure_init();
+    return ol_cuPointerGetAttribute((unsigned char *)data, (int)attribute, (unsigned long long)devPtr);
+}
+
+CUresult hook_cuPointerGetAttributes(unsigned int numAttributes, CUpointer_attribute *attributes, void **data, CUdeviceptr ptr) {
+    ensure_init();
+    return ol_cuPointerGetAttributes(numAttributes, (const int *)attributes, (unsigned char **)data, (unsigned long long)ptr);
 }
 
 /* -- Occupancy -- */

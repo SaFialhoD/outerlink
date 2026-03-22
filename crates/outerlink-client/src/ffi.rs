@@ -1676,6 +1676,178 @@ pub extern "C" fn ol_cuOccupancyMaxPotentialBlockSizeWithFlags(
 }
 
 // ---------------------------------------------------------------------------
+// Pointer attribute queries
+// ---------------------------------------------------------------------------
+
+/// Query a single attribute of a pointer.
+///
+/// The `data` output is a `void*` that may point to different-sized types
+/// depending on the attribute. For simplicity, we always transfer the value
+/// as u64 over the wire and write the appropriate size based on attribute:
+///   - MEMORY_TYPE (2): unsigned int (4 bytes)
+///   - CONTEXT (1): CUcontext (8 bytes, pointer-sized)
+///   - DEVICE_POINTER (3): CUdeviceptr (8 bytes)
+///   - HOST_POINTER (4): void* (8 bytes)
+///   - IS_MANAGED (6): unsigned int (4 bytes)
+///   - DEVICE_ORDINAL (8): int (4 bytes)
+#[no_mangle]
+pub extern "C" fn ol_cuPointerGetAttribute(data: *mut u8, attribute: i32, dev_ptr: u64) -> u32 {
+    let client = get_client();
+    if data.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_ptr = match client.handles.device_ptrs.to_remote(dev_ptr) {
+            Some(r) => r,
+            None => {
+                // Check host allocations -- host pointers are not in the handle map
+                if !host_allocs().lock().unwrap().contains(&dev_ptr) {
+                    return CUDA_ERROR_INVALID_VALUE;
+                }
+                dev_ptr // host pointers are passed as-is
+            }
+        };
+        let mut payload = [0u8; 12];
+        payload[0..4].copy_from_slice(&attribute.to_le_bytes());
+        payload[4..12].copy_from_slice(&remote_ptr.to_le_bytes());
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::PointerGetAttribute, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let val = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                write_pointer_attribute(data, attribute, val);
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback
+    let is_device = client.handles.device_ptrs.to_remote(dev_ptr).is_some();
+    let is_host = host_allocs().lock().unwrap().contains(&dev_ptr);
+    if !is_device && !is_host {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let val: u64 = match attribute {
+        1 => 0,                                      // CONTEXT
+        2 => if is_device { 2 } else { 1 },          // MEMORY_TYPE
+        3 => if is_device { dev_ptr } else { 0 },    // DEVICE_POINTER
+        4 => if is_host { dev_ptr } else { 0 },      // HOST_POINTER
+        6 => 0,                                       // IS_MANAGED
+        8 => 0,                                       // DEVICE_ORDINAL
+        _ => return CUDA_ERROR_INVALID_VALUE,
+    };
+    write_pointer_attribute(data, attribute, val);
+    CUDA_SUCCESS
+}
+
+/// Write a pointer attribute value to the caller's `data` buffer.
+///
+/// The size written depends on the attribute type:
+/// - 4 bytes for MEMORY_TYPE(2), IS_MANAGED(6), DEVICE_ORDINAL(8)
+/// - 8 bytes for CONTEXT(1), DEVICE_POINTER(3), HOST_POINTER(4)
+fn write_pointer_attribute(data: *mut u8, attribute: i32, val: u64) {
+    match attribute {
+        // 4-byte attributes
+        2 | 6 | 8 => unsafe {
+            std::ptr::copy_nonoverlapping(
+                (val as u32).to_ne_bytes().as_ptr(),
+                data,
+                4,
+            );
+        },
+        // 8-byte attributes (pointer-sized)
+        1 | 3 | 4 => unsafe {
+            std::ptr::copy_nonoverlapping(
+                val.to_ne_bytes().as_ptr(),
+                data,
+                8,
+            );
+        },
+        // Unknown: write as u64
+        _ => unsafe {
+            std::ptr::copy_nonoverlapping(
+                val.to_ne_bytes().as_ptr(),
+                data,
+                8,
+            );
+        },
+    }
+}
+
+/// Query multiple pointer attributes in one call.
+#[no_mangle]
+pub extern "C" fn ol_cuPointerGetAttributes(
+    num_attributes: u32,
+    attributes: *const i32,
+    data: *mut *mut u8,
+    ptr: u64,
+) -> u32 {
+    let client = get_client();
+    if attributes.is_null() || data.is_null() || num_attributes == 0 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let n = num_attributes as usize;
+    // Read the attribute array
+    let attrs: Vec<i32> = unsafe {
+        std::slice::from_raw_parts(attributes, n).to_vec()
+    };
+
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_ptr = match client.handles.device_ptrs.to_remote(ptr) {
+            Some(r) => r,
+            None => {
+                if !host_allocs().lock().unwrap().contains(&ptr) {
+                    return CUDA_ERROR_INVALID_VALUE;
+                }
+                ptr
+            }
+        };
+        // [4B numAttrs][8B ptr][N*4B attributes]
+        let mut payload = Vec::with_capacity(12 + n * 4);
+        payload.extend_from_slice(&num_attributes.to_le_bytes());
+        payload.extend_from_slice(&remote_ptr.to_le_bytes());
+        for &a in &attrs {
+            payload.extend_from_slice(&a.to_le_bytes());
+        }
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::PointerGetAttributes, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 4 + n * 8 {
+                for i in 0..n {
+                    let off = 4 + i * 8;
+                    let val = u64::from_le_bytes(resp[off..off + 8].try_into().unwrap());
+                    let data_i = unsafe { *data.add(i) };
+                    if !data_i.is_null() {
+                        write_pointer_attribute(data_i, attrs[i], val);
+                    }
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback: call single-attribute for each
+    for i in 0..n {
+        let data_i = unsafe { *data.add(i) };
+        if !data_i.is_null() {
+            let result = ol_cuPointerGetAttribute(data_i, attrs[i], ptr);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+        }
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // Stream management
 // ---------------------------------------------------------------------------
 
@@ -4404,5 +4576,206 @@ mod tests {
     fn test_ol_cu_ctx_disable_peer_access_invalid_context() {
         let result = ol_cuCtxDisablePeerAccess(0xDEAD_BEEF);
         assert_eq!(result, CUDA_ERROR_INVALID_CONTEXT);
+    }
+
+    // --- Pointer attribute tests ---
+
+    #[test]
+    fn test_ol_cu_pointer_get_attribute_memory_type_device() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 1024), CUDA_SUCCESS);
+        let mut val: u32 = 0;
+        let result = ol_cuPointerGetAttribute(
+            &mut val as *mut u32 as *mut u8,
+            2, // MEMORY_TYPE
+            dptr,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(val, 2); // CU_MEMORYTYPE_DEVICE
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attribute_device_pointer() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 512), CUDA_SUCCESS);
+        let mut val: u64 = 0;
+        let result = ol_cuPointerGetAttribute(
+            &mut val as *mut u64 as *mut u8,
+            3, // DEVICE_POINTER
+            dptr,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(val, dptr);
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attribute_host_pointer_for_device() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 256), CUDA_SUCCESS);
+        let mut val: u64 = 0;
+        let result = ol_cuPointerGetAttribute(
+            &mut val as *mut u64 as *mut u8,
+            4, // HOST_POINTER
+            dptr,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(val, 0); // device pointers have no host pointer
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attribute_is_managed() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 256), CUDA_SUCCESS);
+        let mut val: u32 = 99;
+        let result = ol_cuPointerGetAttribute(
+            &mut val as *mut u32 as *mut u8,
+            6, // IS_MANAGED
+            dptr,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(val, 0);
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attribute_device_ordinal() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 256), CUDA_SUCCESS);
+        let mut val: i32 = -1;
+        let result = ol_cuPointerGetAttribute(
+            &mut val as *mut i32 as *mut u8,
+            8, // DEVICE_ORDINAL
+            dptr,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(val, 0);
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attribute_null_data() {
+        let result = ol_cuPointerGetAttribute(ptr::null_mut(), 2, 1);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attribute_unknown_ptr() {
+        let mut val: u64 = 0;
+        let result = ol_cuPointerGetAttribute(
+            &mut val as *mut u64 as *mut u8,
+            2,
+            0xDEAD_BEEF,
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attribute_invalid_attrib() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 256), CUDA_SUCCESS);
+        let mut val: u64 = 0;
+        let result = ol_cuPointerGetAttribute(
+            &mut val as *mut u64 as *mut u8,
+            9999,
+            dptr,
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attributes_multiple() {
+        let mut dptr: u64 = 0;
+        assert_eq!(ol_cuMemAlloc_v2(&mut dptr, 1024), CUDA_SUCCESS);
+
+        let attrs: [i32; 2] = [2, 8]; // MEMORY_TYPE, DEVICE_ORDINAL
+        let mut val0: u32 = 0;
+        let mut val1: i32 = -1;
+        let mut data_ptrs: [*mut u8; 2] = [
+            &mut val0 as *mut u32 as *mut u8,
+            &mut val1 as *mut i32 as *mut u8,
+        ];
+
+        let result = ol_cuPointerGetAttributes(
+            2,
+            attrs.as_ptr(),
+            data_ptrs.as_mut_ptr(),
+            dptr,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(val0, 2); // DEVICE
+        assert_eq!(val1, 0); // ordinal 0
+        let _ = ol_cuMemFree_v2(dptr);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attributes_null_attrs() {
+        let mut data_ptr: *mut u8 = ptr::null_mut();
+        let result = ol_cuPointerGetAttributes(
+            1,
+            ptr::null(),
+            &mut data_ptr,
+            1,
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attributes_null_data() {
+        let attrs: [i32; 1] = [2];
+        let result = ol_cuPointerGetAttributes(
+            1,
+            attrs.as_ptr(),
+            ptr::null_mut(),
+            1,
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attributes_zero_count() {
+        let attrs: [i32; 1] = [2];
+        let mut data_ptr: *mut u8 = ptr::null_mut();
+        let result = ol_cuPointerGetAttributes(
+            0,
+            attrs.as_ptr(),
+            &mut data_ptr,
+            1,
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attributes_unknown_ptr() {
+        let attrs: [i32; 1] = [2];
+        let mut val: u32 = 0;
+        let mut data_ptrs: [*mut u8; 1] = [&mut val as *mut u32 as *mut u8];
+        let result = ol_cuPointerGetAttributes(
+            1,
+            attrs.as_ptr(),
+            data_ptrs.as_mut_ptr(),
+            0xDEAD_BEEF,
+        );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_pointer_get_attribute_memory_type_host() {
+        let mut ptr: *mut u8 = ptr::null_mut();
+        assert_eq!(ol_cuMemAllocHost(&mut ptr, 512), CUDA_SUCCESS);
+        assert!(!ptr.is_null());
+        let host_val = ptr as u64;
+        let mut val: u32 = 0;
+        let result = ol_cuPointerGetAttribute(
+            &mut val as *mut u32 as *mut u8,
+            2, // MEMORY_TYPE
+            host_val,
+        );
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(val, 1); // CU_MEMORYTYPE_HOST
+        let _ = ol_cuMemFreeHost(ptr);
     }
 }

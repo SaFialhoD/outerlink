@@ -1071,6 +1071,49 @@ pub fn handle_request(
             }
         }
 
+        // --- Pointer attribute queries ---
+
+        MessageType::PointerGetAttribute => {
+            // [4B attribute (i32 LE)][8B devPtr (u64 LE)] = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let attribute = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            let dev_ptr = u64::from_le_bytes(payload[4..12].try_into().unwrap());
+            match backend.pointer_get_attribute(attribute, dev_ptr) {
+                Ok(val) => success_with(rid, &val.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::PointerGetAttributes => {
+            // [4B numAttrs (u32 LE)][8B ptr (u64 LE)][N*4B attributes (i32 LE)]
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let num_attrs = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+            let ptr = u64::from_le_bytes(payload[4..12].try_into().unwrap());
+            let expected_len = 12 + num_attrs * 4;
+            if payload.len() < expected_len {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let mut attrs = Vec::with_capacity(num_attrs);
+            for i in 0..num_attrs {
+                let off = 12 + i * 4;
+                attrs.push(i32::from_le_bytes(payload[off..off + 4].try_into().unwrap()));
+            }
+            match backend.pointer_get_attributes(&attrs, ptr) {
+                Ok(vals) => {
+                    let mut data = Vec::with_capacity(vals.len() * 8);
+                    for v in &vals {
+                        data.extend_from_slice(&v.to_le_bytes());
+                    }
+                    success_with(rid, &data)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         // Anything else is unimplemented for the PoC.
         _ => {
             tracing::warn!(msg_type = ?header.msg_type, "unhandled message type");
@@ -3468,6 +3511,113 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let hdr = req(MessageType::CtxDisablePeerAccess, 4);
         let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // --- Pointer attribute tests ---
+
+    /// Helper: allocate device memory and return the device pointer.
+    fn alloc_device(gpu: &StubGpuBackend) -> u64 {
+        let payload = 1024u64.to_le_bytes();
+        let hdr = req(MessageType::MemAlloc, payload.len() as u32);
+        let (_, resp) = dispatch(gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        u64::from_le_bytes(resp[4..12].try_into().unwrap())
+    }
+
+    #[test]
+    fn test_pointer_get_attribute_memory_type() {
+        let gpu = StubGpuBackend::new();
+        let dev_ptr = alloc_device(&gpu);
+        // attribute=2 (MEMORY_TYPE), devPtr
+        let mut payload = 2i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&dev_ptr.to_le_bytes());
+        let hdr = req(MessageType::PointerGetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let val = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(val, 2); // CU_MEMORYTYPE_DEVICE
+    }
+
+    #[test]
+    fn test_pointer_get_attribute_device_pointer() {
+        let gpu = StubGpuBackend::new();
+        let dev_ptr = alloc_device(&gpu);
+        let mut payload = 3i32.to_le_bytes().to_vec(); // DEVICE_POINTER
+        payload.extend_from_slice(&dev_ptr.to_le_bytes());
+        let hdr = req(MessageType::PointerGetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let val = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(val, dev_ptr);
+    }
+
+    #[test]
+    fn test_pointer_get_attribute_invalid_ptr() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 2i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0xDEADu64.to_le_bytes());
+        let hdr = req(MessageType::PointerGetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_pointer_get_attribute_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 6]; // need 12
+        let hdr = req(MessageType::PointerGetAttribute, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_pointer_get_attributes_multiple() {
+        let gpu = StubGpuBackend::new();
+        let dev_ptr = alloc_device(&gpu);
+        // [4B numAttrs=2][8B ptr][4B attr=2 (MEMORY_TYPE)][4B attr=8 (DEVICE_ORDINAL)]
+        let mut payload = 2u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&dev_ptr.to_le_bytes());
+        payload.extend_from_slice(&2i32.to_le_bytes()); // MEMORY_TYPE
+        payload.extend_from_slice(&8i32.to_le_bytes()); // DEVICE_ORDINAL
+        let hdr = req(MessageType::PointerGetAttributes, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let v0 = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        let v1 = u64::from_le_bytes(resp[12..20].try_into().unwrap());
+        assert_eq!(v0, 2); // DEVICE
+        assert_eq!(v1, 0); // ordinal 0
+    }
+
+    #[test]
+    fn test_pointer_get_attributes_invalid_ptr() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0xDEADu64.to_le_bytes());
+        payload.extend_from_slice(&2i32.to_le_bytes());
+        let hdr = req(MessageType::PointerGetAttributes, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_pointer_get_attributes_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 8]; // need at least 12
+        let hdr = req(MessageType::PointerGetAttributes, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_pointer_get_attributes_truncated_attrs() {
+        let gpu = StubGpuBackend::new();
+        // Claims 3 attrs but only provides 1
+        let mut payload = 3u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&2i32.to_le_bytes()); // only 1 attr (need 3)
+        let hdr = req(MessageType::PointerGetAttributes, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }

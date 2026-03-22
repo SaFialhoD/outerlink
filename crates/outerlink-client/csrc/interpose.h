@@ -94,6 +94,10 @@ extern CUresult ol_cuModuleGetFunction(unsigned long long *func, unsigned long l
 extern CUresult ol_cuModuleGetGlobal(unsigned long long *dptr, size_t *size, unsigned long long module, const unsigned char *name, size_t name_len);
 extern CUresult ol_cuFuncGetAttribute(int *pi, int attrib, unsigned long long func);
 
+/* Pointer attributes */
+extern CUresult ol_cuPointerGetAttribute(unsigned char *data, int attribute, unsigned long long devPtr);
+extern CUresult ol_cuPointerGetAttributes(unsigned int numAttributes, const int *attributes, unsigned char **data, unsigned long long ptr);
+
 /* Occupancy */
 extern CUresult ol_cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, unsigned long long func, int blockSize, unsigned long long dynamicSMemSize);
 extern CUresult ol_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int *numBlocks, unsigned long long func, int blockSize, unsigned long long dynamicSMemSize, unsigned int flags);
@@ -215,6 +219,10 @@ CUresult hook_cuModuleUnload(CUmodule hmod);
 CUresult hook_cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name);
 CUresult hook_cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name);
 CUresult hook_cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc);
+
+/* Pointer attributes */
+CUresult hook_cuPointerGetAttribute(void *data, CUpointer_attribute attribute, CUdeviceptr devPtr);
+CUresult hook_cuPointerGetAttributes(unsigned int numAttributes, CUpointer_attribute *attributes, void **data, CUdeviceptr ptr);
 
 /* Occupancy */
 CUresult hook_cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize);

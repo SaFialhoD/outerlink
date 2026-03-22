@@ -118,6 +118,10 @@ pub enum MessageType {
     CtxGetStreamPriorityRange = 0x00A0,
     CtxGetFlags = 0x00A1,
 
+    // Pointer attributes
+    PointerGetAttribute = 0x00B0,
+    PointerGetAttributes = 0x00B1,
+
     // Response (server -> client)
     Response = 0x00F0,
     Error = 0x00FF,
@@ -199,6 +203,8 @@ impl MessageType {
             0x0091 => Some(Self::CtxDisablePeerAccess),
             0x00A0 => Some(Self::CtxGetStreamPriorityRange),
             0x00A1 => Some(Self::CtxGetFlags),
+            0x00B0 => Some(Self::PointerGetAttribute),
+            0x00B1 => Some(Self::PointerGetAttributes),
             0x00F0 => Some(Self::Response),
             0x00FF => Some(Self::Error),
             _ => None,
