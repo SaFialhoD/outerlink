@@ -158,6 +158,31 @@ type FnCuMemPrefetchAsync = unsafe extern "C" fn(dptr: u64, count: usize, dst_de
 type FnCuMemAdvise = unsafe extern "C" fn(dptr: u64, count: usize, advice: i32, device: i32) -> i32;
 type FnCuMemRangeGetAttribute = unsafe extern "C" fn(data: *mut std::ffi::c_void, data_size: usize, attribute: i32, dptr: u64, count: usize) -> i32;
 type FnCuMemRangeGetAttributes = unsafe extern "C" fn(data: *mut *mut std::ffi::c_void, data_sizes: *const usize, attributes: *const i32, num_attributes: usize, dptr: u64, count: usize) -> i32;
+// Library API (CUDA 12+) -- handles are opaque pointers (usize).
+type FnCuLibraryLoadData = unsafe extern "C" fn(
+    library: *mut usize,
+    code: *const u8,
+    jit_options: *const i32,
+    jit_option_values: *mut *mut std::ffi::c_void,
+    num_jit_options: u32,
+    lib_options: *const i32,
+    lib_option_values: *mut *mut std::ffi::c_void,
+    num_lib_options: u32,
+) -> i32;
+type FnCuLibraryUnload = unsafe extern "C" fn(library: usize) -> i32;
+type FnCuLibraryGetKernel = unsafe extern "C" fn(
+    p_kernel: *mut usize,
+    library: usize,
+    name: *const u8,
+) -> i32;
+type FnCuLibraryGetModule = unsafe extern "C" fn(
+    p_mod: *mut usize,
+    library: usize,
+) -> i32;
+type FnCuKernelGetFunction = unsafe extern "C" fn(
+    p_func: *mut usize,
+    kernel: usize,
+) -> i32;
 
 // Stream-ordered memory / pool operations (CUDA 11.2+)
 type FnCuMemAllocAsync = unsafe extern "C" fn(dptr: *mut u64, bytesize: usize, stream: usize) -> i32;
@@ -413,6 +438,13 @@ struct CudaApi {
     cu_device_primary_ctx_get_state: Option<FnCuDevicePrimaryCtxGetState>,
     cu_device_primary_ctx_set_flags: Option<FnCuDevicePrimaryCtxSetFlags>,
     cu_device_primary_ctx_reset: Option<FnCuDevicePrimaryCtxReset>,
+
+    // Library API (CUDA 12+)
+    cu_library_load_data: Option<FnCuLibraryLoadData>,
+    cu_library_unload: Option<FnCuLibraryUnload>,
+    cu_library_get_kernel: Option<FnCuLibraryGetKernel>,
+    cu_library_get_module: Option<FnCuLibraryGetModule>,
+    cu_kernel_get_function: Option<FnCuKernelGetFunction>,
 }
 
 // Safety: The function pointers in CudaApi are plain function pointers
@@ -598,6 +630,13 @@ impl CudaApi {
             cu_device_primary_ctx_get_state: load_sym!(lib, b"cuDevicePrimaryCtxGetState\0"),
             cu_device_primary_ctx_set_flags: load_sym!(lib, b"cuDevicePrimaryCtxSetFlags_v2\0", b"cuDevicePrimaryCtxSetFlags\0"),
             cu_device_primary_ctx_reset: load_sym!(lib, b"cuDevicePrimaryCtxReset_v2\0", b"cuDevicePrimaryCtxReset\0"),
+
+            // Library API (CUDA 12+) -- optional, not present on older drivers
+            cu_library_load_data: load_sym!(lib, b"cuLibraryLoadData\0"),
+            cu_library_unload: load_sym!(lib, b"cuLibraryUnload\0"),
+            cu_library_get_kernel: load_sym!(lib, b"cuLibraryGetKernel\0"),
+            cu_library_get_module: load_sym!(lib, b"cuLibraryGetModule\0"),
+            cu_kernel_get_function: load_sym!(lib, b"cuKernelGetFunction\0"),
         }
     }
 }
@@ -1831,6 +1870,81 @@ impl GpuBackend for CudaGpuBackend {
     fn launch_host_func(&self, _stream: u64, _callback_id: u64) -> Result<(), CuResult> {
         // Same as stream_add_callback -- immediate notification in Phase 1.
         Ok(())
+    }
+
+    // --- Library API (CUDA 12+) ---
+
+    fn library_load_data(
+        &self,
+        image: &[u8],
+        jit_options: &[(i32, u64)],
+        lib_options: &[(i32, u64)],
+    ) -> Result<u64, CuResult> {
+        if image.is_empty() {
+            return Err(CuResult::InvalidValue);
+        }
+        let func = require_fn(&self.api.cu_library_load_data)?;
+        let mut library: usize = 0;
+
+        // Build JIT option arrays (same pattern as module_load_data_ex).
+        let jit_opt_keys: Vec<i32> = jit_options.iter().map(|(k, _)| *k).collect();
+        let mut jit_opt_vals: Vec<*mut std::ffi::c_void> =
+            jit_options.iter().map(|(_, v)| *v as *mut std::ffi::c_void).collect();
+
+        // Build lib option arrays.
+        let lib_opt_keys: Vec<i32> = lib_options.iter().map(|(k, _)| *k).collect();
+        let mut lib_opt_vals: Vec<*mut std::ffi::c_void> =
+            lib_options.iter().map(|(_, v)| *v as *mut std::ffi::c_void).collect();
+
+        unsafe {
+            map_cuda_result(func(
+                &mut library,
+                image.as_ptr(),
+                jit_opt_keys.as_ptr(),
+                jit_opt_vals.as_mut_ptr(),
+                jit_options.len() as u32,
+                lib_opt_keys.as_ptr(),
+                lib_opt_vals.as_mut_ptr(),
+                lib_options.len() as u32,
+            ))?;
+        }
+        Ok(library as u64)
+    }
+
+    fn library_unload(&self, library: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_library_unload)?;
+        unsafe {
+            map_cuda_result(func(library as usize))?;
+        }
+        Ok(())
+    }
+
+    fn library_get_kernel(&self, library: u64, name: &str) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_library_get_kernel)?;
+        let c_name = CString::new(name).map_err(|_| CuResult::InvalidValue)?;
+        let mut kernel: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut kernel, library as usize, c_name.as_ptr() as *const u8))?;
+        }
+        Ok(kernel as u64)
+    }
+
+    fn library_get_module(&self, library: u64) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_library_get_module)?;
+        let mut module: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut module, library as usize))?;
+        }
+        Ok(module as u64)
+    }
+
+    fn kernel_get_function(&self, kernel: u64) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_kernel_get_function)?;
+        let mut function: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut function, kernel as usize))?;
+        }
+        Ok(function as u64)
     }
 
     fn shutdown(&self) {

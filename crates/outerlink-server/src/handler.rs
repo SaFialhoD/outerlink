@@ -2019,6 +2019,138 @@ pub fn handle_request_full(
 
         // CallbackReady, CallbackChannelInit, CallbackChannelAck are not
         // valid client->server request types on the main connection.
+        // --- Library API (CUDA 12+) ---
+
+        MessageType::LibraryLoadData => {
+            // Wire format:
+            //   4B num_jit_opts (u32 LE)
+            //   num_jit_opts * 12B (4B opt i32 LE + 8B val u64 LE)
+            //   4B num_lib_opts (u32 LE)
+            //   num_lib_opts * 12B (4B opt i32 LE + 8B val u64 LE)
+            //   remaining bytes = image data
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let num_jit_opts = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+            if num_jit_opts > 256 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let jit_opts_size = match num_jit_opts.checked_mul(12) {
+                Some(v) => v,
+                None => return error_response(rid, CuResult::InvalidValue),
+            };
+            let lib_opts_offset = match (4usize).checked_add(jit_opts_size) {
+                Some(v) => v,
+                None => return error_response(rid, CuResult::InvalidValue),
+            };
+            if payload.len() < lib_opts_offset + 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let num_lib_opts = u32::from_le_bytes(
+                payload[lib_opts_offset..lib_opts_offset + 4].try_into().unwrap(),
+            ) as usize;
+            if num_lib_opts > 256 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let lib_opts_size = match num_lib_opts.checked_mul(12) {
+                Some(v) => v,
+                None => return error_response(rid, CuResult::InvalidValue),
+            };
+            let image_offset = match lib_opts_offset
+                .checked_add(4)
+                .and_then(|v| v.checked_add(lib_opts_size))
+            {
+                Some(v) => v,
+                None => return error_response(rid, CuResult::InvalidValue),
+            };
+            if payload.len() <= image_offset {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            // Parse JIT options
+            let mut jit_options = Vec::with_capacity(num_jit_opts);
+            for i in 0..num_jit_opts {
+                let base = 4 + i * 12;
+                let opt_id = i32::from_le_bytes(payload[base..base + 4].try_into().unwrap());
+                let opt_val = u64::from_le_bytes(payload[base + 4..base + 12].try_into().unwrap());
+                jit_options.push((opt_id, opt_val));
+            }
+            // Parse lib options
+            let mut lib_options = Vec::with_capacity(num_lib_opts);
+            for i in 0..num_lib_opts {
+                let base = lib_opts_offset + 4 + i * 12;
+                let opt_id = i32::from_le_bytes(payload[base..base + 4].try_into().unwrap());
+                let opt_val = u64::from_le_bytes(payload[base + 4..base + 12].try_into().unwrap());
+                lib_options.push((opt_id, opt_val));
+            }
+            let image = &payload[image_offset..];
+            match backend.library_load_data(image, &jit_options, &lib_options) {
+                Ok(handle) => {
+                    session.track_library(handle);
+                    success_with(rid, &handle.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::LibraryUnload => {
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let library = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.library_unload(library) {
+                Ok(()) => {
+                    session.untrack_library(library);
+                    result_only(rid, CuResult::Success)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::LibraryGetKernel => {
+            // Payload: u64 library + u32 name_len + name_bytes
+            if payload.len() < 13 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let library = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let name_len = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
+            if payload.len() < 12 + name_len || name_len == 0 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let name = match std::str::from_utf8(&payload[12..12 + name_len]) {
+                Ok(s) => s,
+                Err(_) => return error_response(rid, CuResult::InvalidValue),
+            };
+            match backend.library_get_kernel(library, name) {
+                Ok(handle) => {
+                    session.track_kernel(handle);
+                    success_with(rid, &handle.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::LibraryGetModule => {
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let library = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.library_get_module(library) {
+                Ok(module) => success_with(rid, &module.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::KernelGetFunction => {
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let kernel = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.kernel_get_function(kernel) {
+                Ok(func) => success_with(rid, &func.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         // They are handled in the accept loop (server.rs).
         MessageType::CallbackReady
         | MessageType::CallbackChannelInit
@@ -6254,6 +6386,104 @@ mod tests {
     fn test_handler_mem_alloc_managed_short_payload() {
         let gpu = StubGpuBackend::new();
         let hdr = req(MessageType::MemAllocManaged, 4);
+    // -----------------------------------------------------------------------
+    // Library API (CUDA 12+) tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a LibraryLoadData payload with 0 jit options and 0 lib options.
+    fn library_load_payload(image: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // num_jit_opts = 0
+        payload.extend_from_slice(&0u32.to_le_bytes()); // num_lib_opts = 0
+        payload.extend_from_slice(image);
+        payload
+    }
+
+    /// Helper: build a LibraryLoadData payload with JIT options.
+    fn library_load_payload_with_opts(
+        image: &[u8],
+        jit_opts: &[(i32, u64)],
+        lib_opts: &[(i32, u64)],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(jit_opts.len() as u32).to_le_bytes());
+        for (opt, val) in jit_opts {
+            payload.extend_from_slice(&opt.to_le_bytes());
+            payload.extend_from_slice(&val.to_le_bytes());
+        }
+        payload.extend_from_slice(&(lib_opts.len() as u32).to_le_bytes());
+        for (opt, val) in lib_opts {
+            payload.extend_from_slice(&opt.to_le_bytes());
+            payload.extend_from_slice(&val.to_le_bytes());
+        }
+        payload.extend_from_slice(image);
+        payload
+    }
+
+    /// Helper: load a library and return its handle.
+    fn setup_library(gpu: &StubGpuBackend, session: &mut ConnectionSession) -> u64 {
+        let payload = library_load_payload(b"fake ptx data");
+        let hdr = req(MessageType::LibraryLoadData, payload.len() as u32);
+        let (_, resp) = dispatch_with(gpu, &hdr, &payload, session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        u64::from_le_bytes(resp[4..12].try_into().unwrap())
+    }
+
+    /// Helper: get a kernel from a library and return its handle.
+    fn setup_kernel(gpu: &StubGpuBackend, session: &mut ConnectionSession, library: u64) -> u64 {
+        let name = b"my_kernel";
+        let mut payload = library.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name);
+        let hdr = req(MessageType::LibraryGetKernel, payload.len() as u32);
+        let (_, resp) = dispatch_with(gpu, &hdr, &payload, session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        u64::from_le_bytes(resp[4..12].try_into().unwrap())
+    }
+
+    // -- LibraryLoadData --
+
+    #[test]
+    fn test_library_load_data_success() {
+        let gpu = StubGpuBackend::new();
+        let payload = library_load_payload(b"fake ptx data");
+        let hdr = req(MessageType::LibraryLoadData, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(handle, 0);
+    }
+
+    #[test]
+    fn test_library_load_data_with_jit_options() {
+        let gpu = StubGpuBackend::new();
+        let jit_opts = vec![(0i32, 4u64), (1i32, 1024u64)];
+        let lib_opts = vec![(10i32, 99u64)];
+        let payload = library_load_payload_with_opts(b"ptx code", &jit_opts, &lib_opts);
+        let hdr = req(MessageType::LibraryLoadData, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(handle, 0);
+    }
+
+    #[test]
+    fn test_library_load_data_empty_image() {
+        let gpu = StubGpuBackend::new();
+        // No image bytes after the option counts
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::LibraryLoadData, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_load_data_short_payload() {
+        let gpu = StubGpuBackend::new();
+        // Only 4 bytes -- need at least 8 (num_jit_opts + num_lib_opts)
+        let hdr = req(MessageType::LibraryLoadData, 4);
         let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 4]);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
@@ -6363,6 +6593,414 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let hdr = req(MessageType::MemRangeGetAttributes, 12);
         let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 12]);
+    fn test_library_load_data_too_many_jit_options() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&257u32.to_le_bytes()); // > 256 cap
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::LibraryLoadData, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_load_data_too_many_lib_options() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&257u32.to_le_bytes()); // > 256 cap
+        let hdr = req(MessageType::LibraryLoadData, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_load_data_truncated_jit_options() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u32.to_le_bytes()); // claim 2 jit opts
+        // But provide no option data
+        let hdr = req(MessageType::LibraryLoadData, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_load_data_session_tracking() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let library = setup_library(&gpu, &mut session);
+        assert_eq!(session.library_count(), 1);
+        assert_ne!(library, 0);
+    }
+
+    #[test]
+    fn test_library_load_data_multiple_libraries() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let lib1 = setup_library(&gpu, &mut session);
+        let lib2 = setup_library(&gpu, &mut session);
+        assert_ne!(lib1, lib2); // unique handles
+        assert_eq!(session.library_count(), 2);
+    }
+
+    // -- LibraryUnload --
+
+    #[test]
+    fn test_library_unload_success() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let library = setup_library(&gpu, &mut session);
+
+        let payload = library.to_le_bytes();
+        let hdr = req(MessageType::LibraryUnload, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.library_count(), 0);
+    }
+
+    #[test]
+    fn test_library_unload_invalid_handle() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xBADu64.to_le_bytes();
+        let hdr = req(MessageType::LibraryUnload, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_unload_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::LibraryUnload, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_unload_double_unload() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let library = setup_library(&gpu, &mut session);
+
+        let payload = library.to_le_bytes();
+        let hdr = req(MessageType::LibraryUnload, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Second unload should fail
+        let (_, resp2) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp2), CuResult::InvalidValue);
+    }
+
+    // -- LibraryGetKernel --
+
+    #[test]
+    fn test_library_get_kernel_success() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let library = setup_library(&gpu, &mut session);
+
+        let name = b"my_kernel";
+        let mut payload = library.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name);
+        let hdr = req(MessageType::LibraryGetKernel, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let kernel = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(kernel, 0);
+        assert_eq!(session.kernel_count(), 1);
+    }
+
+    #[test]
+    fn test_library_get_kernel_invalid_library() {
+        let gpu = StubGpuBackend::new();
+        let name = b"my_kernel";
+        let mut payload = 0xBADu64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name);
+        let hdr = req(MessageType::LibraryGetKernel, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_get_kernel_short_payload() {
+        let gpu = StubGpuBackend::new();
+        // Need at least 13 bytes (8B library + 4B name_len + 1B name)
+        let hdr = req(MessageType::LibraryGetKernel, 10);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 10]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_get_kernel_empty_name() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let library = setup_library(&gpu, &mut session);
+
+        let mut payload = library.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // name_len = 0
+        let hdr = req(MessageType::LibraryGetKernel, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_get_kernel_multiple_kernels() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let library = setup_library(&gpu, &mut session);
+
+        let k1 = setup_kernel(&gpu, &mut session, library);
+        // Different name -> different kernel
+        let name2 = b"other_kernel";
+        let mut payload = library.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(name2.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name2);
+        let hdr = req(MessageType::LibraryGetKernel, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let k2 = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        assert_ne!(k1, k2);
+        assert_eq!(session.kernel_count(), 2);
+    }
+
+    // -- LibraryGetModule --
+
+    #[test]
+    fn test_library_get_module_success() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let library = setup_library(&gpu, &mut session);
+
+        let payload = library.to_le_bytes();
+        let hdr = req(MessageType::LibraryGetModule, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(module, 0);
+    }
+
+    #[test]
+    fn test_library_get_module_invalid_library() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xBADu64.to_le_bytes();
+        let hdr = req(MessageType::LibraryGetModule, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_get_module_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::LibraryGetModule, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_get_module_consistent() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let library = setup_library(&gpu, &mut session);
+
+        // Call twice -- should return the same module handle.
+        let payload = library.to_le_bytes();
+        let hdr = req(MessageType::LibraryGetModule, payload.len() as u32);
+        let (_, resp1) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let (_, resp2) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let mod1 = u64::from_le_bytes(resp1[4..12].try_into().unwrap());
+        let mod2 = u64::from_le_bytes(resp2[4..12].try_into().unwrap());
+        assert_eq!(mod1, mod2);
+    }
+
+    // -- KernelGetFunction --
+
+    #[test]
+    fn test_kernel_get_function_success() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let library = setup_library(&gpu, &mut session);
+        let kernel = setup_kernel(&gpu, &mut session, library);
+
+        let payload = kernel.to_le_bytes();
+        let hdr = req(MessageType::KernelGetFunction, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let func = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(func, 0);
+    }
+
+    #[test]
+    fn test_kernel_get_function_invalid_kernel() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xBADu64.to_le_bytes();
+        let hdr = req(MessageType::KernelGetFunction, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_kernel_get_function_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::KernelGetFunction, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_kernel_get_function_consistent() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let library = setup_library(&gpu, &mut session);
+        let kernel = setup_kernel(&gpu, &mut session, library);
+
+        // Same kernel -> same function handle.
+        let payload = kernel.to_le_bytes();
+        let hdr = req(MessageType::KernelGetFunction, payload.len() as u32);
+        let (_, resp1) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let (_, resp2) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let f1 = u64::from_le_bytes(resp1[4..12].try_into().unwrap());
+        let f2 = u64::from_le_bytes(resp2[4..12].try_into().unwrap());
+        assert_eq!(f1, f2);
+    }
+
+    // -- End-to-end workflow --
+
+    #[test]
+    fn test_library_full_workflow() {
+        // Load library -> get kernel -> get function -> get module -> unload
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // 1. Load library
+        let library = setup_library(&gpu, &mut session);
+        assert_eq!(session.library_count(), 1);
+
+        // 2. Get kernel
+        let kernel = setup_kernel(&gpu, &mut session, library);
+        assert_eq!(session.kernel_count(), 1);
+
+        // 3. Get function from kernel
+        let payload = kernel.to_le_bytes();
+        let hdr = req(MessageType::KernelGetFunction, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let func = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(func, 0);
+
+        // 4. Get module from library
+        let payload = library.to_le_bytes();
+        let hdr = req(MessageType::LibraryGetModule, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(module, 0);
+
+        // 5. Unload library
+        let payload = library.to_le_bytes();
+        let hdr = req(MessageType::LibraryUnload, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.library_count(), 0);
+    }
+
+    #[test]
+    fn test_library_unload_cleans_kernels() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        let library = setup_library(&gpu, &mut session);
+        let kernel = setup_kernel(&gpu, &mut session, library);
+
+        // Unload library
+        let payload = library.to_le_bytes();
+        let hdr = req(MessageType::LibraryUnload, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Kernel should be invalid after library unload
+        let payload = kernel.to_le_bytes();
+        let hdr = req(MessageType::KernelGetFunction, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_get_module_after_unload() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        let library = setup_library(&gpu, &mut session);
+
+        // Unload library
+        let payload = library.to_le_bytes();
+        let hdr = req(MessageType::LibraryUnload, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Get module from unloaded library should fail
+        let payload = library.to_le_bytes();
+        let hdr = req(MessageType::LibraryGetModule, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_library_session_cleanup() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        let _library = setup_library(&gpu, &mut session);
+        assert_eq!(session.library_count(), 1);
+
+        // Session cleanup should unload all libraries
+        let report = session.cleanup(&gpu);
+        assert!(report.succeeded > 0);
+        assert_eq!(report.failed, 0);
+        assert_eq!(session.library_count(), 0);
+    }
+
+    #[test]
+    fn test_library_kernel_function_chain_valid_handles() {
+        // Verify all handles in the chain are distinct and non-zero
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        let library = setup_library(&gpu, &mut session);
+        let kernel = setup_kernel(&gpu, &mut session, library);
+
+        let payload = kernel.to_le_bytes();
+        let hdr = req(MessageType::KernelGetFunction, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let func = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        let payload = library.to_le_bytes();
+        let hdr = req(MessageType::LibraryGetModule, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let module = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // All handles should be unique and non-zero
+        assert_ne!(library, 0);
+        assert_ne!(kernel, 0);
+        assert_ne!(func, 0);
+        assert_ne!(module, 0);
+        assert_ne!(library, kernel);
+        assert_ne!(library, func);
+        assert_ne!(library, module);
+        assert_ne!(kernel, func);
+    }
+
+    #[test]
+    fn test_library_load_data_truncated_lib_options() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // 0 jit opts
+        payload.extend_from_slice(&2u32.to_le_bytes()); // claim 2 lib opts but provide none
+        let hdr = req(MessageType::LibraryLoadData, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 }

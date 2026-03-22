@@ -189,6 +189,15 @@ extern CUresult ol_cuFuncSetCacheConfig(unsigned long long func, unsigned int co
 extern CUresult ol_cuFuncSetSharedMemConfig(unsigned long long func, unsigned int config);
 extern CUresult ol_cuMemGetAddressRange_v2(unsigned long long *pbase, size_t *psize, unsigned long long dptr);
 
+/* Library API (CUDA 12+) -- handles passed as u64 (unsigned long long) */
+extern CUresult ol_cuLibraryLoadData(unsigned long long *library, const void *data, size_t data_len,
+                                      unsigned int numJitOptions, const int *jitOptions, const unsigned long long *jitOptionValues,
+                                      unsigned int numLibOptions, const int *libOptions, const unsigned long long *libOptionValues);
+extern CUresult ol_cuLibraryUnload(unsigned long long library);
+extern CUresult ol_cuLibraryGetKernel(unsigned long long *kernel, unsigned long long library, const char *name);
+extern CUresult ol_cuLibraryGetModule(unsigned long long *module, unsigned long long library);
+extern CUresult ol_cuKernelGetFunction(unsigned long long *func, unsigned long long kernel);
+
 /* Pointer attributes */
 extern CUresult ol_cuPointerGetAttribute(unsigned char *data, int attribute, unsigned long long devPtr);
 extern CUresult ol_cuPointerGetAttributes(unsigned int numAttributes, const int *attributes, unsigned char **data, unsigned long long ptr);
@@ -442,6 +451,15 @@ CUresult hook_cuGraphDestroy(CUgraph hGraph);
 /* cuLaunchKernelEx (CUDA 12+) */
 CUresult hook_cuLaunchKernelEx(const void *config, CUfunction f,
                                 void **kernelParams, void **extra);
+
+/* Library API (CUDA 12+) */
+CUresult hook_cuLibraryLoadData(CUlibrary *library, const void *code,
+                                 void *jitOptions, void **jitOptionsValues, unsigned int numJitOptions,
+                                 void *libraryOptions, void **libraryOptionValues, unsigned int numLibraryOptions);
+CUresult hook_cuLibraryUnload(CUlibrary library);
+CUresult hook_cuLibraryGetKernel(CUkernel *pKernel, CUlibrary library, const char *name);
+CUresult hook_cuLibraryGetModule(CUmodule *pMod, CUlibrary library);
+CUresult hook_cuKernelGetFunction(CUfunction *pFunc, CUkernel kernel);
 
 /* cuGetProcAddress hooks */
 CUresult hook_cuGetProcAddress(const char *symbol, void **pfn,

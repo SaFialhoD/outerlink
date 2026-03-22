@@ -53,6 +53,10 @@ pub struct ConnectionSession {
     mem_pools: HashSet<u64>,
     /// JIT linker states created by this session.
     link_states: HashSet<u64>,
+    /// CUDA 12 libraries loaded by this session.
+    libraries: HashSet<u64>,
+    /// CUDA 12 kernels obtained by this session.
+    kernels: HashSet<u64>,
     /// Dedicated callback channel connection (set when client connects
     /// a second TCP stream with CallbackChannelInit).
     callback_channel: Option<Arc<TcpTransportConnection>>,
@@ -80,6 +84,8 @@ impl ConnectionSession {
             peer_access_ctxs: HashSet::new(),
             mem_pools: HashSet::new(),
             link_states: HashSet::new(),
+            libraries: HashSet::new(),
+            kernels: HashSet::new(),
             callback_channel: None,
         }
     }
@@ -275,6 +281,36 @@ impl ConnectionSession {
         self.link_states.len()
     }
 
+    /// Record that this session loaded a CUDA 12 library with handle `library`.
+    pub fn track_library(&mut self, library: u64) {
+        self.libraries.insert(library);
+    }
+
+    /// Remove `library` from this session's tracked libraries.
+    pub fn untrack_library(&mut self, library: u64) {
+        self.libraries.remove(&library);
+    }
+
+    /// Number of libraries tracked by this session.
+    pub fn library_count(&self) -> usize {
+        self.libraries.len()
+    }
+
+    /// Record that this session obtained a CUDA 12 kernel with handle `kernel`.
+    pub fn track_kernel(&mut self, kernel: u64) {
+        self.kernels.insert(kernel);
+    }
+
+    /// Remove `kernel` from this session's tracked kernels.
+    pub fn untrack_kernel(&mut self, kernel: u64) {
+        self.kernels.remove(&kernel);
+    }
+
+    /// Number of kernels tracked by this session.
+    pub fn kernel_count(&self) -> usize {
+        self.kernels.len()
+    }
+
     // --- Resource queries ---
 
     /// Number of device memory allocations tracked by this session.
@@ -319,6 +355,8 @@ impl ConnectionSession {
             + self.peer_access_ctxs.len()
             + self.mem_pools.len()
             + self.link_states.len()
+            + self.libraries.len()
+            + self.kernels.len()
     }
 
     // --- Cleanup ---
@@ -338,6 +376,23 @@ impl ConnectionSession {
     /// and the number that failed.
     pub fn cleanup(&mut self, backend: &dyn GpuBackend) -> CleanupReport {
         let mut report = CleanupReport::default();
+
+        // 0-pre. Libraries (unload before modules, as libraries wrap modules)
+        // Note: kernels don't need explicit cleanup -- they are invalidated when
+        // the library is unloaded.
+        self.kernels.clear();
+        for library in self.libraries.drain() {
+            match backend.library_unload(library) {
+                Ok(()) => {
+                    tracing::debug!(handle = library, "session cleanup: unloaded library");
+                    report.succeeded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(handle = library, error = ?e, "session cleanup: failed to unload library");
+                    report.failed += 1;
+                }
+            }
+        }
 
         // 0a. JIT linker states (destroy before modules, as they may reference module data)
         for state in self.link_states.drain() {

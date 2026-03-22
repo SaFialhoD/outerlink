@@ -1546,6 +1546,216 @@ pub extern "C" fn ol_cuModuleGetFunction(func: *mut u64, module: u64, name: *con
 }
 
 // ---------------------------------------------------------------------------
+// Library API (CUDA 12+)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuLibraryLoadData(
+    library: *mut u64,
+    data: *const u8,
+    data_len: usize,
+    num_jit_options: u32,
+    jit_options: *const i32,
+    jit_option_values: *const u64,
+    num_lib_options: u32,
+    lib_options: *const i32,
+    lib_option_values: *const u64,
+) -> u32 {
+    let client = get_client();
+    if library.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        if !data.is_null() && data_len > 0 {
+            let image = unsafe { std::slice::from_raw_parts(data, data_len) };
+            let nj = num_jit_options as usize;
+            let nl = num_lib_options as usize;
+            // Wire format: 4B num_jit_opts + jit_opts + 4B num_lib_opts + lib_opts + image
+            let mut payload = Vec::with_capacity(8 + nj * 12 + nl * 12 + data_len);
+            payload.extend_from_slice(&num_jit_options.to_le_bytes());
+            if nj > 0 && !jit_options.is_null() && !jit_option_values.is_null() {
+                let opts = unsafe { std::slice::from_raw_parts(jit_options, nj) };
+                let vals = unsafe { std::slice::from_raw_parts(jit_option_values, nj) };
+                for i in 0..nj {
+                    payload.extend_from_slice(&opts[i].to_le_bytes());
+                    payload.extend_from_slice(&vals[i].to_le_bytes());
+                }
+            }
+            payload.extend_from_slice(&num_lib_options.to_le_bytes());
+            if nl > 0 && !lib_options.is_null() && !lib_option_values.is_null() {
+                let opts = unsafe { std::slice::from_raw_parts(lib_options, nl) };
+                let vals = unsafe { std::slice::from_raw_parts(lib_option_values, nl) };
+                for i in 0..nl {
+                    payload.extend_from_slice(&opts[i].to_le_bytes());
+                    payload.extend_from_slice(&vals[i].to_le_bytes());
+                }
+            }
+            payload.extend_from_slice(image);
+            if let Ok((_hdr, resp)) =
+                client.send_request(MessageType::LibraryLoadData, &payload)
+            {
+                let result = parse_result(&resp);
+                if result != CUDA_SUCCESS {
+                    return result;
+                }
+                if resp.len() >= 12 {
+                    let remote_lib =
+                        u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                    let synthetic = client.handles.libraries.insert(remote_lib);
+                    unsafe { *library = synthetic };
+                    return CUDA_SUCCESS;
+                }
+            }
+        }
+    }
+    // Stub: generate a local-only handle
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.libraries.insert(stub_remote);
+    unsafe { *library = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuLibraryUnload(library: u64) -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let remote_lib = match client.handles.libraries.to_remote(library) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_lib.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::LibraryUnload, &payload) {
+            let result = parse_result(&resp);
+            client.handles.libraries.remove_by_local(library);
+            return result;
+        }
+    }
+    if client.handles.libraries.remove_by_local(library).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuLibraryGetKernel(kernel: *mut u64, library: u64, name: *const i8) -> u32 {
+    let client = get_client();
+    if kernel.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_lib = match client.handles.libraries.to_remote(library) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        if !name.is_null() {
+            let name_cstr = unsafe { std::ffi::CStr::from_ptr(name) };
+            let name_bytes = name_cstr.to_bytes();
+            let mut payload = Vec::with_capacity(12 + name_bytes.len());
+            payload.extend_from_slice(&remote_lib.to_le_bytes());
+            payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            payload.extend_from_slice(name_bytes);
+            if let Ok((_hdr, resp)) =
+                client.send_request(MessageType::LibraryGetKernel, &payload)
+            {
+                let result = parse_result(&resp);
+                if result != CUDA_SUCCESS {
+                    return result;
+                }
+                if resp.len() >= 12 {
+                    let remote_kernel =
+                        u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                    let synthetic = client.handles.kernels.insert(remote_kernel);
+                    unsafe { *kernel = synthetic };
+                    return CUDA_SUCCESS;
+                }
+            }
+        }
+    }
+    // Validate library exists in stub mode
+    if client.handles.libraries.to_remote(library).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.kernels.insert(stub_remote);
+    unsafe { *kernel = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuLibraryGetModule(module: *mut u64, library: u64) -> u32 {
+    let client = get_client();
+    if module.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_lib = match client.handles.libraries.to_remote(library) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_lib.to_le_bytes();
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::LibraryGetModule, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_module =
+                    u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.modules.insert(remote_module);
+                unsafe { *module = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    if client.handles.libraries.to_remote(library).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.modules.insert(stub_remote);
+    unsafe { *module = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuKernelGetFunction(func: *mut u64, kernel: u64) -> u32 {
+    let client = get_client();
+    if func.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_kernel = match client.handles.kernels.to_remote(kernel) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_kernel.to_le_bytes();
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::KernelGetFunction, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_func =
+                    u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.functions.insert(remote_func);
+                unsafe { *func = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    if client.handles.kernels.to_remote(kernel).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.functions.insert(stub_remote);
+    unsafe { *func = synthetic };
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // Function attribute query
 // ---------------------------------------------------------------------------
 

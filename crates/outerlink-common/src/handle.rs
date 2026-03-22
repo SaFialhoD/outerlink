@@ -16,6 +16,8 @@ const STREAM_PREFIX: u64 = 0x1000_0000_0000_0000;
 const EVENT_PREFIX: u64 = 0x1100_0000_0000_0000;
 const MEMPOOL_PREFIX: u64 = 0x1200_0000_0000_0000;
 const LINKSTATE_PREFIX: u64 = 0x1300_0000_0000_0000;
+const LIBRARY_PREFIX: u64 = 0x1400_0000_0000_0000;
+const KERNEL_PREFIX: u64 = 0x1500_0000_0000_0000;
 
 /// Thread-safe bidirectional handle mapping.
 ///
@@ -109,6 +111,8 @@ pub struct HandleStore {
     pub events: HandleMap,
     pub mem_pools: HandleMap,
     pub link_states: HandleMap,
+    pub libraries: HandleMap,
+    pub kernels: HandleMap,
 }
 
 impl HandleStore {
@@ -123,6 +127,8 @@ impl HandleStore {
             events: HandleMap::new(EVENT_PREFIX),
             mem_pools: HandleMap::new(MEMPOOL_PREFIX),
             link_states: HandleMap::new(LINKSTATE_PREFIX),
+            libraries: HandleMap::new(LIBRARY_PREFIX),
+            kernels: HandleMap::new(KERNEL_PREFIX),
         }
     }
 }

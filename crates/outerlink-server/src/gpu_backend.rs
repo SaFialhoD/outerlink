@@ -500,6 +500,39 @@ pub trait GpuBackend: Send + Sync {
     /// Returns Ok(()) on success.
     fn launch_host_func(&self, stream: u64, callback_id: u64) -> Result<(), CuResult>;
 
+    // --- Library API (CUDA 12+) ---
+
+    /// Load a library from raw image data with JIT and library options.
+    ///
+    /// This is the CUDA 12 replacement for `cuModuleLoadData`. In the stub,
+    /// delegates to `module_load_data` internally and wraps the module handle
+    /// as a library handle.
+    fn library_load_data(
+        &self,
+        image: &[u8],
+        jit_options: &[(i32, u64)],
+        lib_options: &[(i32, u64)],
+    ) -> Result<u64, CuResult>;
+
+    /// Unload a previously loaded library.
+    fn library_unload(&self, library: u64) -> Result<(), CuResult>;
+
+    /// Get a kernel handle from a library by name.
+    ///
+    /// In the stub, delegates to `module_get_function` using the underlying
+    /// module handle.
+    fn library_get_kernel(&self, library: u64, name: &str) -> Result<u64, CuResult>;
+
+    /// Get the underlying CUmodule from a library.
+    ///
+    /// In the stub, returns the module handle that backs this library.
+    fn library_get_module(&self, library: u64) -> Result<u64, CuResult>;
+
+    /// Get a CUfunction from a CUkernel.
+    ///
+    /// In the stub, returns the kernel handle itself (same handle space).
+    fn kernel_get_function(&self, kernel: u64) -> Result<u64, CuResult>;
+
     // --- Lifecycle ---
 
     /// Clean up all GPU resources held by this backend.
@@ -594,6 +627,18 @@ struct StubEvent {
     timestamp_ns: u64,
 }
 
+/// Metadata for a stub CUDA 12 library.
+struct StubLibrary {
+    /// The underlying module handle backing this library.
+    module_id: u64,
+}
+
+/// Metadata for a stub CUDA 12 kernel (from cuLibraryGetKernel).
+struct StubKernel {
+    /// The underlying function handle backing this kernel.
+    function_id: u64,
+}
+
 /// State for a device's primary context.
 struct PrimaryCtxState {
     /// Context handle (0 = not created yet).
@@ -662,6 +707,14 @@ struct StubState {
     next_link_id: u64,
     /// Per-device current memory pool (set via cuDeviceSetMemPool).
     current_mem_pools: HashMap<i32, u64>,
+    /// CUDA 12 libraries: handle -> library info.
+    libraries: HashMap<u64, StubLibrary>,
+    /// Counter for generating library handles.
+    next_library_id: u64,
+    /// CUDA 12 kernels: handle -> kernel info.
+    kernels: HashMap<u64, StubKernel>,
+    /// Counter for generating kernel handles.
+    next_kernel_id: u64,
     /// Peer contexts currently enabled for P2P access.
     peer_access: HashSet<u64>,
     /// Preferred cache configuration (CU_FUNC_CACHE_PREFER_*).
@@ -724,6 +777,10 @@ impl StubGpuBackend {
                 },
                 link_states: HashMap::new(),
                 next_link_id: 0x4C00_0000_0000_0001, // 'L' prefix
+                libraries: HashMap::new(),
+                next_library_id: 0x4C1B_0000_0000_0001, // 'Lib' prefix
+                kernels: HashMap::new(),
+                next_kernel_id: 0x4B52_0000_0000_0001, // 'Kr' prefix
                 current_mem_pools: HashMap::new(),
                 peer_access: HashSet::new(),
                 cache_config: 0,        // CU_FUNC_CACHE_PREFER_NONE
@@ -1831,6 +1888,84 @@ impl GpuBackend for StubGpuBackend {
         Ok(())
     }
 
+    // --- Library API (CUDA 12+) ---
+
+    fn library_load_data(
+        &self,
+        image: &[u8],
+        _jit_options: &[(i32, u64)],
+        _lib_options: &[(i32, u64)],
+    ) -> Result<u64, CuResult> {
+        // Delegate to module_load_data, then wrap the module as a library.
+        let module_id = self.module_load_data(image)?;
+        let mut state = self.state.lock().unwrap();
+        let lib_id = state.next_library_id;
+        state.next_library_id += 1;
+        state.libraries.insert(lib_id, StubLibrary { module_id });
+        Ok(lib_id)
+    }
+
+    fn library_unload(&self, library: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        let lib = match state.libraries.remove(&library) {
+            Some(lib) => lib,
+            None => return Err(CuResult::InvalidValue),
+        };
+        let module_id = lib.module_id;
+        // Collect kernel IDs to remove (kernels whose functions belong to this module).
+        let kernels_to_remove: Vec<u64> = state.kernels.iter()
+            .filter(|(_, k)| {
+                state.functions.get(&k.function_id)
+                    .map(|f| f.module_id == module_id)
+                    .unwrap_or(false)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for kid in kernels_to_remove {
+            state.kernels.remove(&kid);
+        }
+        // Unload the underlying module.
+        if state.modules.remove(&module_id).is_some() {
+            state.functions.retain(|_, f| f.module_id != module_id);
+        }
+        Ok(())
+    }
+
+    fn library_get_kernel(&self, library: u64, name: &str) -> Result<u64, CuResult> {
+        // Validate library exists, get underlying module.
+        let module_id = {
+            let state = self.state.lock().unwrap();
+            match state.libraries.get(&library) {
+                Some(lib) => lib.module_id,
+                None => return Err(CuResult::InvalidValue),
+            }
+        };
+        // Delegate to module_get_function to create the function handle.
+        let function_id = self.module_get_function(module_id, name)?;
+        // Wrap the function as a kernel.
+        let mut state = self.state.lock().unwrap();
+        let kernel_id = state.next_kernel_id;
+        state.next_kernel_id += 1;
+        state.kernels.insert(kernel_id, StubKernel { function_id });
+        Ok(kernel_id)
+    }
+
+    fn library_get_module(&self, library: u64) -> Result<u64, CuResult> {
+        let state = self.state.lock().unwrap();
+        match state.libraries.get(&library) {
+            Some(lib) => Ok(lib.module_id),
+            None => Err(CuResult::InvalidValue),
+        }
+    }
+
+    fn kernel_get_function(&self, kernel: u64) -> Result<u64, CuResult> {
+        let state = self.state.lock().unwrap();
+        match state.kernels.get(&kernel) {
+            Some(k) => Ok(k.function_id),
+            None => Err(CuResult::InvalidValue),
+        }
+    }
+
     fn shutdown(&self) {
         let mut state = self.state.lock().unwrap();
         tracing::info!(
@@ -1855,6 +1990,8 @@ impl GpuBackend for StubGpuBackend {
         state.context_stack.clear();
         state.context_limits.clear();
         state.link_states.clear();
+        state.libraries.clear();
+        state.kernels.clear();
     }
 
     fn primary_ctx_retain(&self, device: i32) -> Result<u64, CuResult> {

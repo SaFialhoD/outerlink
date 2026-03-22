@@ -288,6 +288,13 @@ static const hook_entry_t hook_table[] = {
     /* cuLaunchKernelEx (CUDA 12+) */
     { "cuLaunchKernelEx",        (void *)hook_cuLaunchKernelEx },
 
+    /* Library API (CUDA 12+) */
+    { "cuLibraryLoadData",       (void *)hook_cuLibraryLoadData },
+    { "cuLibraryUnload",         (void *)hook_cuLibraryUnload },
+    { "cuLibraryGetKernel",      (void *)hook_cuLibraryGetKernel },
+    { "cuLibraryGetModule",      (void *)hook_cuLibraryGetModule },
+    { "cuKernelGetFunction",     (void *)hook_cuKernelGetFunction },
+
     /* Export table -- passthrough to real libcuda.so (in-process vtables) */
     { "cuGetExportTable",        (void *)hook_cuGetExportTable },
 
@@ -1744,6 +1751,146 @@ CUresult hook_cuLaunchKernelEx(const void *config, CUfunction f,
         blockDimX, blockDimY, blockDimZ,
         sharedMemBytes, hStream,
         kernelParams, extra);
+}
+
+/* -----------------------------------------------------------------------
+ * Library API (CUDA 12+)
+ *
+ * cuLibraryLoadData, cuLibraryUnload, cuLibraryGetKernel, cuLibraryGetModule,
+ * cuKernelGetFunction -- modern replacements for cuModule* functions.
+ * ----------------------------------------------------------------------- */
+
+CUresult hook_cuLibraryLoadData(CUlibrary *library, const void *code,
+                                 void *jitOptions, void **jitOptionsValues,
+                                 unsigned int numJitOptions,
+                                 void *libraryOptions, void **libraryOptionValues,
+                                 unsigned int numLibraryOptions) {
+    ensure_init();
+    unsigned long long lib_u64 = 0;
+
+    /* Determine image size (same PTX/ELF logic as hook_cuModuleLoadData). */
+    size_t data_len = 0;
+    if (code) {
+        const unsigned char *p = (const unsigned char *)code;
+        if (p[0] >= 0x20 && p[0] < 0x7F) {
+            /* PTX text -- null-terminated string */
+            data_len = strlen((const char *)code) + 1;
+        } else if (p[0] == 0x7F && p[1] == 'E' && p[2] == 'L' && p[3] == 'F'
+                   && p[4] == 2 && p[5] == 1) {
+            /* ELF cubin */
+            unsigned long long e_shoff = 0;
+            unsigned short e_shnum = 0, e_shentsize = 0;
+            memcpy(&e_shoff, p + 0x28, 8);
+            memcpy(&e_shentsize, p + 0x3A, 2);
+            memcpy(&e_shnum, p + 0x3C, 2);
+            if (e_shoff > 0 && e_shnum > 0 && e_shentsize > 0) {
+                unsigned long long end = e_shoff + (unsigned long long)e_shnum * e_shentsize;
+                if (end > e_shoff) {
+                    data_len = (size_t)end;
+                }
+            }
+        } else if (p[0] == 0x50 && p[1] == 0xED && p[2] == 0x55 && p[3] == 0xBA) {
+            /* NVIDIA fatbin magic -- read size from header */
+            if (1) {
+                unsigned long long fat_size = 0;
+                memcpy(&fat_size, p + 8, 8);
+                data_len = (size_t)fat_size + 16; /* header + data */
+            }
+        }
+    }
+
+    /* Convert JIT options to i32/u64 arrays for the Rust FFI */
+    int *jit_opts_i32 = NULL;
+    unsigned long long *jit_vals_u64 = NULL;
+    if (numJitOptions > 0 && jitOptions && jitOptionsValues) {
+        jit_opts_i32 = (int *)malloc(numJitOptions * sizeof(int));
+        jit_vals_u64 = (unsigned long long *)malloc(numJitOptions * sizeof(unsigned long long));
+        if (jit_opts_i32 && jit_vals_u64) {
+            int *src_opts = (int *)jitOptions;
+            for (unsigned int i = 0; i < numJitOptions; i++) {
+                jit_opts_i32[i] = src_opts[i];
+                jit_vals_u64[i] = (unsigned long long)(uintptr_t)jitOptionsValues[i];
+            }
+        } else {
+            free(jit_opts_i32);
+            free(jit_vals_u64);
+            jit_opts_i32 = NULL;
+            jit_vals_u64 = NULL;
+            numJitOptions = 0;
+        }
+    }
+
+    int *lib_opts_i32 = NULL;
+    unsigned long long *lib_vals_u64 = NULL;
+    if (numLibraryOptions > 0 && libraryOptions && libraryOptionValues) {
+        lib_opts_i32 = (int *)malloc(numLibraryOptions * sizeof(int));
+        lib_vals_u64 = (unsigned long long *)malloc(numLibraryOptions * sizeof(unsigned long long));
+        if (lib_opts_i32 && lib_vals_u64) {
+            int *src_opts = (int *)libraryOptions;
+            for (unsigned int i = 0; i < numLibraryOptions; i++) {
+                lib_opts_i32[i] = src_opts[i];
+                lib_vals_u64[i] = (unsigned long long)(uintptr_t)libraryOptionValues[i];
+            }
+        } else {
+            free(lib_opts_i32);
+            free(lib_vals_u64);
+            lib_opts_i32 = NULL;
+            lib_vals_u64 = NULL;
+            numLibraryOptions = 0;
+        }
+    }
+
+    CUresult r = ol_cuLibraryLoadData(&lib_u64, code, data_len,
+                                       numJitOptions, jit_opts_i32, jit_vals_u64,
+                                       numLibraryOptions, lib_opts_i32, lib_vals_u64);
+    free(jit_opts_i32);
+    free(jit_vals_u64);
+    free(lib_opts_i32);
+    free(lib_vals_u64);
+
+    if (r == CUDA_SUCCESS && library) {
+        *library = (CUlibrary)(uintptr_t)lib_u64;
+    }
+    return r;
+}
+
+CUresult hook_cuLibraryUnload(CUlibrary library) {
+    ensure_init();
+    return ol_cuLibraryUnload((unsigned long long)(uintptr_t)library);
+}
+
+CUresult hook_cuLibraryGetKernel(CUkernel *pKernel, CUlibrary library, const char *name) {
+    ensure_init();
+    unsigned long long kernel_u64 = 0;
+    CUresult r = ol_cuLibraryGetKernel(&kernel_u64,
+                                        (unsigned long long)(uintptr_t)library,
+                                        name);
+    if (r == CUDA_SUCCESS && pKernel) {
+        *pKernel = (CUkernel)(uintptr_t)kernel_u64;
+    }
+    return r;
+}
+
+CUresult hook_cuLibraryGetModule(CUmodule *pMod, CUlibrary library) {
+    ensure_init();
+    unsigned long long mod_u64 = 0;
+    CUresult r = ol_cuLibraryGetModule(&mod_u64,
+                                        (unsigned long long)(uintptr_t)library);
+    if (r == CUDA_SUCCESS && pMod) {
+        *pMod = (CUmodule)(uintptr_t)mod_u64;
+    }
+    return r;
+}
+
+CUresult hook_cuKernelGetFunction(CUfunction *pFunc, CUkernel kernel) {
+    ensure_init();
+    unsigned long long func_u64 = 0;
+    CUresult r = ol_cuKernelGetFunction(&func_u64,
+                                         (unsigned long long)(uintptr_t)kernel);
+    if (r == CUDA_SUCCESS && pFunc) {
+        *pFunc = (CUfunction)(uintptr_t)func_u64;
+    }
+    return r;
 }
 
 /* -----------------------------------------------------------------------

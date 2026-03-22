@@ -187,6 +187,13 @@ pub enum MessageType {
     CallbackChannelInit = 0x00D3,
     CallbackChannelAck = 0x00D4,
 
+    // Library API (CUDA 12+)
+    LibraryLoadData = 0x00D5,
+    LibraryUnload = 0x00D6,
+    LibraryGetKernel = 0x00D7,
+    LibraryGetModule = 0x00D8,
+    KernelGetFunction = 0x00D9,
+
     // Response (server -> client)
     Response = 0x00F0,
     Error = 0x00FF,
@@ -323,6 +330,11 @@ impl MessageType {
             0x00D2 => Some(Self::CallbackReady),
             0x00D3 => Some(Self::CallbackChannelInit),
             0x00D4 => Some(Self::CallbackChannelAck),
+            0x00D5 => Some(Self::LibraryLoadData),
+            0x00D6 => Some(Self::LibraryUnload),
+            0x00D7 => Some(Self::LibraryGetKernel),
+            0x00D8 => Some(Self::LibraryGetModule),
+            0x00D9 => Some(Self::KernelGetFunction),
             0x00F0 => Some(Self::Response),
             0x00FF => Some(Self::Error),
             _ => None,

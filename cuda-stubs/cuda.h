@@ -25,6 +25,8 @@ typedef unsigned long long CUdeviceptr;
 typedef struct CUmemPoolHandle_st *CUmemoryPool;
 typedef struct CUgraph_st *CUgraph;
 typedef struct CUgraphExec_st *CUgraphExec;
+typedef struct CUlib_st *CUlibrary;
+typedef struct CUkern_st *CUkernel;
 typedef uint64_t cuuint64_t;
 
 /* Occupancy callback type: maps block size to dynamic shared memory size */
