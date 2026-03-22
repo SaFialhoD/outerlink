@@ -112,6 +112,18 @@ pub trait GpuBackend: Send + Sync {
     /// `Ok(())` = complete, `Err(NotReady)` = still busy.
     fn stream_query(&self, stream: u64) -> Result<(), CuResult>;
 
+    /// Create a new CUDA stream with the given flags, priority, and owning context.
+    fn stream_create_with_priority(&self, flags: u32, priority: i32, ctx: u64) -> Result<u64, CuResult>;
+
+    /// Get the priority of a stream.
+    fn stream_get_priority(&self, stream: u64) -> Result<i32, CuResult>;
+
+    /// Get the creation flags of a stream.
+    fn stream_get_flags(&self, stream: u64) -> Result<u32, CuResult>;
+
+    /// Get the context associated with a stream.
+    fn stream_get_ctx(&self, stream: u64) -> Result<u64, CuResult>;
+
     // --- Event operations ---
 
     /// Create a new CUDA event with the given flags.
@@ -254,6 +266,9 @@ struct StubFunction {
 /// Metadata for a stub CUDA stream.
 struct StubStream {
     flags: u32,
+    priority: i32,
+    /// Context that was current when this stream was created.
+    ctx: u64,
 }
 
 /// Metadata for a stub CUDA event.
@@ -605,7 +620,7 @@ impl GpuBackend for StubGpuBackend {
         let mut state = self.state.lock().unwrap();
         let id = state.next_stream_id;
         state.next_stream_id += 1;
-        state.streams.insert(id, StubStream { flags });
+        state.streams.insert(id, StubStream { flags, priority: 0, ctx: 0 });
         Ok(id)
     }
 
@@ -632,6 +647,38 @@ impl GpuBackend for StubGpuBackend {
         }
         // Stub: all work is always complete.
         Ok(())
+    }
+
+    fn stream_create_with_priority(&self, flags: u32, priority: i32, ctx: u64) -> Result<u64, CuResult> {
+        let mut state = self.state.lock().unwrap();
+        let id = state.next_stream_id;
+        state.next_stream_id += 1;
+        state.streams.insert(id, StubStream { flags, priority, ctx });
+        Ok(id)
+    }
+
+    fn stream_get_priority(&self, stream: u64) -> Result<i32, CuResult> {
+        let state = self.state.lock().unwrap();
+        match state.streams.get(&stream) {
+            Some(s) => Ok(s.priority),
+            None => Err(CuResult::InvalidValue),
+        }
+    }
+
+    fn stream_get_flags(&self, stream: u64) -> Result<u32, CuResult> {
+        let state = self.state.lock().unwrap();
+        match state.streams.get(&stream) {
+            Some(s) => Ok(s.flags),
+            None => Err(CuResult::InvalidValue),
+        }
+    }
+
+    fn stream_get_ctx(&self, stream: u64) -> Result<u64, CuResult> {
+        let state = self.state.lock().unwrap();
+        match state.streams.get(&stream) {
+            Some(s) => Ok(s.ctx),
+            None => Err(CuResult::InvalidValue),
+        }
     }
 
     // --- Event operations ---
@@ -1913,5 +1960,81 @@ mod tests {
         assert_eq!(gpu.func_get_attribute(9999, func), Err(CuResult::InvalidValue));
         assert_eq!(gpu.func_get_attribute(-1, func), Err(CuResult::InvalidValue));
         assert_eq!(gpu.func_get_attribute(16, func), Err(CuResult::InvalidValue));
+    }
+
+    // ----- Stream priority/flags/ctx tests -----
+
+    #[test]
+    fn test_stream_create_with_priority() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        let stream = gpu.stream_create_with_priority(1, -1, ctx).unwrap();
+        assert_ne!(stream, 0);
+        // Verify metadata was stored correctly.
+        assert_eq!(gpu.stream_get_priority(stream).unwrap(), -1);
+        assert_eq!(gpu.stream_get_flags(stream).unwrap(), 1);
+        assert_eq!(gpu.stream_get_ctx(stream).unwrap(), ctx);
+    }
+
+    #[test]
+    fn test_stream_create_with_priority_zero() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create_with_priority(0, 0, 0).unwrap();
+        assert_ne!(stream, 0);
+        assert_eq!(gpu.stream_get_priority(stream).unwrap(), 0);
+        assert_eq!(gpu.stream_get_flags(stream).unwrap(), 0);
+        assert_eq!(gpu.stream_get_ctx(stream).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_stream_get_priority_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.stream_get_priority(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_stream_get_flags_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.stream_get_flags(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_stream_get_ctx_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.stream_get_ctx(0xBAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_stream_create_default_has_zero_priority_and_ctx() {
+        let gpu = StubGpuBackend::new();
+        // stream_create (the basic one) should set priority=0, ctx=0
+        let stream = gpu.stream_create(0x01).unwrap();
+        assert_eq!(gpu.stream_get_priority(stream).unwrap(), 0);
+        assert_eq!(gpu.stream_get_flags(stream).unwrap(), 0x01);
+        assert_eq!(gpu.stream_get_ctx(stream).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_stream_metadata_survives_across_queries() {
+        let gpu = StubGpuBackend::new();
+        let ctx = gpu.ctx_create(0, 0).unwrap();
+        let s1 = gpu.stream_create_with_priority(0x02, -5, ctx).unwrap();
+        let s2 = gpu.stream_create_with_priority(0x04, 3, ctx).unwrap();
+        // Each stream has independent metadata.
+        assert_eq!(gpu.stream_get_priority(s1).unwrap(), -5);
+        assert_eq!(gpu.stream_get_priority(s2).unwrap(), 3);
+        assert_eq!(gpu.stream_get_flags(s1).unwrap(), 0x02);
+        assert_eq!(gpu.stream_get_flags(s2).unwrap(), 0x04);
+    }
+
+    #[test]
+    fn test_stream_create_with_priority_then_destroy() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create_with_priority(0, -1, 0).unwrap();
+        assert!(gpu.stream_destroy(stream).is_ok());
+        // After destroy, queries should fail.
+        assert_eq!(gpu.stream_get_priority(stream), Err(CuResult::InvalidValue));
+        assert_eq!(gpu.stream_get_flags(stream), Err(CuResult::InvalidValue));
+        assert_eq!(gpu.stream_get_ctx(stream), Err(CuResult::InvalidValue));
     }
 }

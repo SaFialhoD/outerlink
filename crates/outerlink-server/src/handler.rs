@@ -557,6 +557,56 @@ pub fn handle_request(
             }
         }
 
+        MessageType::StreamCreateWithPriority => {
+            // [4B flags][4B priority] = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let flags = u32::from_le_bytes(payload[..4].try_into().unwrap());
+            let priority = i32::from_le_bytes(payload[4..8].try_into().unwrap());
+            let ctx = session.current_ctx();
+            match backend.stream_create_with_priority(flags, priority, ctx) {
+                Ok(handle) => {
+                    session.track_stream(handle);
+                    success_with(rid, &handle.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::StreamGetPriority => {
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let stream = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.stream_get_priority(stream) {
+                Ok(priority) => success_with(rid, &priority.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::StreamGetFlags => {
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let stream = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.stream_get_flags(stream) {
+                Ok(flags) => success_with(rid, &flags.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::StreamGetCtx => {
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let stream = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.stream_get_ctx(stream) {
+                Ok(ctx) => success_with(rid, &ctx.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         // --- Event operations ---
 
         MessageType::EventCreate => {
@@ -1461,6 +1511,155 @@ mod tests {
         let payload = 0xBADu64.to_le_bytes();
         let hdr = req(MessageType::StreamQuery, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr,&payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- StreamCreateWithPriority / StreamGetPriority / StreamGetFlags / StreamGetCtx -----
+
+    #[test]
+    fn test_stream_create_with_priority() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // flags
+        payload.extend_from_slice(&(-2i32).to_le_bytes()); // priority
+        let hdr = req(MessageType::StreamCreateWithPriority, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(handle, 0);
+    }
+
+    #[test]
+    fn test_stream_create_with_priority_tracks_session() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::StreamCreateWithPriority, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        // Destroy should succeed (tracked in session).
+        let payload = handle.to_le_bytes();
+        let hdr = req(MessageType::StreamDestroy, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_stream_create_with_priority_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 4]; // Only 4 bytes, need 8
+        let hdr = req(MessageType::StreamCreateWithPriority, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_stream_get_priority() {
+        let gpu = StubGpuBackend::new();
+        // Create a stream with priority -3.
+        let mut create_payload = Vec::new();
+        create_payload.extend_from_slice(&0u32.to_le_bytes());
+        create_payload.extend_from_slice(&(-3i32).to_le_bytes());
+        let hdr = req(MessageType::StreamCreateWithPriority, create_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &create_payload);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Query priority.
+        let payload = stream.to_le_bytes();
+        let hdr = req(MessageType::StreamGetPriority, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let priority = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(priority, -3);
+    }
+
+    #[test]
+    fn test_stream_get_priority_invalid() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xBADu64.to_le_bytes();
+        let hdr = req(MessageType::StreamGetPriority, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_stream_get_flags() {
+        let gpu = StubGpuBackend::new();
+        // Create stream with flags=0x05.
+        let mut create_payload = Vec::new();
+        create_payload.extend_from_slice(&0x05u32.to_le_bytes());
+        create_payload.extend_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::StreamCreateWithPriority, create_payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &create_payload);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Query flags.
+        let payload = stream.to_le_bytes();
+        let hdr = req(MessageType::StreamGetFlags, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let flags = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(flags, 0x05);
+    }
+
+    #[test]
+    fn test_stream_get_flags_invalid() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xBADu64.to_le_bytes();
+        let hdr = req(MessageType::StreamGetFlags, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_stream_get_ctx() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create a context and set it as current.
+        let ctx_payload = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&0u32.to_le_bytes()); // flags
+            p.extend_from_slice(&0i32.to_le_bytes()); // device
+            p
+        };
+        let hdr = req(MessageType::CtxCreate, ctx_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &ctx_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        // Set current context.
+        let set_payload = ctx.to_le_bytes();
+        let hdr = req(MessageType::CtxSetCurrent, set_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &set_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Create stream with priority -- should capture current ctx.
+        let mut create_payload = Vec::new();
+        create_payload.extend_from_slice(&0u32.to_le_bytes());
+        create_payload.extend_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::StreamCreateWithPriority, create_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &create_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Query ctx.
+        let payload = stream.to_le_bytes();
+        let hdr = req(MessageType::StreamGetCtx, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let got_ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(got_ctx, ctx);
+    }
+
+    #[test]
+    fn test_stream_get_ctx_invalid() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xBADu64.to_le_bytes();
+        let hdr = req(MessageType::StreamGetCtx, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 

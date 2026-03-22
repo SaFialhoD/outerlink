@@ -80,9 +80,13 @@ type FnCuFuncGetAttribute = unsafe extern "C" fn(pi: *mut i32, attrib: i32, hfun
 
 // Stream operations
 type FnCuStreamCreate = unsafe extern "C" fn(stream: *mut usize, flags: u32) -> i32;
+type FnCuStreamCreateWithPriority = unsafe extern "C" fn(stream: *mut usize, flags: u32, priority: i32) -> i32;
 type FnCuStreamDestroy = unsafe extern "C" fn(stream: usize) -> i32;
 type FnCuStreamSynchronize = unsafe extern "C" fn(stream: usize) -> i32;
 type FnCuStreamQuery = unsafe extern "C" fn(stream: usize) -> i32;
+type FnCuStreamGetPriority = unsafe extern "C" fn(stream: usize, priority: *mut i32) -> i32;
+type FnCuStreamGetFlags = unsafe extern "C" fn(stream: usize, flags: *mut u32) -> i32;
+type FnCuStreamGetCtx = unsafe extern "C" fn(stream: usize, pctx: *mut usize) -> i32;
 
 // Event operations
 type FnCuEventCreate = unsafe extern "C" fn(event: *mut usize, flags: u32) -> i32;
@@ -188,9 +192,13 @@ struct CudaApi {
     cu_func_get_attribute: Option<FnCuFuncGetAttribute>,
 
     cu_stream_create: Option<FnCuStreamCreate>,
+    cu_stream_create_with_priority: Option<FnCuStreamCreateWithPriority>,
     cu_stream_destroy: Option<FnCuStreamDestroy>,
     cu_stream_synchronize: Option<FnCuStreamSynchronize>,
     cu_stream_query: Option<FnCuStreamQuery>,
+    cu_stream_get_priority: Option<FnCuStreamGetPriority>,
+    cu_stream_get_flags: Option<FnCuStreamGetFlags>,
+    cu_stream_get_ctx: Option<FnCuStreamGetCtx>,
     cu_stream_wait_event: Option<FnCuStreamWaitEvent>,
 
     cu_event_create: Option<FnCuEventCreate>,
@@ -304,9 +312,13 @@ impl CudaApi {
             cu_func_get_attribute: load_sym!(lib, b"cuFuncGetAttribute\0"),
 
             cu_stream_create: load_sym!(lib, b"cuStreamCreate\0"),
+            cu_stream_create_with_priority: load_sym!(lib, b"cuStreamCreateWithPriority\0"),
             cu_stream_destroy: load_sym!(lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0"),
             cu_stream_synchronize: load_sym!(lib, b"cuStreamSynchronize\0"),
             cu_stream_query: load_sym!(lib, b"cuStreamQuery\0"),
+            cu_stream_get_priority: load_sym!(lib, b"cuStreamGetPriority\0"),
+            cu_stream_get_flags: load_sym!(lib, b"cuStreamGetFlags_v2\0", b"cuStreamGetFlags\0"),
+            cu_stream_get_ctx: load_sym!(lib, b"cuStreamGetCtx_v2\0", b"cuStreamGetCtx\0"),
             cu_stream_wait_event: load_sym!(lib, b"cuStreamWaitEvent\0"),
 
             cu_event_create: load_sym!(lib, b"cuEventCreate\0"),
@@ -798,6 +810,43 @@ impl GpuBackend for CudaGpuBackend {
             map_cuda_result(func(stream as usize))?;
         }
         Ok(())
+    }
+
+    fn stream_create_with_priority(&self, flags: u32, priority: i32, _ctx: u64) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_stream_create_with_priority)?;
+        let mut stream: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut stream, flags, priority))?;
+        }
+        tracing::trace!(stream, flags, priority, "CUDA stream created with priority");
+        Ok(stream as u64)
+    }
+
+    fn stream_get_priority(&self, stream: u64) -> Result<i32, CuResult> {
+        let func = require_fn(&self.api.cu_stream_get_priority)?;
+        let mut priority: i32 = 0;
+        unsafe {
+            map_cuda_result(func(stream as usize, &mut priority))?;
+        }
+        Ok(priority)
+    }
+
+    fn stream_get_flags(&self, stream: u64) -> Result<u32, CuResult> {
+        let func = require_fn(&self.api.cu_stream_get_flags)?;
+        let mut flags: u32 = 0;
+        unsafe {
+            map_cuda_result(func(stream as usize, &mut flags))?;
+        }
+        Ok(flags)
+    }
+
+    fn stream_get_ctx(&self, stream: u64) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_stream_get_ctx)?;
+        let mut ctx: usize = 0;
+        unsafe {
+            map_cuda_result(func(stream as usize, &mut ctx))?;
+        }
+        Ok(ctx as u64)
     }
 
     // --- Event operations ---

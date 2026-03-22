@@ -1547,6 +1547,156 @@ pub extern "C" fn ol_cuStreamQuery(stream: u64) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Stream priority/flags/ctx
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuStreamCreateWithPriority(
+    stream: *mut u64,
+    flags: u32,
+    priority: i32,
+) -> u32 {
+    let client = get_client();
+    if stream.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = [0u8; 8];
+        payload[0..4].copy_from_slice(&flags.to_le_bytes());
+        payload[4..8].copy_from_slice(&priority.to_le_bytes());
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::StreamCreateWithPriority, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.streams.insert(remote_stream);
+                unsafe { *stream = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: generate a local-only handle
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.streams.insert(stub_remote);
+    unsafe { *stream = synthetic };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuStreamGetPriority(stream: u64, priority: *mut i32) -> u32 {
+    let client = get_client();
+    if priority.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_stream = match client.handles.streams.to_remote(stream) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_stream.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::StreamGetPriority, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                let val = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                unsafe { *priority = val };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle, return 0 as default priority
+    if client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *priority = 0 };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuStreamGetFlags(stream: u64, flags: *mut u32) -> u32 {
+    let client = get_client();
+    if flags.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_stream = match client.handles.streams.to_remote(stream) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_stream.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::StreamGetFlags, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                let val = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+                unsafe { *flags = val };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle, return 0 as default flags
+    if client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *flags = 0 };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuStreamGetCtx(stream: u64, pctx: *mut u64) -> u32 {
+    let client = get_client();
+    if pctx.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_stream = match client.handles.streams.to_remote(stream) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_stream.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::StreamGetCtx, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                // Translate remote context handle back to local handle.
+                let local_ctx = if remote_ctx == 0 {
+                    0
+                } else {
+                    client.handles.contexts.to_local(remote_ctx).unwrap_or(0)
+                };
+                unsafe { *pctx = local_ctx };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle, return 0 (no context info in stub mode)
+    if client.handles.streams.to_remote(stream).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *pctx = 0 };
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // Additional event stubs
 // ---------------------------------------------------------------------------
 
@@ -2641,6 +2791,101 @@ mod tests {
     #[test]
     fn test_ol_cu_stream_synchronize_invalid() {
         assert_eq!(ol_cuStreamSynchronize(0xDEAD), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- Stream priority/flags/ctx tests --
+
+    #[test]
+    fn test_ol_cu_stream_create_with_priority() {
+        let mut stream: u64 = 0;
+        let result = ol_cuStreamCreateWithPriority(&mut stream, 0, -1);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_ne!(stream, 0);
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_create_with_priority_null_ptr() {
+        let result = ol_cuStreamCreateWithPriority(ptr::null_mut(), 0, 0);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_get_priority() {
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreateWithPriority(&mut stream, 0, 0), CUDA_SUCCESS);
+        let mut priority: i32 = -999;
+        assert_eq!(ol_cuStreamGetPriority(stream, &mut priority), CUDA_SUCCESS);
+        // In stub mode, priority is 0 (server not connected)
+        assert_eq!(priority, 0);
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_get_priority_null_ptr() {
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        let result = ol_cuStreamGetPriority(stream, ptr::null_mut());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_get_priority_invalid() {
+        let mut priority: i32 = 0;
+        assert_eq!(ol_cuStreamGetPriority(0xDEAD, &mut priority), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_get_flags() {
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        let mut flags: u32 = 999;
+        assert_eq!(ol_cuStreamGetFlags(stream, &mut flags), CUDA_SUCCESS);
+        // In stub mode, flags default to 0
+        assert_eq!(flags, 0);
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_get_flags_null_ptr() {
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        let result = ol_cuStreamGetFlags(stream, ptr::null_mut());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_get_flags_invalid() {
+        let mut flags: u32 = 0;
+        assert_eq!(ol_cuStreamGetFlags(0xDEAD, &mut flags), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_get_ctx() {
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        let mut ctx: u64 = 999;
+        assert_eq!(ol_cuStreamGetCtx(stream, &mut ctx), CUDA_SUCCESS);
+        // In stub mode, ctx is 0
+        assert_eq!(ctx, 0);
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_get_ctx_null_ptr() {
+        let mut stream: u64 = 0;
+        assert_eq!(ol_cuStreamCreate(&mut stream, 0), CUDA_SUCCESS);
+        let result = ol_cuStreamGetCtx(stream, ptr::null_mut());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuStreamDestroy(stream);
+    }
+
+    #[test]
+    fn test_ol_cu_stream_get_ctx_invalid() {
+        let mut ctx: u64 = 0;
+        assert_eq!(ol_cuStreamGetCtx(0xDEAD, &mut ctx), CUDA_ERROR_INVALID_VALUE);
     }
 
     // -- Event tests --

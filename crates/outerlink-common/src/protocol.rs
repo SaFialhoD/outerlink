@@ -84,6 +84,10 @@ pub enum MessageType {
     StreamSynchronize = 0x0062,
     StreamWaitEvent = 0x0063,
     StreamQuery = 0x0064,
+    StreamCreateWithPriority = 0x0065,
+    StreamGetPriority = 0x0066,
+    StreamGetFlags = 0x0067,
+    StreamGetCtx = 0x0068,
 
     // Event
     EventCreate = 0x0070,
@@ -149,6 +153,10 @@ impl MessageType {
             0x0062 => Some(Self::StreamSynchronize),
             0x0063 => Some(Self::StreamWaitEvent),
             0x0064 => Some(Self::StreamQuery),
+            0x0065 => Some(Self::StreamCreateWithPriority),
+            0x0066 => Some(Self::StreamGetPriority),
+            0x0067 => Some(Self::StreamGetFlags),
+            0x0068 => Some(Self::StreamGetCtx),
             0x0070 => Some(Self::EventCreate),
             0x0071 => Some(Self::EventDestroy),
             0x0072 => Some(Self::EventRecord),

@@ -83,9 +83,13 @@ extern CUresult ol_cuFuncGetAttribute(int *pi, int attrib, unsigned long long fu
 
 /* Stream management */
 extern CUresult ol_cuStreamCreate(unsigned long long *stream, unsigned int flags);
+extern CUresult ol_cuStreamCreateWithPriority(unsigned long long *stream, unsigned int flags, int priority);
 extern CUresult ol_cuStreamDestroy(unsigned long long stream);
 extern CUresult ol_cuStreamSynchronize(unsigned long long stream);
 extern CUresult ol_cuStreamQuery(unsigned long long stream);
+extern CUresult ol_cuStreamGetPriority(unsigned long long stream, int *priority);
+extern CUresult ol_cuStreamGetFlags(unsigned long long stream, unsigned int *flags);
+extern CUresult ol_cuStreamGetCtx(unsigned long long stream, unsigned long long *pctx);
 extern CUresult ol_cuStreamWaitEvent(unsigned long long stream, unsigned long long event, unsigned int flags);
 
 /* Event management */
@@ -182,9 +186,13 @@ CUresult hook_cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunctio
 
 /* Stream */
 CUresult hook_cuStreamCreate(CUstream *phStream, unsigned int Flags);
+CUresult hook_cuStreamCreateWithPriority(CUstream *phStream, unsigned int Flags, int priority);
 CUresult hook_cuStreamDestroy(CUstream hStream);
 CUresult hook_cuStreamSynchronize(CUstream hStream);
 CUresult hook_cuStreamQuery(CUstream hStream);
+CUresult hook_cuStreamGetPriority(CUstream hStream, int *priority);
+CUresult hook_cuStreamGetFlags(CUstream hStream, unsigned int *flags);
+CUresult hook_cuStreamGetCtx(CUstream hStream, CUcontext *pctx);
 CUresult hook_cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int Flags);
 
 /* Event */

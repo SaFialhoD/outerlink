@@ -149,10 +149,16 @@ static const hook_entry_t hook_table[] = {
 
     /* Stream */
     { "cuStreamCreate",          (void *)hook_cuStreamCreate },
+    { "cuStreamCreateWithPriority", (void *)hook_cuStreamCreateWithPriority },
     { "cuStreamDestroy",         (void *)hook_cuStreamDestroy },
     { "cuStreamDestroy_v2",      (void *)hook_cuStreamDestroy },
     { "cuStreamSynchronize",     (void *)hook_cuStreamSynchronize },
     { "cuStreamQuery",           (void *)hook_cuStreamQuery },
+    { "cuStreamGetPriority",     (void *)hook_cuStreamGetPriority },
+    { "cuStreamGetFlags",        (void *)hook_cuStreamGetFlags },
+    { "cuStreamGetFlags_v2",     (void *)hook_cuStreamGetFlags },
+    { "cuStreamGetCtx",          (void *)hook_cuStreamGetCtx },
+    { "cuStreamGetCtx_v2",       (void *)hook_cuStreamGetCtx },
     { "cuStreamWaitEvent",       (void *)hook_cuStreamWaitEvent },
 
     /* Event */
@@ -599,6 +605,16 @@ CUresult hook_cuStreamCreate(CUstream *phStream, unsigned int Flags) {
     return r;
 }
 
+CUresult hook_cuStreamCreateWithPriority(CUstream *phStream, unsigned int Flags, int priority) {
+    ensure_init();
+    unsigned long long stream_u64 = 0;
+    CUresult r = ol_cuStreamCreateWithPriority(&stream_u64, Flags, priority);
+    if (r == CUDA_SUCCESS && phStream) {
+        *phStream = (CUstream)(uintptr_t)stream_u64;
+    }
+    return r;
+}
+
 CUresult hook_cuStreamDestroy(CUstream hStream) {
     ensure_init();
     return ol_cuStreamDestroy((unsigned long long)(uintptr_t)hStream);
@@ -612,6 +628,26 @@ CUresult hook_cuStreamSynchronize(CUstream hStream) {
 CUresult hook_cuStreamQuery(CUstream hStream) {
     ensure_init();
     return ol_cuStreamQuery((unsigned long long)(uintptr_t)hStream);
+}
+
+CUresult hook_cuStreamGetPriority(CUstream hStream, int *priority) {
+    ensure_init();
+    return ol_cuStreamGetPriority((unsigned long long)(uintptr_t)hStream, priority);
+}
+
+CUresult hook_cuStreamGetFlags(CUstream hStream, unsigned int *flags) {
+    ensure_init();
+    return ol_cuStreamGetFlags((unsigned long long)(uintptr_t)hStream, flags);
+}
+
+CUresult hook_cuStreamGetCtx(CUstream hStream, CUcontext *pctx) {
+    ensure_init();
+    unsigned long long ctx_u64 = 0;
+    CUresult r = ol_cuStreamGetCtx((unsigned long long)(uintptr_t)hStream, &ctx_u64);
+    if (r == CUDA_SUCCESS && pctx) {
+        *pctx = (CUcontext)(uintptr_t)ctx_u64;
+    }
+    return r;
 }
 
 CUresult hook_cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int Flags) {
