@@ -138,6 +138,12 @@ static const hook_entry_t hook_table[] = {
     { "cuMemAllocHost",          (void *)hook_cuMemAllocHost },
     { "cuMemAllocHost_v2",      (void *)hook_cuMemAllocHost },
     { "cuMemFreeHost",           (void *)hook_cuMemFreeHost },
+    { "cuMemHostGetDevicePointer",   (void *)hook_cuMemHostGetDevicePointer },
+    { "cuMemHostGetDevicePointer_v2",(void *)hook_cuMemHostGetDevicePointer },
+    { "cuMemHostGetFlags",       (void *)hook_cuMemHostGetFlags },
+    { "cuMemHostRegister",       (void *)hook_cuMemHostRegister },
+    { "cuMemHostRegister_v2",   (void *)hook_cuMemHostRegister },
+    { "cuMemHostUnregister",     (void *)hook_cuMemHostUnregister },
     { "cuMemcpyHtoDAsync",       (void *)hook_cuMemcpyHtoDAsync_v2 },
     { "cuMemcpyHtoDAsync_v2",   (void *)hook_cuMemcpyHtoDAsync_v2 },
     { "cuMemcpyDtoHAsync",      (void *)hook_cuMemcpyDtoHAsync_v2 },
@@ -485,6 +491,26 @@ CUresult hook_cuMemAllocHost(void **pp, size_t bytesize) {
 CUresult hook_cuMemFreeHost(void *p) {
     ensure_init();
     return ol_cuMemFreeHost(p);
+}
+
+CUresult hook_cuMemHostGetDevicePointer(CUdeviceptr *pdptr, void *p, unsigned int Flags) {
+    ensure_init();
+    return ol_cuMemHostGetDevicePointer((unsigned long long *)pdptr, p, Flags);
+}
+
+CUresult hook_cuMemHostGetFlags(unsigned int *pFlags, void *p) {
+    ensure_init();
+    return ol_cuMemHostGetFlags(pFlags, p);
+}
+
+CUresult hook_cuMemHostRegister(void *p, size_t bytesize, unsigned int Flags) {
+    ensure_init();
+    return ol_cuMemHostRegister(p, bytesize, Flags);
+}
+
+CUresult hook_cuMemHostUnregister(void *p) {
+    ensure_init();
+    return ol_cuMemHostUnregister(p);
 }
 
 CUresult hook_cuMemGetInfo_v2(size_t *free, size_t *total) {

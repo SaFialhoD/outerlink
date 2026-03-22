@@ -1103,6 +1103,65 @@ pub fn handle_request(
             }
         }
 
+        // --- Host memory utility ---
+
+        MessageType::MemHostGetDevicePointer => {
+            // [8B hostPtr][4B flags] = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let host_ptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let flags = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            match backend.mem_host_get_device_pointer(host_ptr, flags) {
+                Ok(dev_ptr) => success_with(rid, &dev_ptr.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemHostGetFlags => {
+            // [8B hostPtr] = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let ptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.mem_host_get_flags(ptr) {
+                Ok(flags) => success_with(rid, &flags.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemHostRegister => {
+            // [8B hostPtr][8B bytesize][4B flags] = 20 bytes
+            if payload.len() < 20 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let ptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let size = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+            let flags = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+            match backend.mem_host_register(ptr, size, flags) {
+                Ok(()) => {
+                    session.track_registered_host(ptr);
+                    result_only(rid, CuResult::Success)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::MemHostUnregister => {
+            // [8B hostPtr] = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let ptr = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.mem_host_unregister(ptr) {
+                Ok(()) => {
+                    session.untrack_registered_host(ptr);
+                    result_only(rid, CuResult::Success)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         // --- Pointer attribute queries ---
 
         MessageType::PointerGetAttribute => {
@@ -3749,5 +3808,219 @@ mod tests {
         let hdr = req(MessageType::PointerGetAttributes, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr, &payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- MemHostGetDevicePointer handler tests -----
+
+    #[test]
+    fn test_mem_host_get_device_pointer_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Allocate host memory first.
+        let alloc_payload = (4096u64).to_le_bytes();
+        let hdr = req(MessageType::MemAllocHost, alloc_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &alloc_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let host_ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Get device pointer (UVA: same as host pointer).
+        let mut payload = host_ptr.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::MemHostGetDevicePointer, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let dev_ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(dev_ptr, host_ptr);
+    }
+
+    #[test]
+    fn test_mem_host_get_device_pointer_unknown() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 0xBADu64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::MemHostGetDevicePointer, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_mem_host_get_device_pointer_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 4]; // too short (need 12)
+        let hdr = req(MessageType::MemHostGetDevicePointer, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- MemHostGetFlags handler tests -----
+
+    #[test]
+    fn test_mem_host_get_flags_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Allocate host memory.
+        let alloc_payload = (1024u64).to_le_bytes();
+        let hdr = req(MessageType::MemAllocHost, alloc_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &alloc_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let host_ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Get flags (should be 0 for cuMemAllocHost).
+        let payload = host_ptr.to_le_bytes();
+        let hdr = req(MessageType::MemHostGetFlags, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let flags = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn test_mem_host_get_flags_unknown() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xBADu64.to_le_bytes();
+        let hdr = req(MessageType::MemHostGetFlags, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_mem_host_get_flags_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 4]; // too short (need 8)
+        let hdr = req(MessageType::MemHostGetFlags, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- MemHostRegister / MemHostUnregister handler tests -----
+
+    #[test]
+    fn test_mem_host_register_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Register host memory.
+        let mut payload = 0x1000u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&4096u64.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::MemHostRegister, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.registered_host_count(), 1);
+    }
+
+    #[test]
+    fn test_mem_host_register_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 10]; // too short (need 20)
+        let hdr = req(MessageType::MemHostRegister, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_mem_host_unregister_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Register first.
+        let mut reg_payload = 0x2000u64.to_le_bytes().to_vec();
+        reg_payload.extend_from_slice(&2048u64.to_le_bytes());
+        reg_payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::MemHostRegister, reg_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &reg_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Unregister.
+        let payload = 0x2000u64.to_le_bytes();
+        let hdr = req(MessageType::MemHostUnregister, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.registered_host_count(), 0);
+    }
+
+    #[test]
+    fn test_mem_host_unregister_not_registered() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xBADu64.to_le_bytes();
+        let hdr = req(MessageType::MemHostUnregister, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_mem_host_unregister_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 4]; // too short (need 8)
+        let hdr = req(MessageType::MemHostUnregister, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_mem_host_get_flags_after_register() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Register with flags = 0x03.
+        let mut reg_payload = 0x3000u64.to_le_bytes().to_vec();
+        reg_payload.extend_from_slice(&512u64.to_le_bytes());
+        reg_payload.extend_from_slice(&0x03u32.to_le_bytes());
+        let hdr = req(MessageType::MemHostRegister, reg_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &reg_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Get flags should return 0x03.
+        let payload = 0x3000u64.to_le_bytes();
+        let hdr = req(MessageType::MemHostGetFlags, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let flags = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(flags, 0x03);
+    }
+
+    #[test]
+    fn test_handler_tracks_registered_host() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Register.
+        let mut payload = 0x4000u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&1024u64.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::MemHostRegister, payload.len() as u32);
+        dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(session.registered_host_count(), 1);
+
+        // Unregister.
+        let payload = 0x4000u64.to_le_bytes();
+        let hdr = req(MessageType::MemHostUnregister, payload.len() as u32);
+        dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(session.registered_host_count(), 0);
+    }
+
+    #[test]
+    fn test_mem_host_get_device_pointer_registered() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Register host memory.
+        let mut reg_payload = 0x5000u64.to_le_bytes().to_vec();
+        reg_payload.extend_from_slice(&4096u64.to_le_bytes());
+        reg_payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::MemHostRegister, reg_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &reg_payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Get device pointer for registered memory (UVA: same).
+        let mut payload = 0x5000u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::MemHostGetDevicePointer, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let dev_ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(dev_ptr, 0x5000);
     }
 }
