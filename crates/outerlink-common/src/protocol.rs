@@ -50,6 +50,11 @@ pub enum MessageType {
     DevicePrimaryCtxGetState = 0x0028,
     DevicePrimaryCtxSetFlags = 0x0029,
     DevicePrimaryCtxReset = 0x002A,
+    CtxPushCurrent = 0x002B,
+    CtxPopCurrent = 0x002C,
+    CtxGetApiVersion = 0x002D,
+    CtxGetLimit = 0x002E,
+    CtxSetLimit = 0x002F,
 
     // Memory
     MemAlloc = 0x0030,
@@ -97,6 +102,10 @@ pub enum MessageType {
     EventElapsedTime = 0x0074,
     EventQuery = 0x0075,
 
+    // Context (extended)
+    CtxGetStreamPriorityRange = 0x00A0,
+    CtxGetFlags = 0x00A1,
+
     // Response (server -> client)
     Response = 0x00F0,
     Error = 0x00FF,
@@ -127,6 +136,11 @@ impl MessageType {
             0x0028 => Some(Self::DevicePrimaryCtxGetState),
             0x0029 => Some(Self::DevicePrimaryCtxSetFlags),
             0x002A => Some(Self::DevicePrimaryCtxReset),
+            0x002B => Some(Self::CtxPushCurrent),
+            0x002C => Some(Self::CtxPopCurrent),
+            0x002D => Some(Self::CtxGetApiVersion),
+            0x002E => Some(Self::CtxGetLimit),
+            0x002F => Some(Self::CtxSetLimit),
             0x0030 => Some(Self::MemAlloc),
             0x0031 => Some(Self::MemFree),
             0x0032 => Some(Self::MemcpyHtoD),
@@ -163,6 +177,8 @@ impl MessageType {
             0x0073 => Some(Self::EventSynchronize),
             0x0074 => Some(Self::EventElapsedTime),
             0x0075 => Some(Self::EventQuery),
+            0x00A0 => Some(Self::CtxGetStreamPriorityRange),
+            0x00A1 => Some(Self::CtxGetFlags),
             0x00F0 => Some(Self::Response),
             0x00FF => Some(Self::Error),
             _ => None,

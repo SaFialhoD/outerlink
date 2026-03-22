@@ -102,6 +102,15 @@ static const hook_entry_t hook_table[] = {
     { "cuCtxGetCurrent",         (void *)hook_cuCtxGetCurrent },
     { "cuCtxGetDevice",          (void *)hook_cuCtxGetDevice },
     { "cuCtxSynchronize",        (void *)hook_cuCtxSynchronize },
+    { "cuCtxPushCurrent",        (void *)hook_cuCtxPushCurrent_v2 },
+    { "cuCtxPushCurrent_v2",     (void *)hook_cuCtxPushCurrent_v2 },
+    { "cuCtxPopCurrent",         (void *)hook_cuCtxPopCurrent_v2 },
+    { "cuCtxPopCurrent_v2",      (void *)hook_cuCtxPopCurrent_v2 },
+    { "cuCtxGetApiVersion",      (void *)hook_cuCtxGetApiVersion },
+    { "cuCtxGetLimit",           (void *)hook_cuCtxGetLimit },
+    { "cuCtxSetLimit",           (void *)hook_cuCtxSetLimit },
+    { "cuCtxGetStreamPriorityRange", (void *)hook_cuCtxGetStreamPriorityRange },
+    { "cuCtxGetFlags",           (void *)hook_cuCtxGetFlags },
 
     /* Primary context */
     { "cuDevicePrimaryCtxRetain",       (void *)hook_cuDevicePrimaryCtxRetain },
@@ -325,6 +334,48 @@ CUresult hook_cuCtxGetDevice(CUdevice *dev) {
 CUresult hook_cuCtxSynchronize(void) {
     ensure_init();
     return ol_cuCtxSynchronize();
+}
+
+CUresult hook_cuCtxPushCurrent_v2(CUcontext ctx) {
+    ensure_init();
+    return ol_cuCtxPushCurrent_v2((unsigned long long)(uintptr_t)ctx);
+}
+
+CUresult hook_cuCtxPopCurrent_v2(CUcontext *pctx) {
+    ensure_init();
+    unsigned long long ctx_u64 = 0;
+    CUresult r = ol_cuCtxPopCurrent_v2(&ctx_u64);
+    if (r == CUDA_SUCCESS && pctx) {
+        *pctx = (CUcontext)(uintptr_t)ctx_u64;
+    }
+    return r;
+}
+
+CUresult hook_cuCtxGetApiVersion(CUcontext ctx, unsigned int *version) {
+    ensure_init();
+    return ol_cuCtxGetApiVersion((unsigned long long)(uintptr_t)ctx, version);
+}
+
+CUresult hook_cuCtxGetLimit(size_t *pvalue, int limit) {
+    ensure_init();
+    /* CUDA uses size_t for limit values; Rust FFI uses u64 which is the same
+     * width on 64-bit. Cast through the pointer type. */
+    return ol_cuCtxGetLimit((unsigned long long *)pvalue, (unsigned int)limit);
+}
+
+CUresult hook_cuCtxSetLimit(int limit, size_t value) {
+    ensure_init();
+    return ol_cuCtxSetLimit((unsigned int)limit, (unsigned long long)value);
+}
+
+CUresult hook_cuCtxGetStreamPriorityRange(int *leastPriority, int *greatestPriority) {
+    ensure_init();
+    return ol_cuCtxGetStreamPriorityRange(leastPriority, greatestPriority);
+}
+
+CUresult hook_cuCtxGetFlags(unsigned int *flags) {
+    ensure_init();
+    return ol_cuCtxGetFlags(flags);
 }
 
 /* -- Primary context -- */

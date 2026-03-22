@@ -551,6 +551,187 @@ pub extern "C" fn ol_cuCtxSynchronize() -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Context stack & query operations
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxPushCurrent_v2(ctx: u64) -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let remote_ctx = match client.handles.contexts.to_remote(ctx) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_CONTEXT,
+        };
+        let payload = remote_ctx.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxPushCurrent, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: validate handle exists
+    match client.handles.contexts.to_remote(ctx) {
+        Some(_) => CUDA_SUCCESS,
+        None => CUDA_ERROR_INVALID_CONTEXT,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxPopCurrent_v2(pctx: *mut u64) -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxPopCurrent, &[]) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 && !pctx.is_null() {
+                let remote_ctx = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let local = client.handles.contexts.to_local(remote_ctx).unwrap_or(0);
+                unsafe { *pctx = local };
+            }
+            return CUDA_SUCCESS;
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: return null context
+    if !pctx.is_null() {
+        unsafe { *pctx = 0 };
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxGetApiVersion(ctx: u64, version: *mut u32) -> u32 {
+    let client = get_client();
+    if version.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_ctx = match client.handles.contexts.to_remote(ctx) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_CONTEXT,
+        };
+        let payload = remote_ctx.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxGetApiVersion, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe { *version = u32::from_le_bytes(resp[4..8].try_into().unwrap()) };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: return CUDA 12.0
+    unsafe { *version = 12000 };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxGetLimit(pvalue: *mut u64, limit: u32) -> u32 {
+    let client = get_client();
+    if pvalue.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let payload = limit.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxGetLimit, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                unsafe { *pvalue = u64::from_le_bytes(resp[4..12].try_into().unwrap()) };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: return reasonable defaults
+    let default = match limit {
+        0x00 => 1024,       // CU_LIMIT_STACK_SIZE
+        0x01 => 1_048_576,  // CU_LIMIT_PRINTF_FIFO_SIZE
+        0x02 => 8_388_608,  // CU_LIMIT_MALLOC_HEAP_SIZE
+        _ => return CUDA_ERROR_INVALID_VALUE,
+    };
+    unsafe { *pvalue = default };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxSetLimit(limit: u32, value: u64) -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = [0u8; 12];
+        payload[..4].copy_from_slice(&limit.to_le_bytes());
+        payload[4..12].copy_from_slice(&value.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxSetLimit, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: accept silently
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxGetStreamPriorityRange(least: *mut i32, greatest: *mut i32) -> u32 {
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxGetStreamPriorityRange, &[]) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                if !least.is_null() {
+                    unsafe { *least = i32::from_le_bytes(resp[4..8].try_into().unwrap()) };
+                }
+                if !greatest.is_null() {
+                    unsafe { *greatest = i32::from_le_bytes(resp[8..12].try_into().unwrap()) };
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: standard NVIDIA range
+    if !least.is_null() {
+        unsafe { *least = 0 };
+    }
+    if !greatest.is_null() {
+        unsafe { *greatest = -1 };
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxGetFlags(flags: *mut u32) -> u32 {
+    let client = get_client();
+    if flags.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxGetFlags, &[]) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe { *flags = u32::from_le_bytes(resp[4..8].try_into().unwrap()) };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: default flags
+    unsafe { *flags = 0 };
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // Primary context management
 // ---------------------------------------------------------------------------
 
@@ -3465,5 +3646,114 @@ mod tests {
         let result = ol_cuFuncGetAttribute(&mut val, 9999, func);
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
         let _ = ol_cuModuleUnload(module);
+    }
+
+    // --- Context push/pop tests ---
+
+    #[test]
+    fn test_ol_cu_ctx_push_current_stub() {
+        let mut ctx: u64 = 0;
+        assert_eq!(ol_cuCtxCreate_v2(&mut ctx, 0, 0), CUDA_SUCCESS);
+        assert_ne!(ctx, 0);
+        let result = ol_cuCtxPushCurrent_v2(ctx);
+        assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuCtxDestroy_v2(ctx);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_push_invalid() {
+        let result = ol_cuCtxPushCurrent_v2(0xDEAD_BEEF);
+        assert_eq!(result, CUDA_ERROR_INVALID_CONTEXT);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_pop_current_stub() {
+        let mut popped: u64 = 0xFFFF;
+        let result = ol_cuCtxPopCurrent_v2(&mut popped);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(popped, 0);
+    }
+
+    // --- Context API version tests ---
+
+    #[test]
+    fn test_ol_cu_ctx_get_api_version_stub() {
+        let mut ctx: u64 = 0;
+        assert_eq!(ol_cuCtxCreate_v2(&mut ctx, 0, 0), CUDA_SUCCESS);
+        let mut version: u32 = 0;
+        let result = ol_cuCtxGetApiVersion(ctx, &mut version);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(version, 12000);
+        let _ = ol_cuCtxDestroy_v2(ctx);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_get_api_version_null_ptr() {
+        let result = ol_cuCtxGetApiVersion(1, ptr::null_mut());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // --- Context limit tests ---
+
+    #[test]
+    fn test_ol_cu_ctx_get_limit_stack_size() {
+        let mut value: u64 = 0;
+        let result = ol_cuCtxGetLimit(&mut value, 0x00);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(value, 1024);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_get_limit_null_ptr() {
+        let result = ol_cuCtxGetLimit(ptr::null_mut(), 0x00);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_get_limit_unknown() {
+        let mut value: u64 = 0;
+        let result = ol_cuCtxGetLimit(&mut value, 0xFF);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_set_limit() {
+        let result = ol_cuCtxSetLimit(0x00, 4096);
+        assert_eq!(result, CUDA_SUCCESS);
+    }
+
+    // --- Stream priority range tests ---
+
+    #[test]
+    fn test_ol_cu_ctx_get_stream_priority_range() {
+        let mut least: i32 = -99;
+        let mut greatest: i32 = 99;
+        let result = ol_cuCtxGetStreamPriorityRange(&mut least, &mut greatest);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(least, 0);
+        assert_eq!(greatest, -1);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_get_stream_priority_range_null_ptrs() {
+        // Both null is valid -- CUDA allows querying one at a time
+        let result = ol_cuCtxGetStreamPriorityRange(ptr::null_mut(), ptr::null_mut());
+        assert_eq!(result, CUDA_SUCCESS);
+    }
+
+    // --- Context flags tests ---
+
+    #[test]
+    fn test_ol_cu_ctx_get_flags() {
+        let mut flags: u32 = 0xFF;
+        let result = ol_cuCtxGetFlags(&mut flags);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_get_flags_null_ptr() {
+        let result = ol_cuCtxGetFlags(ptr::null_mut());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
     }
 }

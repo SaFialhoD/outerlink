@@ -44,6 +44,13 @@ extern CUresult ol_cuCtxSetCurrent(unsigned long long ctx);
 extern CUresult ol_cuCtxGetCurrent(unsigned long long *pctx);
 extern CUresult ol_cuCtxGetDevice(int *dev);
 extern CUresult ol_cuCtxSynchronize(void);
+extern CUresult ol_cuCtxPushCurrent_v2(unsigned long long ctx);
+extern CUresult ol_cuCtxPopCurrent_v2(unsigned long long *pctx);
+extern CUresult ol_cuCtxGetApiVersion(unsigned long long ctx, unsigned int *version);
+extern CUresult ol_cuCtxGetLimit(unsigned long long *pvalue, unsigned int limit);
+extern CUresult ol_cuCtxSetLimit(unsigned int limit, unsigned long long value);
+extern CUresult ol_cuCtxGetStreamPriorityRange(int *leastPriority, int *greatestPriority);
+extern CUresult ol_cuCtxGetFlags(unsigned int *flags);
 
 /* Primary context management */
 extern CUresult ol_cuDevicePrimaryCtxRetain(unsigned long long *pctx, int dev);
@@ -147,6 +154,13 @@ CUresult hook_cuCtxSetCurrent(CUcontext ctx);
 CUresult hook_cuCtxGetCurrent(CUcontext *pctx);
 CUresult hook_cuCtxGetDevice(CUdevice *dev);
 CUresult hook_cuCtxSynchronize(void);
+CUresult hook_cuCtxPushCurrent_v2(CUcontext ctx);
+CUresult hook_cuCtxPopCurrent_v2(CUcontext *pctx);
+CUresult hook_cuCtxGetApiVersion(CUcontext ctx, unsigned int *version);
+CUresult hook_cuCtxGetLimit(size_t *pvalue, int limit);
+CUresult hook_cuCtxSetLimit(int limit, size_t value);
+CUresult hook_cuCtxGetStreamPriorityRange(int *leastPriority, int *greatestPriority);
+CUresult hook_cuCtxGetFlags(unsigned int *flags);
 
 /* Primary context */
 CUresult hook_cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev);
