@@ -51,6 +51,10 @@ extern CUresult ol_cuCtxGetLimit(unsigned long long *pvalue, unsigned int limit)
 extern CUresult ol_cuCtxSetLimit(unsigned int limit, unsigned long long value);
 extern CUresult ol_cuCtxGetStreamPriorityRange(int *leastPriority, int *greatestPriority);
 extern CUresult ol_cuCtxGetFlags(unsigned int *flags);
+extern CUresult ol_cuCtxGetCacheConfig(unsigned int *pconfig);
+extern CUresult ol_cuCtxSetCacheConfig(unsigned int config);
+extern CUresult ol_cuCtxGetSharedMemConfig(unsigned int *pConfig);
+extern CUresult ol_cuCtxSetSharedMemConfig(unsigned int config);
 
 /* Primary context management */
 extern CUresult ol_cuDevicePrimaryCtxRetain(unsigned long long *pctx, int dev);
@@ -102,6 +106,8 @@ extern CUresult ol_cuModuleGetFunction(unsigned long long *func, unsigned long l
 extern CUresult ol_cuModuleGetGlobal(unsigned long long *dptr, size_t *size, unsigned long long module, const unsigned char *name, size_t name_len);
 extern CUresult ol_cuFuncGetAttribute(int *pi, int attrib, unsigned long long func);
 extern CUresult ol_cuFuncSetAttribute(unsigned long long func, int attrib, int value);
+extern CUresult ol_cuFuncSetCacheConfig(unsigned long long func, unsigned int config);
+extern CUresult ol_cuFuncSetSharedMemConfig(unsigned long long func, unsigned int config);
 extern CUresult ol_cuMemGetAddressRange_v2(unsigned long long *pbase, size_t *psize, unsigned long long dptr);
 
 /* Pointer attributes */
@@ -187,6 +193,10 @@ CUresult hook_cuCtxGetLimit(size_t *pvalue, int limit);
 CUresult hook_cuCtxSetLimit(int limit, size_t value);
 CUresult hook_cuCtxGetStreamPriorityRange(int *leastPriority, int *greatestPriority);
 CUresult hook_cuCtxGetFlags(unsigned int *flags);
+CUresult hook_cuCtxGetCacheConfig(int *pconfig);
+CUresult hook_cuCtxSetCacheConfig(int config);
+CUresult hook_cuCtxGetSharedMemConfig(int *pConfig);
+CUresult hook_cuCtxSetSharedMemConfig(int config);
 
 /* Primary context */
 CUresult hook_cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev);
@@ -237,6 +247,8 @@ CUresult hook_cuModuleUnload(CUmodule hmod);
 CUresult hook_cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod, const char *name);
 CUresult hook_cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes, CUmodule hmod, const char *name);
 CUresult hook_cuFuncGetAttribute(int *pi, CUfunction_attribute attrib, CUfunction hfunc);
+CUresult hook_cuFuncSetCacheConfig(CUfunction hfunc, int config);
+CUresult hook_cuFuncSetSharedMemConfig(CUfunction hfunc, int config);
 
 /* Pointer attributes */
 CUresult hook_cuPointerGetAttribute(void *data, CUpointer_attribute attribute, CUdeviceptr devPtr);

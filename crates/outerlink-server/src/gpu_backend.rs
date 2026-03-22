@@ -327,6 +327,24 @@ pub trait GpuBackend: Send + Sync {
     /// Get the flags of the current context.
     fn ctx_get_flags(&self, ctx: u64) -> Result<u32, CuResult>;
 
+    /// Get the preferred cache configuration for the current context.
+    fn ctx_get_cache_config(&self) -> Result<u32, CuResult>;
+
+    /// Set the preferred cache configuration for the current context.
+    fn ctx_set_cache_config(&self, config: u32) -> Result<(), CuResult>;
+
+    /// Get the shared memory configuration (bank size) for the current context.
+    fn ctx_get_shared_mem_config(&self) -> Result<u32, CuResult>;
+
+    /// Set the shared memory configuration (bank size) for the current context.
+    fn ctx_set_shared_mem_config(&self, config: u32) -> Result<(), CuResult>;
+
+    /// Set the preferred cache configuration for a kernel function.
+    fn func_set_cache_config(&self, func: u64, config: u32) -> Result<(), CuResult>;
+
+    /// Set the shared memory configuration for a kernel function.
+    fn func_set_shared_mem_config(&self, func: u64, config: u32) -> Result<(), CuResult>;
+
     // --- Lifecycle ---
 
     /// Clean up all GPU resources held by this backend.
@@ -462,6 +480,10 @@ struct StubState {
     context_limits: HashMap<u32, u64>,
     /// Peer contexts currently enabled for P2P access.
     peer_access: HashSet<u64>,
+    /// Preferred cache configuration (CU_FUNC_CACHE_PREFER_*).
+    cache_config: u32,
+    /// Shared memory configuration (CU_SHARED_MEM_CONFIG_*_BANK_SIZE).
+    shared_mem_config: u32,
 }
 
 impl StubState {
@@ -515,6 +537,8 @@ impl StubGpuBackend {
                     m
                 },
                 peer_access: HashSet::new(),
+                cache_config: 0,        // CU_FUNC_CACHE_PREFER_NONE
+                shared_mem_config: 0,    // CU_SHARED_MEM_CONFIG_DEFAULT_BANK_SIZE
             }),
         }
     }
@@ -1381,6 +1405,61 @@ impl GpuBackend for StubGpuBackend {
             Some(c) => Ok(c.flags),
             None => Err(CuResult::InvalidContext),
         }
+    }
+
+    fn ctx_get_cache_config(&self) -> Result<u32, CuResult> {
+        let state = self.state.lock().unwrap();
+        Ok(state.cache_config)
+    }
+
+    fn ctx_set_cache_config(&self, config: u32) -> Result<(), CuResult> {
+        if config > 0x03 {
+            return Err(CuResult::InvalidValue);
+        }
+        let mut state = self.state.lock().unwrap();
+        state.cache_config = config;
+        Ok(())
+    }
+
+    fn ctx_get_shared_mem_config(&self) -> Result<u32, CuResult> {
+        let state = self.state.lock().unwrap();
+        Ok(state.shared_mem_config)
+    }
+
+    fn ctx_set_shared_mem_config(&self, config: u32) -> Result<(), CuResult> {
+        if config > 0x02 {
+            return Err(CuResult::InvalidValue);
+        }
+        let mut state = self.state.lock().unwrap();
+        state.shared_mem_config = config;
+        Ok(())
+    }
+
+    fn func_set_cache_config(&self, func: u64, config: u32) -> Result<(), CuResult> {
+        if config > 0x03 {
+            return Err(CuResult::InvalidValue);
+        }
+        let mut state = self.state.lock().unwrap();
+        let stub_fn = match state.functions.get_mut(&func) {
+            Some(f) => f,
+            None => return Err(CuResult::InvalidValue),
+        };
+        // Store as a negative attribute key to avoid collision with CUfunction_attribute
+        stub_fn.attributes.insert(-1, config as i32); // -1 = cache config
+        Ok(())
+    }
+
+    fn func_set_shared_mem_config(&self, func: u64, config: u32) -> Result<(), CuResult> {
+        if config > 0x02 {
+            return Err(CuResult::InvalidValue);
+        }
+        let mut state = self.state.lock().unwrap();
+        let stub_fn = match state.functions.get_mut(&func) {
+            Some(f) => f,
+            None => return Err(CuResult::InvalidValue),
+        };
+        stub_fn.attributes.insert(-2, config as i32); // -2 = shared mem config
+        Ok(())
     }
 
     fn shutdown(&self) {
@@ -3218,5 +3297,101 @@ mod tests {
         // HOST_POINTER returns the pointer itself
         assert_eq!(gpu.pointer_get_attribute(4, 0x6000), Ok(0x6000));
         let _ = gpu.mem_host_unregister(0x6000);
+    }
+
+    // --- Cache config tests ---
+
+    #[test]
+    fn test_ctx_get_cache_config_default() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_get_cache_config().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_ctx_set_cache_config() {
+        let gpu = StubGpuBackend::new();
+        gpu.ctx_set_cache_config(0x01).unwrap(); // PREFER_SHARED
+        assert_eq!(gpu.ctx_get_cache_config().unwrap(), 0x01);
+        gpu.ctx_set_cache_config(0x02).unwrap(); // PREFER_L1
+        assert_eq!(gpu.ctx_get_cache_config().unwrap(), 0x02);
+        gpu.ctx_set_cache_config(0x03).unwrap(); // PREFER_EQUAL
+        assert_eq!(gpu.ctx_get_cache_config().unwrap(), 0x03);
+    }
+
+    #[test]
+    fn test_ctx_set_cache_config_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_set_cache_config(0x04), Err(CuResult::InvalidValue));
+    }
+
+    // --- Shared mem config tests ---
+
+    #[test]
+    fn test_ctx_get_shared_mem_config_default() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_get_shared_mem_config().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_ctx_set_shared_mem_config() {
+        let gpu = StubGpuBackend::new();
+        gpu.ctx_set_shared_mem_config(0x01).unwrap(); // FOUR_BYTE_BANK_SIZE
+        assert_eq!(gpu.ctx_get_shared_mem_config().unwrap(), 0x01);
+        gpu.ctx_set_shared_mem_config(0x02).unwrap(); // EIGHT_BYTE_BANK_SIZE
+        assert_eq!(gpu.ctx_get_shared_mem_config().unwrap(), 0x02);
+    }
+
+    #[test]
+    fn test_ctx_set_shared_mem_config_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.ctx_set_shared_mem_config(0x03), Err(CuResult::InvalidValue));
+    }
+
+    // --- FuncSetCacheConfig tests ---
+
+    #[test]
+    fn test_func_set_cache_config() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "my_kernel").unwrap();
+        gpu.func_set_cache_config(func, 0x02).unwrap(); // PREFER_L1
+    }
+
+    #[test]
+    fn test_func_set_cache_config_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.func_set_cache_config(0xDEAD, 0x01), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_func_set_cache_config_invalid_config() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "my_kernel").unwrap();
+        assert_eq!(gpu.func_set_cache_config(func, 0x04), Err(CuResult::InvalidValue));
+    }
+
+    // --- FuncSetSharedMemConfig tests ---
+
+    #[test]
+    fn test_func_set_shared_mem_config() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "my_kernel").unwrap();
+        gpu.func_set_shared_mem_config(func, 0x01).unwrap(); // FOUR_BYTE
+    }
+
+    #[test]
+    fn test_func_set_shared_mem_config_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.func_set_shared_mem_config(0xDEAD, 0x01), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_func_set_shared_mem_config_invalid_config() {
+        let gpu = StubGpuBackend::new();
+        let module = gpu.module_load_data(b"ptx").unwrap();
+        let func = gpu.module_get_function(module, "my_kernel").unwrap();
+        assert_eq!(gpu.func_set_shared_mem_config(func, 0x03), Err(CuResult::InvalidValue));
     }
 }

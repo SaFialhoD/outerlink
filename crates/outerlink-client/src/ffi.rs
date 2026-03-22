@@ -764,6 +764,142 @@ pub extern "C" fn ol_cuCtxGetFlags(flags: *mut u32) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Cache and shared memory configuration
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxGetCacheConfig(pconfig: *mut u32) -> u32 {
+    let client = get_client();
+    if pconfig.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxGetCacheConfig, &[]) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe { *pconfig = u32::from_le_bytes(resp[4..8].try_into().unwrap()) };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: default is PREFER_NONE (0)
+    unsafe { *pconfig = 0 };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxSetCacheConfig(config: u32) -> u32 {
+    let client = get_client();
+    if config > 0x03 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let payload = config.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxSetCacheConfig, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: accept silently
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxGetSharedMemConfig(pconfig: *mut u32) -> u32 {
+    let client = get_client();
+    if pconfig.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxGetSharedMemConfig, &[]) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 {
+                unsafe { *pconfig = u32::from_le_bytes(resp[4..8].try_into().unwrap()) };
+                return CUDA_SUCCESS;
+            }
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: default is DEFAULT_BANK_SIZE (0)
+    unsafe { *pconfig = 0 };
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuCtxSetSharedMemConfig(config: u32) -> u32 {
+    let client = get_client();
+    if config > 0x02 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let payload = config.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::CtxSetSharedMemConfig, &payload) {
+            return parse_result(&resp);
+        }
+        // Transport error -- fall through to stub
+    }
+    // Stub: accept silently
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuFuncSetCacheConfig(func: u64, config: u32) -> u32 {
+    let client = get_client();
+    if config > 0x03 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = [0u8; 12];
+        payload[0..8].copy_from_slice(&remote_func.to_le_bytes());
+        payload[8..12].copy_from_slice(&config.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::FuncSetCacheConfig, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    // Stub fallback: validate function handle exists
+    if client.handles.functions.to_remote(func).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn ol_cuFuncSetSharedMemConfig(func: u64, config: u32) -> u32 {
+    let client = get_client();
+    if config > 0x02 {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = [0u8; 12];
+        payload[0..8].copy_from_slice(&remote_func.to_le_bytes());
+        payload[8..12].copy_from_slice(&config.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::FuncSetSharedMemConfig, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    // Stub fallback: validate function handle exists
+    if client.handles.functions.to_remote(func).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // Primary context management
 // ---------------------------------------------------------------------------
 
@@ -5636,5 +5772,133 @@ mod tests {
 
         assert_eq!(ol_cuMemHostUnregister(ptr), CUDA_SUCCESS);
         unsafe { std::alloc::dealloc(ptr, layout) };
+    }
+
+    // -- CtxGetCacheConfig / CtxSetCacheConfig tests --
+
+    #[test]
+    fn test_ol_cu_ctx_get_cache_config_default() {
+        let mut config: u32 = 0xFF;
+        let result = ol_cuCtxGetCacheConfig(&mut config);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(config, 0); // PREFER_NONE
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_get_cache_config_null_ptr() {
+        let result = ol_cuCtxGetCacheConfig(ptr::null_mut());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_set_cache_config() {
+        let result = ol_cuCtxSetCacheConfig(0x01); // PREFER_SHARED
+        assert_eq!(result, CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_set_cache_config_invalid() {
+        let result = ol_cuCtxSetCacheConfig(0x04);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- CtxGetSharedMemConfig / CtxSetSharedMemConfig tests --
+
+    #[test]
+    fn test_ol_cu_ctx_get_shared_mem_config_default() {
+        let mut config: u32 = 0xFF;
+        let result = ol_cuCtxGetSharedMemConfig(&mut config);
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(config, 0); // DEFAULT_BANK_SIZE
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_get_shared_mem_config_null_ptr() {
+        let result = ol_cuCtxGetSharedMemConfig(ptr::null_mut());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_set_shared_mem_config() {
+        let result = ol_cuCtxSetSharedMemConfig(0x01); // FOUR_BYTE_BANK_SIZE
+        assert_eq!(result, CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_ol_cu_ctx_set_shared_mem_config_invalid() {
+        let result = ol_cuCtxSetSharedMemConfig(0x03);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- FuncSetCacheConfig tests --
+
+    #[test]
+    fn test_ol_cu_func_set_cache_config() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"kern\0";
+        assert_eq!(ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8), CUDA_SUCCESS);
+
+        let result = ol_cuFuncSetCacheConfig(func, 0x02); // PREFER_L1
+        assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_ol_cu_func_set_cache_config_invalid_func() {
+        let result = ol_cuFuncSetCacheConfig(0xDEAD, 0x01);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_func_set_cache_config_invalid_config() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"kern\0";
+        assert_eq!(ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8), CUDA_SUCCESS);
+
+        let result = ol_cuFuncSetCacheConfig(func, 0x04);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    // -- FuncSetSharedMemConfig tests --
+
+    #[test]
+    fn test_ol_cu_func_set_shared_mem_config() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"kern\0";
+        assert_eq!(ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8), CUDA_SUCCESS);
+
+        let result = ol_cuFuncSetSharedMemConfig(func, 0x01); // FOUR_BYTE_BANK_SIZE
+        assert_eq!(result, CUDA_SUCCESS);
+        let _ = ol_cuModuleUnload(module);
+    }
+
+    #[test]
+    fn test_ol_cu_func_set_shared_mem_config_invalid_func() {
+        let result = ol_cuFuncSetSharedMemConfig(0xDEAD, 0x01);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_func_set_shared_mem_config_invalid_config() {
+        let mut module: u64 = 0;
+        let data = [0u8; 16];
+        assert_eq!(ol_cuModuleLoadData(&mut module, data.as_ptr(), data.len()), CUDA_SUCCESS);
+        let mut func: u64 = 0;
+        let name = b"kern\0";
+        assert_eq!(ol_cuModuleGetFunction(&mut func, module, name.as_ptr() as *const i8), CUDA_SUCCESS);
+
+        let result = ol_cuFuncSetSharedMemConfig(func, 0x03);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+        let _ = ol_cuModuleUnload(module);
     }
 }
