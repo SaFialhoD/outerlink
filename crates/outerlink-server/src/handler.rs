@@ -5910,4 +5910,236 @@ mod tests {
         let (_, resp) = dispatch(&gpu, &hdr, &payload);
         assert_eq!(response_result(&resp), CuResult::Success);
     }
+
+    // ----- MemcpyDtoDAsync handler tests -----
+
+    #[test]
+    fn test_memcpy_dtod_async_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Allocate src and dst
+        let mut alloc = |size: u64| {
+            let payload = size.to_le_bytes();
+            let hdr = req(MessageType::MemAlloc, payload.len() as u32);
+            let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+            assert_eq!(response_result(&resp), CuResult::Success);
+            u64::from_le_bytes(resp[4..12].try_into().unwrap())
+        };
+        let src = alloc(256);
+        let dst = alloc(256);
+
+        // Create a stream
+        let stream_payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::StreamCreate, stream_payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &stream_payload, &mut session);
+        let stream = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // MemcpyDtoDAsync: [8B dst][8B src][8B byte_count][8B stream] = 32B
+        let mut payload = Vec::with_capacity(32);
+        payload.extend_from_slice(&dst.to_le_bytes());
+        payload.extend_from_slice(&src.to_le_bytes());
+        payload.extend_from_slice(&256u64.to_le_bytes());
+        payload.extend_from_slice(&stream.to_le_bytes());
+        let hdr = req(MessageType::MemcpyDtoDAsync, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_memcpy_dtod_async_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemcpyDtoDAsync, 24);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 24]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- MemHostAlloc handler tests -----
+
+    #[test]
+    fn test_mem_host_alloc_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&4096u64.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes()); // flags = 0
+        let hdr = req(MessageType::MemHostAlloc, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let ptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(ptr, 0);
+    }
+
+    #[test]
+    fn test_mem_host_alloc_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemHostAlloc, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_mem_host_alloc_zero_size() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&0u64.to_le_bytes()); // zero size
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let hdr = req(MessageType::MemHostAlloc, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- MemAllocPitch handler tests -----
+
+    #[test]
+    fn test_mem_alloc_pitch_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        let mut payload = Vec::with_capacity(20);
+        payload.extend_from_slice(&100u64.to_le_bytes()); // width
+        payload.extend_from_slice(&50u64.to_le_bytes()); // height
+        payload.extend_from_slice(&4u32.to_le_bytes()); // element_size
+        let hdr = req(MessageType::MemAllocPitch, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        // Response: 4B result + 8B dptr + 8B pitch
+        assert!(resp.len() >= 20);
+        let dptr = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        let pitch = u64::from_le_bytes(resp[12..20].try_into().unwrap());
+        assert_ne!(dptr, 0);
+        assert_eq!(pitch, 512); // 100 rounded up to 512
+    }
+
+    #[test]
+    fn test_mem_alloc_pitch_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemAllocPitch, 16);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 16]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- ModuleLoad handler tests -----
+
+    #[test]
+    fn test_module_load_handler_stub_returns_not_found() {
+        let gpu = StubGpuBackend::new();
+        let path = b"/some/path.ptx";
+        let mut payload = Vec::with_capacity(4 + path.len());
+        payload.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        payload.extend_from_slice(path);
+        let hdr = req(MessageType::ModuleLoad, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::NotFound);
+    }
+
+    #[test]
+    fn test_module_load_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::ModuleLoad, 2);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 2]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_module_load_empty_path() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0u32.to_le_bytes(); // path_len = 0
+        let hdr = req(MessageType::ModuleLoad, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- ModuleLoadFatBinary handler tests -----
+
+    #[test]
+    fn test_module_load_fat_binary_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        let payload = b"fake fat binary data";
+        let hdr = req(MessageType::ModuleLoadFatBinary, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(handle, 0);
+    }
+
+    #[test]
+    fn test_module_load_fat_binary_empty_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::ModuleLoadFatBinary, 0);
+        let (_, resp) = dispatch(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- DeviceGetMemPool handler tests -----
+
+    #[test]
+    fn test_device_get_mem_pool_handler() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0i32.to_le_bytes();
+        let hdr = req(MessageType::DeviceGetMemPool, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let pool = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(pool, 0);
+    }
+
+    #[test]
+    fn test_device_get_mem_pool_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        let payload = 99i32.to_le_bytes();
+        let hdr = req(MessageType::DeviceGetMemPool, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidDevice);
+    }
+
+    // ----- DeviceSetMemPool handler tests -----
+
+    #[test]
+    fn test_device_set_mem_pool_handler() {
+        let gpu = StubGpuBackend::new();
+        // First get the default pool
+        let pool = gpu.device_get_default_mem_pool(0).unwrap();
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.extend_from_slice(&pool.to_le_bytes());
+        let hdr = req(MessageType::DeviceSetMemPool, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_device_set_mem_pool_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::DeviceSetMemPool, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // ----- MemGetAllocationGranularity handler tests -----
+
+    #[test]
+    fn test_mem_get_allocation_granularity_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&0i32.to_le_bytes()); // location_type
+        payload.extend_from_slice(&0i32.to_le_bytes()); // location_id
+        payload.extend_from_slice(&0i32.to_le_bytes()); // option
+        let hdr = req(MessageType::MemGetAllocationGranularity, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let gran = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_eq!(gran, 512);
+    }
+
+    #[test]
+    fn test_mem_get_allocation_granularity_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::MemGetAllocationGranularity, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0u8; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
 }

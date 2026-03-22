@@ -4319,4 +4319,270 @@ mod tests {
         // After shutdown, the handle is invalid
         assert_eq!(gpu.link_destroy(h), Err(CuResult::InvalidValue));
     }
+
+    // -----------------------------------------------------------------------
+    // cuMemcpyDtoDAsync_v2 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_memcpy_dtod_async_basic() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        let src = gpu.mem_alloc(256).unwrap();
+        let dst = gpu.mem_alloc(256).unwrap();
+        // Write pattern to source.
+        gpu.memcpy_htod(src, &[0xAB; 256]);
+        // Async DtoD copy.
+        gpu.memcpy_dtod_async(dst, src, 256, stream).unwrap();
+        // Verify destination.
+        let out = gpu.memcpy_dtoh(dst, 256).unwrap();
+        assert_eq!(out, vec![0xAB; 256]);
+    }
+
+    #[test]
+    fn test_memcpy_dtod_async_zero_size_noop() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        let dst = gpu.mem_alloc(64).unwrap();
+        // Zero-size copy should succeed via delegation to memcpy_dtod which handles size=0
+        // by successfully copying 0 bytes.
+        gpu.memcpy_dtod_async(dst, src, 0, 0).unwrap();
+    }
+
+    #[test]
+    fn test_memcpy_dtod_async_default_stream() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(128).unwrap();
+        let dst = gpu.mem_alloc(128).unwrap();
+        gpu.memcpy_htod(src, &[0xFF; 128]);
+        // stream=0 is always valid (default stream).
+        gpu.memcpy_dtod_async(dst, src, 128, 0).unwrap();
+        let out = gpu.memcpy_dtoh(dst, 128).unwrap();
+        assert_eq!(out, vec![0xFF; 128]);
+    }
+
+    #[test]
+    fn test_memcpy_dtod_async_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        let dst = gpu.mem_alloc(64).unwrap();
+        assert_eq!(
+            gpu.memcpy_dtod_async(dst, src, 64, 0xBAD0000),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_memcpy_dtod_async_invalid_src() {
+        let gpu = StubGpuBackend::new();
+        let dst = gpu.mem_alloc(64).unwrap();
+        assert_eq!(
+            gpu.memcpy_dtod_async(dst, 0xBAD, 64, 0),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_memcpy_dtod_async_invalid_dst() {
+        let gpu = StubGpuBackend::new();
+        let src = gpu.mem_alloc(64).unwrap();
+        assert_eq!(
+            gpu.memcpy_dtod_async(0xBAD, src, 64, 0),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // cuMemHostAlloc tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mem_host_alloc_basic() {
+        let gpu = StubGpuBackend::new();
+        let ptr = gpu.mem_host_alloc(4096, 0).unwrap();
+        assert_ne!(ptr, 0);
+        gpu.mem_free_host(ptr).unwrap();
+    }
+
+    #[test]
+    fn test_mem_host_alloc_with_flags() {
+        let gpu = StubGpuBackend::new();
+        // CU_MEMHOSTALLOC_PORTABLE = 1, CU_MEMHOSTALLOC_DEVICEMAP = 2
+        let ptr = gpu.mem_host_alloc(1024, 1 | 2).unwrap();
+        assert_ne!(ptr, 0);
+        gpu.mem_free_host(ptr).unwrap();
+    }
+
+    #[test]
+    fn test_mem_host_alloc_zero_size() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.mem_host_alloc(0, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_mem_host_alloc_delegates_to_alloc_host() {
+        let gpu = StubGpuBackend::new();
+        let p1 = gpu.mem_host_alloc(512, 0).unwrap();
+        let p2 = gpu.mem_alloc_host(512).unwrap();
+        // Both should return distinct non-zero pointers.
+        assert_ne!(p1, p2);
+        assert_ne!(p1, 0);
+        assert_ne!(p2, 0);
+        gpu.mem_free_host(p1).unwrap();
+        gpu.mem_free_host(p2).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // cuMemAllocPitch_v2 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mem_alloc_pitch_basic() {
+        let gpu = StubGpuBackend::new();
+        let (dptr, pitch) = gpu.mem_alloc_pitch(100, 50, 4).unwrap();
+        assert_ne!(dptr, 0);
+        // Pitch should be aligned to 512 bytes.
+        assert_eq!(pitch, 512);
+        // Total allocation should be pitch * height.
+        let data = gpu.memcpy_dtoh(dptr, pitch * 50).unwrap();
+        assert_eq!(data.len(), 512 * 50);
+    }
+
+    #[test]
+    fn test_mem_alloc_pitch_exact_512() {
+        let gpu = StubGpuBackend::new();
+        let (dptr, pitch) = gpu.mem_alloc_pitch(512, 10, 4).unwrap();
+        assert_eq!(pitch, 512);
+        gpu.mem_free(dptr).unwrap();
+    }
+
+    #[test]
+    fn test_mem_alloc_pitch_larger_than_512() {
+        let gpu = StubGpuBackend::new();
+        let (dptr, pitch) = gpu.mem_alloc_pitch(513, 10, 4).unwrap();
+        assert_eq!(pitch, 1024); // Next 512-byte boundary.
+        gpu.mem_free(dptr).unwrap();
+    }
+
+    #[test]
+    fn test_mem_alloc_pitch_zero_width() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.mem_alloc_pitch(0, 10, 4),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_mem_alloc_pitch_zero_height() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.mem_alloc_pitch(100, 0, 4),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // cuModuleLoad / cuModuleLoadFatBinary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_module_load_returns_not_found() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.module_load("/some/path.ptx"), Err(CuResult::NotFound));
+    }
+
+    #[test]
+    fn test_module_load_fat_binary_basic() {
+        let gpu = StubGpuBackend::new();
+        let handle = gpu.module_load_fat_binary(b"fake fat binary data").unwrap();
+        assert_ne!(handle, 0);
+        // Should be unloadable.
+        gpu.module_unload(handle).unwrap();
+    }
+
+    #[test]
+    fn test_module_load_fat_binary_empty_data() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.module_load_fat_binary(b""),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_module_load_fat_binary_delegates_to_load_data() {
+        let gpu = StubGpuBackend::new();
+        let h1 = gpu.module_load_fat_binary(b"data1").unwrap();
+        let h2 = gpu.module_load_data(b"data2").unwrap();
+        assert_ne!(h1, h2);
+        gpu.module_unload(h1).unwrap();
+        gpu.module_unload(h2).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // cuDeviceGetMemPool / cuDeviceSetMemPool tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_device_get_mem_pool_default() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.device_get_mem_pool(0).unwrap();
+        let default_pool = gpu.device_get_default_mem_pool(0).unwrap();
+        // Before any set, current pool should equal default pool.
+        assert_eq!(pool, default_pool);
+    }
+
+    #[test]
+    fn test_device_get_mem_pool_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.device_get_mem_pool(1), Err(CuResult::InvalidDevice));
+    }
+
+    #[test]
+    fn test_device_set_mem_pool_basic() {
+        let gpu = StubGpuBackend::new();
+        let new_pool = gpu.mem_pool_create(1, 0, 0).unwrap();
+        gpu.device_set_mem_pool(0, new_pool).unwrap();
+        let current = gpu.device_get_mem_pool(0).unwrap();
+        assert_eq!(current, new_pool);
+    }
+
+    #[test]
+    fn test_device_set_mem_pool_invalid_pool() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(
+            gpu.device_set_mem_pool(0, 0xBAD0000),
+            Err(CuResult::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn test_device_set_mem_pool_invalid_device() {
+        let gpu = StubGpuBackend::new();
+        let pool = gpu.device_get_default_mem_pool(0).unwrap();
+        assert_eq!(
+            gpu.device_set_mem_pool(1, pool),
+            Err(CuResult::InvalidDevice)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // cuMemGetAllocationGranularity tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mem_get_allocation_granularity() {
+        let gpu = StubGpuBackend::new();
+        let gran = gpu.mem_get_allocation_granularity(0, 0, 0).unwrap();
+        assert_eq!(gran, 512);
+    }
+
+    #[test]
+    fn test_mem_get_allocation_granularity_different_params() {
+        let gpu = StubGpuBackend::new();
+        // Stub always returns 512 regardless of params.
+        let gran = gpu.mem_get_allocation_granularity(1, 0, 1).unwrap();
+        assert_eq!(gran, 512);
+    }
 }
