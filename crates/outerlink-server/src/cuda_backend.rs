@@ -283,6 +283,51 @@ type FnCuDevicePrimaryCtxReset = unsafe extern "C" fn(dev: i32) -> i32;
 type FnCuDeviceGetPCIBusId = unsafe extern "C" fn(pci_bus_id: *mut u8, len: i32, dev: i32) -> i32;
 type FnCuDeviceGetByPCIBusId = unsafe extern "C" fn(dev: *mut i32, pci_bus_id: *const u8) -> i32;
 
+// JIT Linker operations
+type FnCuLinkCreate = unsafe extern "C" fn(
+    num_options: u32,
+    options: *const i32,
+    option_values: *mut *mut std::ffi::c_void,
+    state_out: *mut usize,
+) -> i32;
+type FnCuLinkAddData = unsafe extern "C" fn(
+    state: usize,
+    jit_type: i32,
+    data: *const u8,
+    size: usize,
+    name: *const u8,
+    num_options: u32,
+    options: *const i32,
+    option_values: *mut *mut std::ffi::c_void,
+) -> i32;
+type FnCuLinkAddFile = unsafe extern "C" fn(
+    state: usize,
+    jit_type: i32,
+    path: *const u8,
+    num_options: u32,
+    options: *const i32,
+    option_values: *mut *mut std::ffi::c_void,
+) -> i32;
+type FnCuLinkComplete = unsafe extern "C" fn(
+    state: usize,
+    cubin_out: *mut *mut std::ffi::c_void,
+    size_out: *mut usize,
+) -> i32;
+type FnCuLinkDestroy = unsafe extern "C" fn(state: usize) -> i32;
+
+// Stream callback / host function
+type FnCuStreamAddCallback = unsafe extern "C" fn(
+    stream: usize,
+    callback: usize, // CUstreamCallback function pointer
+    user_data: *mut std::ffi::c_void,
+    flags: u32,
+) -> i32;
+type FnCuLaunchHostFunc = unsafe extern "C" fn(
+    stream: usize,
+    callback: usize, // CUhostFn function pointer
+    user_data: *mut std::ffi::c_void,
+) -> i32;
+
 // Kernel launch
 type FnCuLaunchKernel = unsafe extern "C" fn(
     f: usize,
@@ -462,6 +507,17 @@ struct CudaApi {
     cu_device_primary_ctx_get_state: Option<FnCuDevicePrimaryCtxGetState>,
     cu_device_primary_ctx_set_flags: Option<FnCuDevicePrimaryCtxSetFlags>,
     cu_device_primary_ctx_reset: Option<FnCuDevicePrimaryCtxReset>,
+
+    // JIT Linker
+    cu_link_create: Option<FnCuLinkCreate>,
+    cu_link_add_data: Option<FnCuLinkAddData>,
+    cu_link_add_file: Option<FnCuLinkAddFile>,
+    cu_link_complete: Option<FnCuLinkComplete>,
+    cu_link_destroy: Option<FnCuLinkDestroy>,
+
+    // Stream callback / host function
+    cu_stream_add_callback: Option<FnCuStreamAddCallback>,
+    cu_launch_host_func: Option<FnCuLaunchHostFunc>,
 
     // Library API (CUDA 12+)
     cu_library_load_data: Option<FnCuLibraryLoadData>,
@@ -665,6 +721,17 @@ impl CudaApi {
             cu_device_primary_ctx_get_state: load_sym!(lib, b"cuDevicePrimaryCtxGetState\0"),
             cu_device_primary_ctx_set_flags: load_sym!(lib, b"cuDevicePrimaryCtxSetFlags_v2\0", b"cuDevicePrimaryCtxSetFlags\0"),
             cu_device_primary_ctx_reset: load_sym!(lib, b"cuDevicePrimaryCtxReset_v2\0", b"cuDevicePrimaryCtxReset\0"),
+
+            // JIT Linker
+            cu_link_create: load_sym!(lib, b"cuLinkCreate_v2\0", b"cuLinkCreate\0"),
+            cu_link_add_data: load_sym!(lib, b"cuLinkAddData_v2\0", b"cuLinkAddData\0"),
+            cu_link_add_file: load_sym!(lib, b"cuLinkAddFile_v2\0", b"cuLinkAddFile\0"),
+            cu_link_complete: load_sym!(lib, b"cuLinkComplete\0"),
+            cu_link_destroy: load_sym!(lib, b"cuLinkDestroy\0"),
+
+            // Stream callback / host function
+            cu_stream_add_callback: load_sym!(lib, b"cuStreamAddCallback\0"),
+            cu_launch_host_func: load_sym!(lib, b"cuLaunchHostFunc\0"),
 
             // Library API (CUDA 12+) -- optional, not present on older drivers
             cu_library_load_data: load_sym!(lib, b"cuLibraryLoadData\0"),
@@ -1869,41 +1936,113 @@ impl GpuBackend for CudaGpuBackend {
         }
     }
 
-    fn link_create(&self, _options: &[(i32, u64)]) -> Result<u64, CuResult> {
-        // TODO: Wire to real cuLinkCreate_v2 via libloading.
-        tracing::warn!("CudaBackend::link_create not yet wired to real CUDA driver");
-        Err(CuResult::JitCompilerNotFound)
+    fn link_create(&self, options: &[(i32, u64)]) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_link_create)?;
+        let num_options = options.len() as u32;
+        let mut opt_keys: Vec<i32> = options.iter().map(|(k, _)| *k).collect();
+        let mut opt_vals: Vec<*mut std::ffi::c_void> =
+            options.iter().map(|(_, v)| *v as *mut std::ffi::c_void).collect();
+        let mut state: usize = 0;
+        unsafe {
+            map_cuda_result(func(
+                num_options,
+                if opt_keys.is_empty() { std::ptr::null() } else { opt_keys.as_mut_ptr() },
+                if opt_vals.is_empty() { std::ptr::null_mut() } else { opt_vals.as_mut_ptr() },
+                &mut state,
+            ))?;
+        }
+        tracing::debug!(state, num_options, "JIT linker state created");
+        Ok(state as u64)
     }
 
-    fn link_add_data(&self, _state: u64, _jit_type: i32, _data: &[u8], _name: &str, _options: &[(i32, u64)]) -> Result<(), CuResult> {
-        tracing::warn!("CudaBackend::link_add_data not yet wired to real CUDA driver");
-        Err(CuResult::JitCompilerNotFound)
-    }
-
-    fn link_add_file(&self, _state: u64, _jit_type: i32, _path: &str, _options: &[(i32, u64)]) -> Result<(), CuResult> {
-        tracing::warn!("CudaBackend::link_add_file not yet wired to real CUDA driver");
-        Err(CuResult::JitCompilerNotFound)
-    }
-
-    fn link_complete(&self, _state: u64) -> Result<(u64, Vec<u8>), CuResult> {
-        tracing::warn!("CudaBackend::link_complete not yet wired to real CUDA driver");
-        Err(CuResult::JitCompilerNotFound)
-    }
-
-    fn link_destroy(&self, _state: u64) -> Result<(), CuResult> {
-        tracing::warn!("CudaBackend::link_destroy not yet wired to real CUDA driver");
-        Err(CuResult::JitCompilerNotFound)
-    }
-
-    fn stream_add_callback(&self, _stream: u64, _callback_id: u64, _flags: u32) -> Result<(), CuResult> {
-        // In the real backend, we would use cuLaunchHostFunc to enqueue a
-        // notification-sender on the real GPU stream. For now, callbacks fire
-        // immediately (the handler sends CallbackReady right after the response).
+    fn link_add_data(&self, state: u64, jit_type: i32, data: &[u8], name: &str, options: &[(i32, u64)]) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_link_add_data)?;
+        let c_name = CString::new(name).map_err(|_| CuResult::InvalidValue)?;
+        let num_options = options.len() as u32;
+        let mut opt_keys: Vec<i32> = options.iter().map(|(k, _)| *k).collect();
+        let mut opt_vals: Vec<*mut std::ffi::c_void> =
+            options.iter().map(|(_, v)| *v as *mut std::ffi::c_void).collect();
+        unsafe {
+            map_cuda_result(func(
+                state as usize,
+                jit_type,
+                data.as_ptr(),
+                data.len(),
+                c_name.as_ptr() as *const u8,
+                num_options,
+                if opt_keys.is_empty() { std::ptr::null() } else { opt_keys.as_mut_ptr() },
+                if opt_vals.is_empty() { std::ptr::null_mut() } else { opt_vals.as_mut_ptr() },
+            ))?;
+        }
+        tracing::debug!(state, jit_type, name, data_len = data.len(), "JIT linker data added");
         Ok(())
     }
 
-    fn launch_host_func(&self, _stream: u64, _callback_id: u64) -> Result<(), CuResult> {
-        // Same as stream_add_callback -- immediate notification in Phase 1.
+    fn link_add_file(&self, state: u64, jit_type: i32, path: &str, options: &[(i32, u64)]) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_link_add_file)?;
+        let c_path = CString::new(path).map_err(|_| CuResult::InvalidValue)?;
+        let num_options = options.len() as u32;
+        let mut opt_keys: Vec<i32> = options.iter().map(|(k, _)| *k).collect();
+        let mut opt_vals: Vec<*mut std::ffi::c_void> =
+            options.iter().map(|(_, v)| *v as *mut std::ffi::c_void).collect();
+        unsafe {
+            map_cuda_result(func(
+                state as usize,
+                jit_type,
+                c_path.as_ptr() as *const u8,
+                num_options,
+                if opt_keys.is_empty() { std::ptr::null() } else { opt_keys.as_mut_ptr() },
+                if opt_vals.is_empty() { std::ptr::null_mut() } else { opt_vals.as_mut_ptr() },
+            ))?;
+        }
+        tracing::debug!(state, jit_type, path, "JIT linker file added");
+        Ok(())
+    }
+
+    fn link_complete(&self, state: u64) -> Result<(u64, Vec<u8>), CuResult> {
+        let func = require_fn(&self.api.cu_link_complete)?;
+        let mut cubin_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut cubin_size: usize = 0;
+        unsafe {
+            map_cuda_result(func(state as usize, &mut cubin_ptr, &mut cubin_size))?;
+        }
+        // Copy the cubin data out -- CUDA owns the buffer and it is freed by cuLinkDestroy.
+        let cubin_data = if cubin_size > 0 && !cubin_ptr.is_null() {
+            unsafe { std::slice::from_raw_parts(cubin_ptr as *const u8, cubin_size) }.to_vec()
+        } else {
+            Vec::new()
+        };
+        tracing::debug!(state, cubin_ptr = ?cubin_ptr, cubin_size, "JIT link completed");
+        Ok((cubin_ptr as u64, cubin_data))
+    }
+
+    fn link_destroy(&self, state: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_link_destroy)?;
+        unsafe {
+            map_cuda_result(func(state as usize))?;
+        }
+        tracing::debug!(state, "JIT linker state destroyed");
+        Ok(())
+    }
+
+    fn stream_add_callback(&self, stream: u64, _callback_id: u64, _flags: u32) -> Result<(), CuResult> {
+        // The server cannot forward the client's callback function pointer across
+        // the network. In Phase 1, the handler fires CallbackReady immediately after
+        // the response. When we have a real notification mechanism, we will use
+        // cuStreamAddCallback/cuLaunchHostFunc to enqueue a C trampoline that sends
+        // the notification. For now this is intentionally a no-op on the CUDA side.
+        //
+        // We still validate that the symbol exists so callers get NotFound on
+        // truly ancient drivers rather than silent success.
+        let _func = require_fn(&self.api.cu_stream_add_callback)?;
+        tracing::trace!(stream, "stream_add_callback: immediate fire (Phase 1)");
+        Ok(())
+    }
+
+    fn launch_host_func(&self, stream: u64, _callback_id: u64) -> Result<(), CuResult> {
+        // Same rationale as stream_add_callback above.
+        let _func = require_fn(&self.api.cu_launch_host_func)?;
+        tracing::trace!(stream, "launch_host_func: immediate fire (Phase 1)");
         Ok(())
     }
 
