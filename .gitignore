@@ -32,3 +32,5 @@ Thumbs.db
 
 # Claude internal
 .claude/settings.local.json
+.claude/worktrees/
+.claude/cache/
