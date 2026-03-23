@@ -1291,25 +1291,14 @@ CUresult hook_cuEventQuery(CUevent hEvent) {
  *      Falls back to NULL if cuFuncGetParamInfo is unavailable.
  */
 
-/* ---- cuFuncGetParamInfo dynamic resolution ---- */
-
-typedef CUresult (*cuFuncGetParamInfo_fn)(CUfunction func, size_t paramIndex,
-                                          size_t *paramOffset, size_t *paramSize);
-
-static cuFuncGetParamInfo_fn real_cuFuncGetParamInfo = NULL;
-static int cuFuncGetParamInfo_resolved = 0; /* 0 = not tried, 1 = resolved, -1 = unavailable */
-
-static void resolve_cuFuncGetParamInfo(void) {
-    if (cuFuncGetParamInfo_resolved != 0)
-        return;
-    if (!real_dlsym) {
-        real_dlsym = (void *(*)(void *, const char *))
-            __libc_dlsym(RTLD_NEXT, "dlsym");
-    }
-    real_cuFuncGetParamInfo = (cuFuncGetParamInfo_fn)
-        real_dlsym(RTLD_NEXT, "cuFuncGetParamInfo");
-    cuFuncGetParamInfo_resolved = real_cuFuncGetParamInfo ? 1 : -1;
-}
+/* ---- cuFuncGetParamInfo via Rust FFI ---- */
+/*
+ * Instead of calling the real CUDA driver's cuFuncGetParamInfo directly
+ * (which would SEGFAULT on our synthetic function handles), we route
+ * through the Rust FFI ol_cuFuncGetParamInfo. When connected to a server,
+ * this sends the query over the wire to the server which holds the real
+ * function handles. When disconnected, it returns stub defaults.
+ */
 
 /* ---- Per-CUfunction param info cache ---- */
 
@@ -1340,9 +1329,13 @@ static const param_cache_entry_t *param_cache_lookup(CUfunction func) {
 }
 
 /*
- * Query cuFuncGetParamInfo for all params and store in cache.
+ * Query ol_cuFuncGetParamInfo (Rust FFI) for all params and store in cache.
  * Returns pointer to new cache entry, or NULL on failure.
  * Caller must hold param_cache_mutex.
+ *
+ * This calls the server-side cuFuncGetParamInfo via the OuterLink protocol,
+ * avoiding the SEGFAULT that would occur if we called the real driver with
+ * our synthetic function handles.
  */
 static const param_cache_entry_t *param_cache_populate(CUfunction func) {
     if (param_cache_count >= PARAM_CACHE_MAX_FUNCS) {
@@ -1358,8 +1351,10 @@ static const param_cache_entry_t *param_cache_populate(CUfunction func) {
     entry->num_params = 0;
 
     for (size_t i = 0; i < PARAM_CACHE_MAX_PARAMS; i++) {
-        size_t offset = 0, size = 0;
-        CUresult r = real_cuFuncGetParamInfo(func, i, &offset, &size);
+        unsigned long long offset = 0, size = 0;
+        CUresult r = ol_cuFuncGetParamInfo(
+            (unsigned long long)(uintptr_t)func, (unsigned long long)i,
+            &offset, &size);
         if (r != CUDA_SUCCESS) {
             /* CUDA_ERROR_INVALID_VALUE signals end of params */
             break;
@@ -1374,17 +1369,14 @@ static const param_cache_entry_t *param_cache_populate(CUfunction func) {
 
 /*
  * Get param info for a CUfunction, using cache.
- * Returns cache entry or NULL if cuFuncGetParamInfo is unavailable.
+ * Returns cache entry or NULL on failure.
+ * Always available -- ol_cuFuncGetParamInfo provides stub defaults when
+ * not connected to a server.
  */
 static const param_cache_entry_t *get_func_param_info(CUfunction func) {
-    resolve_cuFuncGetParamInfo();
-    if (cuFuncGetParamInfo_resolved != 1)
-        return NULL;
-
-    /* Hold the mutex for both read and write.  The cache is only 256 entries
-     * and kernel launches aren't on the hot path relative to network overhead,
-     * so there is no benefit to a lockless fast-path (which would be a data
-     * race on param_cache_count / array contents under C11). */
+    /* ol_cuFuncGetParamInfo is always available (provided by the Rust FFI),
+     * so no resolution check is needed.  When connected to a server the
+     * query goes over the wire; when disconnected it returns stub defaults. */
     pthread_mutex_lock(&param_cache_mutex);
     const param_cache_entry_t *cached = param_cache_lookup(func);
     if (!cached) {
@@ -1480,11 +1472,11 @@ CUresult hook_cuLaunchKernel(CUfunction f,
                 info->num_params,
                 info->param_sizes);
         }
-        /* cuFuncGetParamInfo unavailable or zero params -- fall through */
+        /* Zero params or query failed -- fall through */
     }
 
     /*
-     * Fallback: no params (kernelParams==NULL, or cuFuncGetParamInfo unavailable).
+     * Fallback: no params (kernelParams==NULL, or param query returned zero params).
      */
     return ol_cuLaunchKernel(
         (unsigned long long)(uintptr_t)f,
@@ -1909,7 +1901,13 @@ CUresult hook_cuGetExportTable(const void **ppExportTable, const void *pExportTa
     static int resolved = 0;
 
     if (!resolved) {
-        real_cuGetExportTable = (real_fn_t)dlsym(RTLD_NEXT, "cuGetExportTable");
+        /* Use real_dlsym (via __libc_dlsym) to bypass our hooked dlsym,
+         * which would return hook_cuGetExportTable and cause infinite recursion. */
+        if (!real_dlsym) {
+            real_dlsym = (void *(*)(void *, const char *))
+                __libc_dlsym(RTLD_NEXT, "dlsym");
+        }
+        real_cuGetExportTable = (real_fn_t)real_dlsym(RTLD_NEXT, "cuGetExportTable");
         resolved = 1;
     }
 

@@ -12,6 +12,7 @@ use std::ptr;
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 
+use outerlink_common::handle::translate_device_ptrs_in_params;
 use outerlink_common::protocol::MessageType;
 
 use crate::OuterLinkClient;
@@ -1848,6 +1849,62 @@ pub extern "C" fn ol_cuFuncSetAttribute(func: u64, attrib: i32, value: i32) -> u
         8 | 9 => CUDA_SUCCESS,
         _ => CUDA_ERROR_INVALID_VALUE,
     }
+}
+
+// ---------------------------------------------------------------------------
+// cuFuncGetParamInfo (CUDA 12.3+)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn ol_cuFuncGetParamInfo(
+    func: u64,
+    param_index: u64,
+    param_offset: *mut u64,
+    param_size: *mut u64,
+) -> u32 {
+    if param_offset.is_null() || param_size.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let client = get_client();
+    // Connected: ask the server
+    if client.connected.load(Ordering::Acquire) {
+        let remote_func = match client.handles.functions.to_remote(func) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let mut payload = [0u8; 16];
+        payload[0..8].copy_from_slice(&remote_func.to_le_bytes());
+        payload[8..16].copy_from_slice(&param_index.to_le_bytes());
+        if let Ok((_hdr, resp)) =
+            client.send_request(MessageType::FuncGetParamInfo, &payload)
+        {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 20 {
+                unsafe {
+                    *param_offset = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                    *param_size = u64::from_le_bytes(resp[12..20].try_into().unwrap());
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub fallback: validate function handle
+    if client.handles.functions.to_remote(func).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // Stub: return plausible defaults (same as StubGpuBackend)
+    const MAX_STUB_PARAMS: u64 = 64;
+    if param_index >= MAX_STUB_PARAMS {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe {
+        *param_offset = param_index * 8;
+        *param_size = 8;
+    }
+    CUDA_SUCCESS
 }
 
 // ---------------------------------------------------------------------------
@@ -3894,6 +3951,10 @@ pub extern "C" fn ol_cuLaunchKernel(
             }
         }
 
+        // Translate any synthetic device pointers in the serialized params
+        // to their real remote addresses before sending to the server.
+        translate_device_ptrs_in_params(&mut payload[44..], &client.handles);
+
         if let Ok((_hdr, resp)) = client.send_request(MessageType::LaunchKernel, &payload) {
             return parse_result(&resp);
         }
@@ -3980,6 +4041,9 @@ pub extern "C" fn ol_cuLaunchCooperativeKernel(
                 }
             }
         }
+
+        // Translate any synthetic device pointers in the serialized params.
+        translate_device_ptrs_in_params(&mut payload[44..], &client.handles);
 
         if let Ok((_hdr, resp)) = client.send_request(MessageType::LaunchCooperativeKernel, &payload) {
             return parse_result(&resp);
@@ -5794,6 +5858,9 @@ pub extern "C" fn ol_cuLaunchKernelEx(
                 }
             }
         }
+
+        // Translate any synthetic device pointers in the serialized params.
+        translate_device_ptrs_in_params(&mut payload[44..], &client.handles);
 
         if let Ok((_hdr, resp)) = client.send_request(MessageType::LaunchKernelEx, &payload) {
             return parse_result(&resp);
@@ -9335,6 +9402,49 @@ mod tests {
             0xDEADBEEF,
             1024,
         );
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- FuncGetParamInfo tests --
+
+    #[test]
+    fn test_ol_cu_func_get_param_info_null_ptrs() {
+        let client = get_client();
+        let func = client.handles.functions.insert(0x1000);
+        // Both output pointers null
+        let result = ol_cuFuncGetParamInfo(func, 0, ptr::null_mut(), ptr::null_mut());
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_func_get_param_info_invalid_func() {
+        let mut offset: u64 = 0;
+        let mut size: u64 = 0;
+        let result = ol_cuFuncGetParamInfo(0xDEAD, 0, &mut offset, &mut size);
+        assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_ol_cu_func_get_param_info_stub_first_param() {
+        let client = get_client();
+        let func = client.handles.functions.insert(0x2000);
+        let mut offset: u64 = 0;
+        let mut size: u64 = 0;
+        let result = ol_cuFuncGetParamInfo(func, 0, &mut offset, &mut size);
+        // In stub mode (not connected), should return plausible defaults
+        assert_eq!(result, CUDA_SUCCESS);
+        assert_eq!(offset, 0);
+        assert_eq!(size, 8);
+    }
+
+    #[test]
+    fn test_ol_cu_func_get_param_info_stub_out_of_range() {
+        let client = get_client();
+        let func = client.handles.functions.insert(0x3000);
+        let mut offset: u64 = 0;
+        let mut size: u64 = 0;
+        // Query a large param index -- stub should return InvalidValue
+        let result = ol_cuFuncGetParamInfo(func, 999, &mut offset, &mut size);
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
     }
 }

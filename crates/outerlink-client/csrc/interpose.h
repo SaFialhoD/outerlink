@@ -185,6 +185,8 @@ extern CUresult ol_cuModuleGetFunction(unsigned long long *func, unsigned long l
 extern CUresult ol_cuModuleGetGlobal(unsigned long long *dptr, size_t *size, unsigned long long module, const unsigned char *name, size_t name_len);
 extern CUresult ol_cuFuncGetAttribute(int *pi, int attrib, unsigned long long func);
 extern CUresult ol_cuFuncSetAttribute(unsigned long long func, int attrib, int value);
+extern CUresult ol_cuFuncGetParamInfo(unsigned long long func, unsigned long long param_index,
+                                       unsigned long long *param_offset, unsigned long long *param_size);
 extern CUresult ol_cuFuncSetCacheConfig(unsigned long long func, unsigned int config);
 extern CUresult ol_cuFuncSetSharedMemConfig(unsigned long long func, unsigned int config);
 extern CUresult ol_cuMemGetAddressRange_v2(unsigned long long *pbase, size_t *psize, unsigned long long dptr);
@@ -238,9 +240,10 @@ extern CUresult ol_cuEventQuery(unsigned long long event);
  *   1. `extra` path: Parses CU_LAUNCH_PARAM_BUFFER_POINTER/SIZE tags to
  *      extract the packed buffer. Passed as a single param to Rust FFI.
  *
- *   2. `kernelParams` path: Uses cuFuncGetParamInfo (CUDA 12.3+, resolved
- *      via dlsym) to introspect per-parameter sizes. Results are cached
- *      per CUfunction. Falls back to NULL if unavailable (old drivers).
+ *   2. `kernelParams` path: Uses ol_cuFuncGetParamInfo (routed through the
+ *      Rust FFI to the server) to introspect per-parameter sizes. Results
+ *      are cached per CUfunction. This avoids calling the real driver's
+ *      cuFuncGetParamInfo with synthetic handles (which would SEGFAULT).
  */
 extern CUresult ol_cuLaunchCooperativeKernel(unsigned long long func,
                                    unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,

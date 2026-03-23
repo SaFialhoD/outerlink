@@ -88,6 +88,7 @@ pub enum MessageType {
     FuncSetAttribute = 0x0046,
     ModuleLoad = 0x0049,
     ModuleLoadFatBinary = 0x004A,
+    FuncGetParamInfo = 0x004B,
 
     // Execution
     LaunchKernel = 0x0050,
@@ -269,6 +270,7 @@ impl MessageType {
             0x0046 => Some(Self::FuncSetAttribute),
             0x0049 => Some(Self::ModuleLoad),
             0x004A => Some(Self::ModuleLoadFatBinary),
+            0x004B => Some(Self::FuncGetParamInfo),
             0x0050 => Some(Self::LaunchKernel),
             0x0055 => Some(Self::LaunchCooperativeKernel),
             0x0056 => Some(Self::LaunchKernelEx),
@@ -483,5 +485,12 @@ mod tests {
             let mt = MessageType::from_raw(raw).unwrap();
             assert_eq!(mt as u16, raw);
         }
+    }
+
+    #[test]
+    fn test_func_get_param_info_message_type() {
+        let mt = MessageType::from_raw(0x004B).unwrap();
+        assert_eq!(mt, MessageType::FuncGetParamInfo);
+        assert_eq!(mt as u16, 0x004B);
     }
 }

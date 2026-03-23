@@ -84,6 +84,7 @@ type FnCuModuleGetGlobal =
     unsafe extern "C" fn(dptr: *mut u64, size: *mut usize, module: usize, name: *const u8) -> i32;
 type FnCuFuncGetAttribute = unsafe extern "C" fn(pi: *mut i32, attrib: i32, hfunc: usize) -> i32;
 type FnCuFuncSetAttribute = unsafe extern "C" fn(hfunc: usize, attrib: i32, value: i32) -> i32;
+type FnCuFuncGetParamInfo = unsafe extern "C" fn(func: usize, param_index: usize, param_offset: *mut usize, param_size: *mut usize) -> i32;
 type FnCuCtxGetCacheConfig = unsafe extern "C" fn(pconfig: *mut i32) -> i32;
 type FnCuCtxSetCacheConfig = unsafe extern "C" fn(config: i32) -> i32;
 type FnCuCtxGetSharedMemConfig = unsafe extern "C" fn(pconfig: *mut i32) -> i32;
@@ -446,6 +447,7 @@ struct CudaApi {
     cu_module_get_global: Option<FnCuModuleGetGlobal>,
     cu_func_get_attribute: Option<FnCuFuncGetAttribute>,
     cu_func_set_attribute: Option<FnCuFuncSetAttribute>,
+    cu_func_get_param_info: Option<FnCuFuncGetParamInfo>,
     cu_ctx_get_cache_config: Option<FnCuCtxGetCacheConfig>,
     cu_ctx_set_cache_config: Option<FnCuCtxSetCacheConfig>,
     cu_ctx_get_shared_mem_config: Option<FnCuCtxGetSharedMemConfig>,
@@ -661,6 +663,7 @@ impl CudaApi {
             cu_module_get_global: load_sym!(lib, b"cuModuleGetGlobal_v2\0", b"cuModuleGetGlobal\0"),
             cu_func_get_attribute: load_sym!(lib, b"cuFuncGetAttribute\0"),
             cu_func_set_attribute: load_sym!(lib, b"cuFuncSetAttribute\0"),
+            cu_func_get_param_info: load_sym!(lib, b"cuFuncGetParamInfo\0"),
             cu_ctx_get_cache_config: load_sym!(lib, b"cuCtxGetCacheConfig\0"),
             cu_ctx_set_cache_config: load_sym!(lib, b"cuCtxSetCacheConfig\0"),
             cu_ctx_get_shared_mem_config: load_sym!(lib, b"cuCtxGetSharedMemConfig\0"),
@@ -1224,6 +1227,17 @@ impl GpuBackend for CudaGpuBackend {
         }
         tracing::trace!(func, attrib, value, "CUDA func attribute set");
         Ok(())
+    }
+
+    fn func_get_param_info(&self, func: u64, param_index: u64) -> Result<(u64, u64), CuResult> {
+        let f = require_fn(&self.api.cu_func_get_param_info)?;
+        let mut param_offset: usize = 0;
+        let mut param_size: usize = 0;
+        unsafe {
+            map_cuda_result(f(func as usize, param_index as usize, &mut param_offset, &mut param_size))?;
+        }
+        tracing::trace!(func, param_index, param_offset, param_size, "CUDA func param info queried");
+        Ok((param_offset as u64, param_size as u64))
     }
 
     fn ctx_get_cache_config(&self) -> Result<u32, CuResult> {
@@ -2450,6 +2464,18 @@ impl CudaGpuBackend {
             map_cuda_result(func(&mut dev, ordinal))?;
         }
         Ok(dev)
+    }
+
+    fn ctx_set_current(&self, ctx: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_ctx_set_current)?;
+        unsafe {
+            map_cuda_result(func(ctx as usize))?;
+        }
+        Ok(())
+    }
+
+    fn needs_dedicated_thread(&self) -> bool {
+        true
     }
 }
 

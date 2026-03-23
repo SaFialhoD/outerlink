@@ -285,38 +285,45 @@ impl OuterLinkClient {
         msg_type: MessageType,
         payload: &[u8],
     ) -> Result<(MessageHeader, Vec<u8>), OuterLinkError> {
-        self.runtime.block_on(async {
-            let conn = {
-                let guard = self.connection.lock().unwrap();
-                match guard.as_ref() {
-                    Some(c) => Arc::clone(c),
-                    None => {
-                        self.connected.store(false, Ordering::Release);
-                        return Err(OuterLinkError::Connection("not connected".into()));
-                    }
-                }
-            };
+        // Hold the connection mutex for the entire send+recv cycle to prevent
+        // two threads from interleaving their send/recv on the same connection.
+        let guard = self.connection.lock().unwrap();
+        let conn = match guard.as_ref() {
+            Some(c) => Arc::clone(c),
+            None => {
+                self.connected.store(false, Ordering::Release);
+                return Err(OuterLinkError::Connection("not connected".into()));
+            }
+        };
 
-            let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-            let header =
-                MessageHeader::new_request(req_id, msg_type, payload.len() as u32);
+        let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let header =
+            MessageHeader::new_request(req_id, msg_type, payload.len() as u32);
 
-            if let Err(e) = conn.send_message(&header, payload).await {
+        let result = self.runtime.block_on(async {
+            conn.send_message(&header, payload).await?;
+            conn.recv_message().await
+        });
+
+        // Drop the guard only after the full send+recv cycle completes.
+        drop(guard);
+
+        match result {
+            Ok((resp_header, resp_payload)) => {
+                debug_assert_eq!(
+                    resp_header.request_id, req_id,
+                    "response request_id {} does not match sent request_id {}",
+                    resp_header.request_id, req_id
+                );
+                Ok((resp_header, resp_payload))
+            }
+            Err(e) => {
                 if !conn.is_connected() {
                     self.connected.store(false, Ordering::Release);
                 }
-                return Err(e);
+                Err(e)
             }
-            match conn.recv_message().await {
-                Ok((resp_header, resp_payload)) => Ok((resp_header, resp_payload)),
-                Err(e) => {
-                    if !conn.is_connected() {
-                        self.connected.store(false, Ordering::Release);
-                    }
-                    Err(e)
-                }
-            }
-        })
+        }
     }
 
     /// Send a request to the server and wait for the response.
@@ -385,39 +392,46 @@ impl OuterLinkClient {
         payload: &[u8],
         bulk_data: &[u8],
     ) -> Result<(MessageHeader, Vec<u8>), OuterLinkError> {
-        self.runtime.block_on(async {
-            let conn = {
-                let guard = self.connection.lock().unwrap();
-                match guard.as_ref() {
-                    Some(c) => Arc::clone(c),
-                    None => {
-                        self.connected.store(false, Ordering::Release);
-                        return Err(OuterLinkError::Connection("not connected".into()));
-                    }
-                }
-            };
-
-            let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-            let header =
-                MessageHeader::new_request(req_id, msg_type, payload.len() as u32);
-
-            let result = async {
-                conn.send_message(&header, payload).await?;
-                conn.send_bulk(bulk_data).await?;
-                conn.recv_message().await
+        // Hold the connection mutex for the entire send+bulk+recv cycle to
+        // prevent two threads from interleaving on the same connection.
+        let guard = self.connection.lock().unwrap();
+        let conn = match guard.as_ref() {
+            Some(c) => Arc::clone(c),
+            None => {
+                self.connected.store(false, Ordering::Release);
+                return Err(OuterLinkError::Connection("not connected".into()));
             }
-            .await;
+        };
 
-            match result {
-                Ok((resp_header, resp_payload)) => Ok((resp_header, resp_payload)),
-                Err(e) => {
-                    if !conn.is_connected() {
-                        self.connected.store(false, Ordering::Release);
-                    }
-                    Err(e)
-                }
+        let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let header =
+            MessageHeader::new_request(req_id, msg_type, payload.len() as u32);
+
+        let result = self.runtime.block_on(async {
+            conn.send_message(&header, payload).await?;
+            conn.send_bulk(bulk_data).await?;
+            conn.recv_message().await
+        });
+
+        // Drop the guard only after the full send+bulk+recv cycle completes.
+        drop(guard);
+
+        match result {
+            Ok((resp_header, resp_payload)) => {
+                debug_assert_eq!(
+                    resp_header.request_id, req_id,
+                    "response request_id {} does not match sent request_id {}",
+                    resp_header.request_id, req_id
+                );
+                Ok((resp_header, resp_payload))
             }
-        })
+            Err(e) => {
+                if !conn.is_connected() {
+                    self.connected.store(false, Ordering::Release);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Send a request followed by raw bulk data (e.g. MemcpyHtoD).

@@ -126,6 +126,12 @@ pub trait GpuBackend: Send + Sync {
     /// The most important attribute is `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` (8).
     fn func_set_attribute(&self, func: u64, attrib: i32, value: i32) -> Result<(), CuResult>;
 
+    /// Query the offset and size of a kernel parameter by index.
+    ///
+    /// Wraps `cuFuncGetParamInfo` (CUDA 12.3+). Returns `(param_offset, param_size)`.
+    /// Returns `Err(InvalidValue)` if the function or param_index is invalid.
+    fn func_get_param_info(&self, func: u64, param_index: u64) -> Result<(u64, u64), CuResult>;
+
     /// Get the base address and size of the allocation that contains `dptr`.
     ///
     /// Returns `(base, size)` on success.
@@ -601,6 +607,35 @@ pub trait GpuBackend: Send + Sync {
     /// Destroys regardless of refcount, resets refcount to 0.
     /// Returns the old context handle if one existed.
     fn primary_ctx_reset(&self, device: i32) -> Result<Option<u64>, CuResult>;
+
+    // --- Threading support ---
+
+    /// Set the CUDA context as current on the calling thread.
+    ///
+    /// On a real GPU backend this calls `cuCtxSetCurrent`. On the stub this
+    /// is a no-op because stub contexts are not thread-local.
+    ///
+    /// The CudaWorker calls this before every backend operation to ensure
+    /// the correct context is active on its dedicated OS thread.
+    fn ctx_set_current(&self, ctx: u64) -> Result<(), CuResult> {
+        // Default: no-op (suitable for stubs that have no thread-local state)
+        let _ = ctx;
+        Ok(())
+    }
+
+    /// Whether this backend requires a dedicated OS thread per connection.
+    ///
+    /// CUDA contexts are thread-local: `cuCtxCreate` pushes onto the calling
+    /// thread's stack, and subsequent operations use whatever context is
+    /// current on *that* thread. When the server dispatches requests across
+    /// tokio worker threads, the context may not be current on the thread
+    /// that runs the next request.
+    ///
+    /// Returns `true` for real GPU backends (CudaGpuBackend) and `false`
+    /// for the stub (which has no thread-local state).
+    fn needs_dedicated_thread(&self) -> bool {
+        false // Default: no dedicated thread needed (safe for stubs)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,6 +1180,23 @@ impl GpuBackend for StubGpuBackend {
             0..=7 | 10..=15 => Err(CuResult::InvalidValue),
             _ => Err(CuResult::InvalidValue),
         }
+    }
+
+    fn func_get_param_info(&self, func: u64, param_index: u64) -> Result<(u64, u64), CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.functions.contains_key(&func) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Stub: pretend every kernel has a fixed set of 8-byte parameters.
+        // Real CUDA kernels vary, but for testing this gives deterministic results.
+        // We allow up to 64 params (CUDA max total is 4096 bytes / 8 = 512 params of 8 bytes).
+        const MAX_STUB_PARAMS: u64 = 64;
+        if param_index >= MAX_STUB_PARAMS {
+            return Err(CuResult::InvalidValue);
+        }
+        let offset = param_index * 8; // each param is 8 bytes, packed
+        let size = 8u64;
+        Ok((offset, size))
     }
 
     fn mem_get_address_range(&self, dptr: u64) -> Result<(u64, usize), CuResult> {

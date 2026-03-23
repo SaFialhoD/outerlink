@@ -4,6 +4,7 @@
 //! for the OuterLink GPU node daemon.
 
 pub mod cuda_backend;
+pub mod cuda_thread;
 pub mod gpu_backend;
 pub mod handler;
 pub mod server;

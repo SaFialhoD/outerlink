@@ -657,6 +657,24 @@ pub fn handle_request_full(
             }
         }
 
+        MessageType::FuncGetParamInfo => {
+            // Payload: 8B func (u64 LE) + 8B param_index (u64 LE) = 16 bytes
+            if payload.len() < 16 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let func = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let param_index = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            match backend.func_get_param_info(func, param_index) {
+                Ok((offset, size)) => {
+                    let mut data = Vec::with_capacity(16);
+                    data.extend_from_slice(&offset.to_le_bytes());
+                    data.extend_from_slice(&size.to_le_bytes());
+                    success_with(rid, &data)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         MessageType::MemGetAddressRange => {
             // Payload: 8B dptr (u64 LE) = 8 bytes
             if payload.len() < 8 {
@@ -1871,10 +1889,17 @@ pub fn handle_request_full(
 
         // --- ModuleLoadFatBinary ---
         MessageType::ModuleLoadFatBinary => {
-            if payload.is_empty() {
+            // Client sends [8B data_len][data_bytes]. Strip the length prefix.
+            if payload.len() < 8 {
                 return error_response(rid, CuResult::InvalidValue);
             }
-            match backend.module_load_fat_binary(payload) {
+            let data_len =
+                u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
+            if payload.len() < 8 + data_len {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let data = &payload[8..8 + data_len];
+            match backend.module_load_fat_binary(data) {
                 Ok(handle) => {
                     session.track_module(handle);
                     success_with(rid, &handle.to_le_bytes())
@@ -4756,6 +4781,58 @@ mod tests {
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 
+    // --- FuncGetParamInfo handler tests ---
+
+    #[test]
+    fn test_func_get_param_info_handler() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // Query param 0: stub should return (offset=0, size=8) for param index 0
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u64.to_le_bytes()); // param_index = 0
+        let hdr = req(MessageType::FuncGetParamInfo, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        // Response should contain offset (8B) + size (8B) after the 4B result
+        assert!(resp.len() >= 20, "response too short: {} bytes", resp.len());
+        let offset = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        let size = u64::from_le_bytes(resp[12..20].try_into().unwrap());
+        assert_eq!(offset, 0); // first param at offset 0
+        assert_eq!(size, 8);   // default param size = 8 bytes
+    }
+
+    #[test]
+    fn test_func_get_param_info_invalid_func() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = 0xDEADu64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::FuncGetParamInfo, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_func_get_param_info_short_payload() {
+        let gpu = StubGpuBackend::new();
+        let payload = [0u8; 8]; // need 16
+        let hdr = req(MessageType::FuncGetParamInfo, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_func_get_param_info_out_of_range_index() {
+        let gpu = StubGpuBackend::new();
+        let func = setup_function(&gpu);
+        // Stub has no real params, so any index should return InvalidValue
+        // (since the stub defaults to 0 params defined)
+        let mut payload = func.to_le_bytes().to_vec();
+        payload.extend_from_slice(&999u64.to_le_bytes());
+        let hdr = req(MessageType::FuncGetParamInfo, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
     // --- MemGetAddressRange handler tests ---
 
     #[test]
@@ -6422,9 +6499,13 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let mut session = ConnectionSession::new();
 
-        let payload = b"fake fat binary data";
+        // Wire format: [8B data_len][data_bytes]
+        let fat_data = b"fake fat binary data";
+        let mut payload = Vec::with_capacity(8 + fat_data.len());
+        payload.extend_from_slice(&(fat_data.len() as u64).to_le_bytes());
+        payload.extend_from_slice(fat_data);
         let hdr = req(MessageType::ModuleLoadFatBinary, payload.len() as u32);
-        let (_, resp) = dispatch_with(&gpu, &hdr, payload, &mut session);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
         assert_eq!(response_result(&resp), CuResult::Success);
         let handle = u64::from_le_bytes(resp[4..12].try_into().unwrap());
         assert_ne!(handle, 0);
@@ -6435,6 +6516,18 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let hdr = req(MessageType::ModuleLoadFatBinary, 0);
         let (_, resp) = dispatch(&gpu, &hdr, &[]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_module_load_fat_binary_truncated_data() {
+        let gpu = StubGpuBackend::new();
+        // Length prefix claims 100 bytes but only 4 bytes of data follow
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&100u64.to_le_bytes());
+        payload.extend_from_slice(b"short");
+        let hdr = req(MessageType::ModuleLoadFatBinary, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
     }
 

@@ -21,6 +21,7 @@ use outerlink_common::protocol::{MessageHeader, MessageType};
 use outerlink_common::tcp_transport::TcpTransportConnection;
 use outerlink_common::transport::TransportConnection;
 
+use crate::cuda_thread::CudaWorker;
 use crate::gpu_backend::GpuBackend;
 use crate::handler::handle_request_full;
 use crate::session::ConnectionSession;
@@ -160,61 +161,103 @@ impl Server {
                                     }
                                     tracing::info!(%peer, "callback channel closed");
                                 } else {
-                                    // Normal client connection. Process the first message, then loop.
+                                    // Normal client connection.
                                     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-                                    let session = Arc::new(TokioMutex::new(
-                                        ConnectionSession::with_session_id(session_id),
-                                    ));
 
-                                    // Register session for callback channel lookup.
-                                    {
-                                        let mut reg = sessions.lock().await;
-                                        reg.insert(session_id, Arc::clone(&session));
-                                    }
-
-                                    // Handle the first message (which we already read).
-                                    {
-                                        let mut sess = session.lock().await;
-                                        let result = handle_request_full(
-                                            &*backend, &first_header, &first_payload, &mut sess,
+                                    if backend.needs_dedicated_thread() {
+                                        // --- Dedicated CUDA thread path ---
+                                        //
+                                        // All backend calls go through a CudaWorker
+                                        // that runs on a single OS thread, ensuring
+                                        // CUDA context thread-locality.
+                                        let worker = CudaWorker::with_session_id(
+                                            Arc::clone(&backend),
+                                            session_id,
                                         );
+
+                                        // Handle the first message through the worker.
+                                        let result = match worker.send_request_full(
+                                            first_header, first_payload, 0,
+                                        ).await {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                tracing::error!(%peer, error = %e, "worker failed on first message");
+                                                return;
+                                            }
+                                        };
                                         if let Err(e) = conn.send_message(
                                             &result.response.0, &result.response.1,
                                         ).await {
                                             tracing::error!(%peer, error = %e, "send failed on first message");
-                                            sess.cleanup(&*backend);
-                                            let mut reg = sessions.lock().await;
-                                            reg.remove(&session_id);
                                             return;
                                         }
-                                        // Send callback notification if present
-                                        if let Some((cb_id, cb_status)) = result.callback_notification {
-                                            send_callback_ready(&sess, cb_id, cb_status).await;
+
+                                        // Main request loop (dedicated thread path)
+                                        if let Err(e) = handle_connection_loop_worker(
+                                            &conn, &worker, &mut conn_shutdown_rx,
+                                        ).await {
+                                            tracing::error!(%peer, error = %e, "connection handler error");
                                         }
-                                    }
 
-                                    // Main request loop
-                                    if let Err(e) = handle_connection_loop(
-                                        &conn, &*backend, &mut conn_shutdown_rx, &session,
-                                    ).await {
-                                        tracing::error!(%peer, error = %e, "connection handler error");
-                                    }
+                                        // CudaWorker cleans up its session on drop.
+                                        drop(worker);
 
-                                    // Cleanup
-                                    {
-                                        let mut sess = session.lock().await;
-                                        let report = sess.cleanup(&*backend);
-                                        if report.succeeded > 0 || report.failed > 0 {
-                                            tracing::info!(
-                                                succeeded = report.succeeded,
-                                                failed = report.failed,
-                                                "session cleanup complete"
+                                    } else {
+                                        // --- Direct dispatch path (stub / no thread-local state) ---
+                                        let session = Arc::new(TokioMutex::new(
+                                            ConnectionSession::with_session_id(session_id),
+                                        ));
+
+                                        // Register session for callback channel lookup.
+                                        {
+                                            let mut reg = sessions.lock().await;
+                                            reg.insert(session_id, Arc::clone(&session));
+                                        }
+
+                                        // Handle the first message (which we already read).
+                                        {
+                                            let mut sess = session.lock().await;
+                                            let result = handle_request_full(
+                                                &*backend, &first_header, &first_payload, &mut sess,
                                             );
+                                            if let Err(e) = conn.send_message(
+                                                &result.response.0, &result.response.1,
+                                            ).await {
+                                                tracing::error!(%peer, error = %e, "send failed on first message");
+                                                sess.cleanup(&*backend);
+                                                let mut reg = sessions.lock().await;
+                                                reg.remove(&session_id);
+                                                return;
+                                            }
+                                            // Send callback notification if present
+                                            if let Some((cb_id, cb_status)) = result.callback_notification {
+                                                send_callback_ready(&sess, cb_id, cb_status).await;
+                                            }
                                         }
-                                    }
-                                    {
-                                        let mut reg = sessions.lock().await;
-                                        reg.remove(&session_id);
+
+                                        // Main request loop
+                                        if let Err(e) = handle_connection_loop(
+                                            &conn, &*backend, &mut conn_shutdown_rx, &session,
+                                        ).await {
+                                            tracing::error!(%peer, error = %e, "connection handler error");
+                                        }
+
+                                        // Cleanup
+                                        {
+                                            let mut sess = session.lock().await;
+                                            let report = sess.cleanup(&*backend);
+                                            if report.succeeded > 0 || report.failed > 0 {
+                                                tracing::info!(
+                                                    succeeded = report.succeeded,
+                                                    failed = report.failed,
+                                                    "session cleanup complete"
+                                                );
+                                            }
+                                        }
+                                        {
+                                            let mut reg = sessions.lock().await;
+                                            reg.remove(&session_id);
+                                        }
                                     }
 
                                     tracing::info!(%peer, "connection closed");
@@ -386,6 +429,61 @@ async fn handle_connection_loop(
         }
 
         // Check shutdown after completing this request, before reading next.
+        if shutdown_rx.has_changed().unwrap_or(true) {
+            tracing::debug!("shutdown pending, stopping after completed request");
+            return Ok(());
+        }
+    }
+}
+
+/// Inner loop for a connection using a dedicated CUDA worker thread.
+///
+/// Same structure as [`handle_connection_loop`] but dispatches requests
+/// through a [`CudaWorker`] instead of calling the handler directly.
+/// This ensures all backend calls execute on a single OS thread, preserving
+/// CUDA context thread-locality.
+async fn handle_connection_loop_worker(
+    conn: &Arc<TcpTransportConnection>,
+    worker: &CudaWorker,
+    shutdown_rx: &mut watch::Receiver<()>,
+) -> anyhow::Result<()> {
+    loop {
+        let msg = tokio::select! {
+            _ = shutdown_rx.changed() => {
+                tracing::debug!("connection received shutdown signal, finishing");
+                return Ok(());
+            }
+
+            result = conn.recv_message() => {
+                match result {
+                    Ok(msg) => msg,
+                    Err(OuterLinkError::ConnectionClosed) => return Ok(()),
+                    Err(e) => return Err(anyhow::anyhow!(e)),
+                }
+            }
+        };
+
+        let (header, payload) = msg;
+
+        tracing::debug!(
+            request_id = header.request_id,
+            msg_type = ?header.msg_type,
+            payload_len = header.payload_len,
+            "received request (worker path)"
+        );
+
+        // Dispatch through the dedicated CUDA thread.
+        // The worker's internal session tracks current_ctx, so we pass 0
+        // and let the worker use its own session state.
+        let result = worker
+            .send_request_full(header, payload, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        // Write the response.
+        conn.send_message(&result.response.0, &result.response.1).await?;
+
+        // Check shutdown after completing this request.
         if shutdown_rx.has_changed().unwrap_or(true) {
             tracing::debug!("shutdown pending, stopping after completed request");
             return Ok(());
