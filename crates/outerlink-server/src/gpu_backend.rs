@@ -533,6 +533,38 @@ pub trait GpuBackend: Send + Sync {
     /// In the stub, returns the kernel handle itself (same handle space).
     fn kernel_get_function(&self, kernel: u64) -> Result<u64, CuResult>;
 
+    // --- CUDA Graph operations ---
+
+    /// Begin capturing GPU work on a stream into a graph (cuStreamBeginCapture).
+    /// `mode` is the CUstreamCaptureMode enum value.
+    fn stream_begin_capture(&self, stream: u64, mode: i32) -> Result<(), CuResult>;
+
+    /// End capture on a stream, returning a graph handle (cuStreamEndCapture).
+    fn stream_end_capture(&self, stream: u64) -> Result<u64, CuResult>;
+
+    /// Query whether a stream is currently capturing (cuStreamIsCapturing).
+    /// Returns the capture status: 0=NONE, 1=ACTIVE, 2=INVALIDATED.
+    fn stream_is_capturing(&self, stream: u64) -> Result<i32, CuResult>;
+
+    /// Get capture info for a stream (cuStreamGetCaptureInfo_v2).
+    /// Returns (status, capture_id). Deps are not needed for Phase 1.
+    fn stream_get_capture_info(&self, stream: u64) -> Result<(i32, u64), CuResult>;
+
+    /// Create an empty graph (cuGraphCreate).
+    fn graph_create(&self, flags: u32) -> Result<u64, CuResult>;
+
+    /// Instantiate a graph for execution (cuGraphInstantiate).
+    fn graph_instantiate(&self, graph: u64, flags: u64) -> Result<u64, CuResult>;
+
+    /// Launch an instantiated graph on a stream (cuGraphLaunch).
+    fn graph_launch(&self, graph_exec: u64, stream: u64) -> Result<(), CuResult>;
+
+    /// Destroy a graph execution instance (cuGraphExecDestroy).
+    fn graph_exec_destroy(&self, graph_exec: u64) -> Result<(), CuResult>;
+
+    /// Destroy a graph (cuGraphDestroy).
+    fn graph_destroy(&self, graph: u64) -> Result<(), CuResult>;
+
     // --- Lifecycle ---
 
     /// Clean up all GPU resources held by this backend.
@@ -625,6 +657,23 @@ struct StubEvent {
     flags: u32,
     recorded: bool,
     timestamp_ns: u64,
+}
+
+/// Per-stream capture state for graph recording.
+struct CaptureState {
+    mode: i32,
+    capture_id: u64,
+}
+
+/// Metadata for a stub CUDA graph.
+struct GraphState {
+    _flags: u32,
+    _from_capture: bool,
+}
+
+/// Metadata for a stub CUDA graph execution instance.
+struct GraphExecState {
+    _graph: u64,
 }
 
 /// Metadata for a stub CUDA 12 library.
@@ -721,6 +770,18 @@ struct StubState {
     cache_config: u32,
     /// Shared memory configuration (CU_SHARED_MEM_CONFIG_*_BANK_SIZE).
     shared_mem_config: u32,
+    /// Streams currently being captured: stream handle -> capture state.
+    capturing_streams: HashMap<u64, CaptureState>,
+    /// CUDA graphs: handle -> graph state.
+    graphs: HashMap<u64, GraphState>,
+    /// Counter for generating graph handles.
+    next_graph_id: u64,
+    /// CUDA graph execution instances: handle -> exec state.
+    graph_execs: HashMap<u64, GraphExecState>,
+    /// Counter for generating graph exec handles.
+    next_graph_exec_id: u64,
+    /// Monotonically increasing capture ID.
+    next_capture_id: u64,
 }
 
 impl StubState {
@@ -785,6 +846,12 @@ impl StubGpuBackend {
                 peer_access: HashSet::new(),
                 cache_config: 0,        // CU_FUNC_CACHE_PREFER_NONE
                 shared_mem_config: 0,    // CU_SHARED_MEM_CONFIG_DEFAULT_BANK_SIZE
+                capturing_streams: HashMap::new(),
+                graphs: HashMap::new(),
+                next_graph_id: 0x4752_0000_0000_0001, // 'Gr' prefix
+                graph_execs: HashMap::new(),
+                next_graph_exec_id: 0x4758_0000_0000_0001, // 'Gx' prefix
+                next_capture_id: 1,
             }),
         }
     }
@@ -1964,6 +2031,123 @@ impl GpuBackend for StubGpuBackend {
             Some(k) => Ok(k.function_id),
             None => Err(CuResult::InvalidValue),
         }
+    }
+
+    fn stream_begin_capture(&self, stream: u64, mode: i32) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        // Stream 0 (default/legacy) cannot be captured.
+        if stream == 0 {
+            return Err(CuResult::InvalidValue);
+        }
+        if !state.streams.contains_key(&stream) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Already capturing?
+        if state.capturing_streams.contains_key(&stream) {
+            return Err(CuResult::InvalidValue);
+        }
+        let capture_id = state.next_capture_id;
+        state.next_capture_id += 1;
+        state.capturing_streams.insert(stream, CaptureState {
+            mode,
+            capture_id,
+        });
+        Ok(())
+    }
+
+    fn stream_end_capture(&self, stream: u64) -> Result<u64, CuResult> {
+        let mut state = self.state.lock().unwrap();
+        // Must be capturing.
+        if state.capturing_streams.remove(&stream).is_none() {
+            return Err(CuResult::InvalidValue);
+        }
+        // Create a graph from the capture.
+        let id = state.next_graph_id;
+        state.next_graph_id += 1;
+        state.graphs.insert(id, GraphState {
+            _flags: 0,
+            _from_capture: true,
+        });
+        Ok(id)
+    }
+
+    fn stream_is_capturing(&self, stream: u64) -> Result<i32, CuResult> {
+        let state = self.state.lock().unwrap();
+        // Stream 0 is never capturing.
+        if stream == 0 {
+            return Ok(0); // CU_STREAM_CAPTURE_STATUS_NONE
+        }
+        // Non-existent streams return NONE (not an error) to match CUDA behavior
+        // where defensively querying capture status is common.
+        if state.capturing_streams.contains_key(&stream) {
+            Ok(1) // CU_STREAM_CAPTURE_STATUS_ACTIVE
+        } else {
+            Ok(0) // CU_STREAM_CAPTURE_STATUS_NONE
+        }
+    }
+
+    fn stream_get_capture_info(&self, stream: u64) -> Result<(i32, u64), CuResult> {
+        let state = self.state.lock().unwrap();
+        if stream == 0 {
+            return Ok((0, 0)); // NONE, no capture id
+        }
+        match state.capturing_streams.get(&stream) {
+            Some(cap) => Ok((1, cap.capture_id)), // ACTIVE
+            None => Ok((0, 0)), // NONE
+        }
+    }
+
+    fn graph_create(&self, flags: u32) -> Result<u64, CuResult> {
+        let mut state = self.state.lock().unwrap();
+        let id = state.next_graph_id;
+        state.next_graph_id += 1;
+        state.graphs.insert(id, GraphState {
+            _flags: flags,
+            _from_capture: false,
+        });
+        Ok(id)
+    }
+
+    fn graph_instantiate(&self, graph: u64, _flags: u64) -> Result<u64, CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if !state.graphs.contains_key(&graph) {
+            return Err(CuResult::InvalidValue);
+        }
+        let id = state.next_graph_exec_id;
+        state.next_graph_exec_id += 1;
+        state.graph_execs.insert(id, GraphExecState {
+            _graph: graph,
+        });
+        Ok(id)
+    }
+
+    fn graph_launch(&self, graph_exec: u64, stream: u64) -> Result<(), CuResult> {
+        let state = self.state.lock().unwrap();
+        if !state.graph_execs.contains_key(&graph_exec) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Stream 0 is valid (default stream). Non-zero must exist.
+        if stream != 0 && !state.streams.contains_key(&stream) {
+            return Err(CuResult::InvalidValue);
+        }
+        // Stub: no real work to do, graph "launches" immediately.
+        Ok(())
+    }
+
+    fn graph_exec_destroy(&self, graph_exec: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if state.graph_execs.remove(&graph_exec).is_none() {
+            return Err(CuResult::InvalidValue);
+        }
+        Ok(())
+    }
+
+    fn graph_destroy(&self, graph: u64) -> Result<(), CuResult> {
+        let mut state = self.state.lock().unwrap();
+        if state.graphs.remove(&graph).is_none() {
+            return Err(CuResult::InvalidValue);
+        }
+        Ok(())
     }
 
     fn shutdown(&self) {
@@ -4912,5 +5096,263 @@ mod tests {
         let gpu = StubGpuBackend::new();
         let attrs = vec![1, 2];
         assert_eq!(gpu.mem_range_get_attributes(&attrs, 0xDEAD, 1024), Err(CuResult::InvalidValue));
+    }
+
+    // -----------------------------------------------------------------------
+    // CUDA Graph tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_graph_create_and_destroy() {
+        let gpu = StubGpuBackend::new();
+        let g = gpu.graph_create(0).unwrap();
+        assert_ne!(g, 0);
+        gpu.graph_destroy(g).unwrap();
+    }
+
+    #[test]
+    fn test_graph_destroy_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.graph_destroy(0xDEAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_graph_create_unique_handles() {
+        let gpu = StubGpuBackend::new();
+        let g1 = gpu.graph_create(0).unwrap();
+        let g2 = gpu.graph_create(0).unwrap();
+        assert_ne!(g1, g2);
+        gpu.graph_destroy(g1).unwrap();
+        gpu.graph_destroy(g2).unwrap();
+    }
+
+    #[test]
+    fn test_graph_double_destroy() {
+        let gpu = StubGpuBackend::new();
+        let g = gpu.graph_create(0).unwrap();
+        gpu.graph_destroy(g).unwrap();
+        assert_eq!(gpu.graph_destroy(g), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_graph_instantiate_and_destroy() {
+        let gpu = StubGpuBackend::new();
+        let g = gpu.graph_create(0).unwrap();
+        let exec = gpu.graph_instantiate(g, 0).unwrap();
+        assert_ne!(exec, 0);
+        gpu.graph_exec_destroy(exec).unwrap();
+        gpu.graph_destroy(g).unwrap();
+    }
+
+    #[test]
+    fn test_graph_instantiate_invalid_graph() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.graph_instantiate(0xDEAD, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_graph_exec_destroy_invalid() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.graph_exec_destroy(0xDEAD), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_graph_exec_double_destroy() {
+        let gpu = StubGpuBackend::new();
+        let g = gpu.graph_create(0).unwrap();
+        let exec = gpu.graph_instantiate(g, 0).unwrap();
+        gpu.graph_exec_destroy(exec).unwrap();
+        assert_eq!(gpu.graph_exec_destroy(exec), Err(CuResult::InvalidValue));
+        gpu.graph_destroy(g).unwrap();
+    }
+
+    #[test]
+    fn test_graph_launch_default_stream() {
+        let gpu = StubGpuBackend::new();
+        let g = gpu.graph_create(0).unwrap();
+        let exec = gpu.graph_instantiate(g, 0).unwrap();
+        gpu.graph_launch(exec, 0).unwrap();
+        gpu.graph_exec_destroy(exec).unwrap();
+        gpu.graph_destroy(g).unwrap();
+    }
+
+    #[test]
+    fn test_graph_launch_with_stream() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        let g = gpu.graph_create(0).unwrap();
+        let exec = gpu.graph_instantiate(g, 0).unwrap();
+        gpu.graph_launch(exec, stream).unwrap();
+        gpu.graph_exec_destroy(exec).unwrap();
+        gpu.graph_destroy(g).unwrap();
+        gpu.stream_destroy(stream).unwrap();
+    }
+
+    #[test]
+    fn test_graph_launch_invalid_exec() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.graph_launch(0xDEAD, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_graph_launch_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        let g = gpu.graph_create(0).unwrap();
+        let exec = gpu.graph_instantiate(g, 0).unwrap();
+        assert_eq!(gpu.graph_launch(exec, 0xDEAD), Err(CuResult::InvalidValue));
+        gpu.graph_exec_destroy(exec).unwrap();
+        gpu.graph_destroy(g).unwrap();
+    }
+
+    #[test]
+    fn test_stream_begin_capture_end_capture() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        gpu.stream_begin_capture(stream, 0).unwrap();
+        let g = gpu.stream_end_capture(stream).unwrap();
+        assert_ne!(g, 0);
+        gpu.graph_destroy(g).unwrap();
+        gpu.stream_destroy(stream).unwrap();
+    }
+
+    #[test]
+    fn test_stream_begin_capture_default_stream_fails() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.stream_begin_capture(0, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_stream_begin_capture_invalid_stream() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.stream_begin_capture(0xDEAD, 0), Err(CuResult::InvalidValue));
+    }
+
+    #[test]
+    fn test_stream_begin_capture_already_capturing() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        gpu.stream_begin_capture(stream, 0).unwrap();
+        assert_eq!(gpu.stream_begin_capture(stream, 0), Err(CuResult::InvalidValue));
+        let _ = gpu.stream_end_capture(stream).unwrap();
+        gpu.stream_destroy(stream).unwrap();
+    }
+
+    #[test]
+    fn test_stream_end_capture_not_capturing() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        assert_eq!(gpu.stream_end_capture(stream), Err(CuResult::InvalidValue));
+        gpu.stream_destroy(stream).unwrap();
+    }
+
+    #[test]
+    fn test_stream_is_capturing_default_stream() {
+        let gpu = StubGpuBackend::new();
+        assert_eq!(gpu.stream_is_capturing(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_stream_is_capturing_not_capturing() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        assert_eq!(gpu.stream_is_capturing(stream).unwrap(), 0);
+        gpu.stream_destroy(stream).unwrap();
+    }
+
+    #[test]
+    fn test_stream_is_capturing_active() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        gpu.stream_begin_capture(stream, 0).unwrap();
+        assert_eq!(gpu.stream_is_capturing(stream).unwrap(), 1);
+        let g = gpu.stream_end_capture(stream).unwrap();
+        assert_eq!(gpu.stream_is_capturing(stream).unwrap(), 0);
+        gpu.graph_destroy(g).unwrap();
+        gpu.stream_destroy(stream).unwrap();
+    }
+
+    #[test]
+    fn test_stream_get_capture_info_not_capturing() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        let (status, id) = gpu.stream_get_capture_info(stream).unwrap();
+        assert_eq!(status, 0);
+        assert_eq!(id, 0);
+        gpu.stream_destroy(stream).unwrap();
+    }
+
+    #[test]
+    fn test_stream_get_capture_info_capturing() {
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        gpu.stream_begin_capture(stream, 0).unwrap();
+        let (status, id) = gpu.stream_get_capture_info(stream).unwrap();
+        assert_eq!(status, 1); // ACTIVE
+        assert_ne!(id, 0);    // capture ID assigned
+        let g = gpu.stream_end_capture(stream).unwrap();
+        gpu.graph_destroy(g).unwrap();
+        gpu.stream_destroy(stream).unwrap();
+    }
+
+    #[test]
+    fn test_stream_get_capture_info_default_stream() {
+        let gpu = StubGpuBackend::new();
+        let (status, id) = gpu.stream_get_capture_info(0).unwrap();
+        assert_eq!(status, 0);
+        assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn test_capture_unique_ids() {
+        let gpu = StubGpuBackend::new();
+        let s1 = gpu.stream_create(0).unwrap();
+        let s2 = gpu.stream_create(0).unwrap();
+        gpu.stream_begin_capture(s1, 0).unwrap();
+        let (_, id1) = gpu.stream_get_capture_info(s1).unwrap();
+        let g1 = gpu.stream_end_capture(s1).unwrap();
+        gpu.stream_begin_capture(s2, 0).unwrap();
+        let (_, id2) = gpu.stream_get_capture_info(s2).unwrap();
+        let g2 = gpu.stream_end_capture(s2).unwrap();
+        assert_ne!(id1, id2);
+        gpu.graph_destroy(g1).unwrap();
+        gpu.graph_destroy(g2).unwrap();
+        gpu.stream_destroy(s1).unwrap();
+        gpu.stream_destroy(s2).unwrap();
+    }
+
+    #[test]
+    fn test_capture_graph_instantiate_launch() {
+        // Full capture lifecycle: capture -> instantiate -> launch -> destroy.
+        let gpu = StubGpuBackend::new();
+        let stream = gpu.stream_create(0).unwrap();
+        gpu.stream_begin_capture(stream, 0).unwrap();
+        let g = gpu.stream_end_capture(stream).unwrap();
+        let exec = gpu.graph_instantiate(g, 0).unwrap();
+        gpu.graph_launch(exec, 0).unwrap();
+        gpu.graph_exec_destroy(exec).unwrap();
+        gpu.graph_destroy(g).unwrap();
+        gpu.stream_destroy(stream).unwrap();
+    }
+
+    #[test]
+    fn test_graph_instantiate_with_flags() {
+        let gpu = StubGpuBackend::new();
+        let g = gpu.graph_create(0).unwrap();
+        let exec = gpu.graph_instantiate(g, 1).unwrap(); // non-zero flags
+        assert_ne!(exec, 0);
+        gpu.graph_exec_destroy(exec).unwrap();
+        gpu.graph_destroy(g).unwrap();
+    }
+
+    #[test]
+    fn test_multiple_exec_from_same_graph() {
+        let gpu = StubGpuBackend::new();
+        let g = gpu.graph_create(0).unwrap();
+        let e1 = gpu.graph_instantiate(g, 0).unwrap();
+        let e2 = gpu.graph_instantiate(g, 0).unwrap();
+        assert_ne!(e1, e2);
+        gpu.graph_exec_destroy(e1).unwrap();
+        gpu.graph_exec_destroy(e2).unwrap();
+        gpu.graph_destroy(g).unwrap();
     }
 }

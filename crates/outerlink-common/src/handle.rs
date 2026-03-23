@@ -18,6 +18,8 @@ const MEMPOOL_PREFIX: u64 = 0x1200_0000_0000_0000;
 const LINKSTATE_PREFIX: u64 = 0x1300_0000_0000_0000;
 const LIBRARY_PREFIX: u64 = 0x1400_0000_0000_0000;
 const KERNEL_PREFIX: u64 = 0x1500_0000_0000_0000;
+const GRAPH_PREFIX: u64 = 0x1600_0000_0000_0000;
+const GRAPH_EXEC_PREFIX: u64 = 0x1700_0000_0000_0000;
 
 /// Thread-safe bidirectional handle mapping.
 ///
@@ -113,6 +115,8 @@ pub struct HandleStore {
     pub link_states: HandleMap,
     pub libraries: HandleMap,
     pub kernels: HandleMap,
+    pub graphs: HandleMap,
+    pub graph_execs: HandleMap,
 }
 
 impl HandleStore {
@@ -129,6 +133,8 @@ impl HandleStore {
             link_states: HandleMap::new(LINKSTATE_PREFIX),
             libraries: HandleMap::new(LIBRARY_PREFIX),
             kernels: HandleMap::new(KERNEL_PREFIX),
+            graphs: HandleMap::new(GRAPH_PREFIX),
+            graph_execs: HandleMap::new(GRAPH_EXEC_PREFIX),
         }
     }
 }

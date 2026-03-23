@@ -2151,6 +2151,146 @@ pub fn handle_request_full(
             }
         }
 
+        // -----------------------------------------------------------------
+        // CUDA Graph API
+        // -----------------------------------------------------------------
+
+        MessageType::StreamBeginCapture => {
+            // Payload: u64 stream + i32 mode = 12 bytes
+            if payload.len() < 12 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let stream = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let mode = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+            match backend.stream_begin_capture(stream, mode) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::StreamEndCapture => {
+            // Payload: u64 stream = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let stream = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.stream_end_capture(stream) {
+                Ok(graph) => {
+                    session.track_graph(graph);
+                    success_with(rid, &graph.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::StreamIsCapturing => {
+            // Payload: u64 stream = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let stream = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.stream_is_capturing(stream) {
+                Ok(status) => success_with(rid, &status.to_le_bytes()),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::StreamGetCaptureInfo => {
+            // Payload: u64 stream = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let stream = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.stream_get_capture_info(stream) {
+                Ok((status, capture_id)) => {
+                    let mut data = Vec::with_capacity(12);
+                    data.extend_from_slice(&status.to_le_bytes());
+                    data.extend_from_slice(&capture_id.to_le_bytes());
+                    success_with(rid, &data)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::GraphCreate => {
+            // Payload: u32 flags = 4 bytes
+            if payload.len() < 4 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let flags = u32::from_le_bytes(payload[..4].try_into().unwrap());
+            match backend.graph_create(flags) {
+                Ok(graph) => {
+                    session.track_graph(graph);
+                    success_with(rid, &graph.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::GraphInstantiate => {
+            // Payload: u64 graph + u64 flags = 16 bytes
+            // (flags may be absent for the non-flags variant, default to 0)
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let graph = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let flags = if payload.len() >= 16 {
+                u64::from_le_bytes(payload[8..16].try_into().unwrap())
+            } else {
+                0
+            };
+            match backend.graph_instantiate(graph, flags) {
+                Ok(exec) => {
+                    session.track_graph_exec(exec);
+                    success_with(rid, &exec.to_le_bytes())
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::GraphLaunch => {
+            // Payload: u64 graph_exec + u64 stream = 16 bytes
+            if payload.len() < 16 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let graph_exec = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            let stream = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+            match backend.graph_launch(graph_exec, stream) {
+                Ok(()) => result_only(rid, CuResult::Success),
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::GraphExecDestroy => {
+            // Payload: u64 graph_exec = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let graph_exec = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.graph_exec_destroy(graph_exec) {
+                Ok(()) => {
+                    session.untrack_graph_exec(graph_exec);
+                    result_only(rid, CuResult::Success)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
+        MessageType::GraphDestroy => {
+            // Payload: u64 graph = 8 bytes
+            if payload.len() < 8 {
+                return error_response(rid, CuResult::InvalidValue);
+            }
+            let graph = u64::from_le_bytes(payload[..8].try_into().unwrap());
+            match backend.graph_destroy(graph) {
+                Ok(()) => {
+                    session.untrack_graph(graph);
+                    result_only(rid, CuResult::Success)
+                }
+                Err(e) => error_response(rid, e),
+            }
+        }
+
         // They are handled in the accept loop (server.rs).
         MessageType::CallbackReady
         | MessageType::CallbackChannelInit
@@ -7011,5 +7151,421 @@ mod tests {
         let hdr = req(MessageType::LibraryLoadData, payload.len() as u32);
         let (_, resp) = dispatch(&gpu, &hdr, &payload);
         assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    // -----------------------------------------------------------------------
+    // CUDA Graph handler tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a stream and return its handle.
+    fn setup_stream(gpu: &StubGpuBackend, session: &mut ConnectionSession) -> u64 {
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::StreamCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(gpu, &hdr, &payload, session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        u64::from_le_bytes(resp[4..12].try_into().unwrap())
+    }
+
+    #[test]
+    fn test_graph_create_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::GraphCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let graph = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(graph, 0);
+        assert_eq!(session.graph_count(), 1);
+    }
+
+    #[test]
+    fn test_graph_create_truncated_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::GraphCreate, 2);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0; 2]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_graph_destroy_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        // Create
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::GraphCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let graph = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        // Destroy
+        let payload = graph.to_le_bytes();
+        let hdr = req(MessageType::GraphDestroy, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.graph_count(), 0);
+    }
+
+    #[test]
+    fn test_graph_destroy_invalid_handle() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xDEADu64.to_le_bytes();
+        let hdr = req(MessageType::GraphDestroy, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_graph_destroy_truncated_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::GraphDestroy, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_graph_instantiate_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        // Create graph
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::GraphCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let graph = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        // Instantiate
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&graph.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes()); // flags
+        let hdr = req(MessageType::GraphInstantiate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let exec = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(exec, 0);
+        assert_eq!(session.graph_exec_count(), 1);
+    }
+
+    #[test]
+    fn test_graph_instantiate_invalid_graph() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0xDEADu64.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::GraphInstantiate, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_graph_instantiate_truncated_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::GraphInstantiate, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_graph_instantiate_without_flags() {
+        // Send only 8 bytes (graph, no flags) — flags should default to 0.
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::GraphCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let graph = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        let payload = graph.to_le_bytes();
+        let hdr = req(MessageType::GraphInstantiate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.graph_exec_count(), 1);
+    }
+
+    #[test]
+    fn test_graph_exec_destroy_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        // Create + instantiate
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::GraphCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let graph = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&graph.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::GraphInstantiate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let exec = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        // Destroy exec
+        let payload = exec.to_le_bytes();
+        let hdr = req(MessageType::GraphExecDestroy, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        assert_eq!(session.graph_exec_count(), 0);
+    }
+
+    #[test]
+    fn test_graph_exec_destroy_invalid() {
+        let gpu = StubGpuBackend::new();
+        let payload = 0xDEADu64.to_le_bytes();
+        let hdr = req(MessageType::GraphExecDestroy, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_graph_launch_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        // Create + instantiate
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::GraphCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let graph = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&graph.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::GraphInstantiate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let exec = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        // Launch on default stream
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&exec.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes()); // stream 0
+        let hdr = req(MessageType::GraphLaunch, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_graph_launch_invalid_exec() {
+        let gpu = StubGpuBackend::new();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0xDEADu64.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::GraphLaunch, payload.len() as u32);
+        let (_, resp) = dispatch(&gpu, &hdr, &payload);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_graph_launch_truncated_payload() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::GraphLaunch, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_stream_begin_capture_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let stream = setup_stream(&gpu, &mut session);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&stream.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes()); // mode = global
+        let hdr = req(MessageType::StreamBeginCapture, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+    }
+
+    #[test]
+    fn test_stream_begin_capture_truncated() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::StreamBeginCapture, 8);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0; 8]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_stream_end_capture_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let stream = setup_stream(&gpu, &mut session);
+        // Begin capture
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&stream.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::StreamBeginCapture, payload.len() as u32);
+        dispatch_with(&gpu, &hdr, &payload, &mut session);
+        // End capture
+        let payload = stream.to_le_bytes();
+        let hdr = req(MessageType::StreamEndCapture, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let graph = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        assert_ne!(graph, 0);
+        assert_eq!(session.graph_count(), 1);
+    }
+
+    #[test]
+    fn test_stream_end_capture_not_capturing() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let stream = setup_stream(&gpu, &mut session);
+        let payload = stream.to_le_bytes();
+        let hdr = req(MessageType::StreamEndCapture, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_stream_end_capture_truncated() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::StreamEndCapture, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_stream_is_capturing_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let stream = setup_stream(&gpu, &mut session);
+        // Not capturing
+        let payload = stream.to_le_bytes();
+        let hdr = req(MessageType::StreamIsCapturing, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let status = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(status, 0); // NONE
+        // Start capture
+        let mut cap_payload = Vec::new();
+        cap_payload.extend_from_slice(&stream.to_le_bytes());
+        cap_payload.extend_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::StreamBeginCapture, cap_payload.len() as u32);
+        dispatch_with(&gpu, &hdr, &cap_payload, &mut session);
+        // Now capturing
+        let hdr = req(MessageType::StreamIsCapturing, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let status = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(status, 1); // ACTIVE
+    }
+
+    #[test]
+    fn test_stream_is_capturing_truncated() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::StreamIsCapturing, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_stream_get_capture_info_handler() {
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let stream = setup_stream(&gpu, &mut session);
+        // Not capturing
+        let payload = stream.to_le_bytes();
+        let hdr = req(MessageType::StreamGetCaptureInfo, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let status = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let id = u64::from_le_bytes(resp[8..16].try_into().unwrap());
+        assert_eq!(status, 0);
+        assert_eq!(id, 0);
+        // Start capture
+        let mut cap_payload = Vec::new();
+        cap_payload.extend_from_slice(&stream.to_le_bytes());
+        cap_payload.extend_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::StreamBeginCapture, cap_payload.len() as u32);
+        dispatch_with(&gpu, &hdr, &cap_payload, &mut session);
+        // Capturing
+        let hdr = req(MessageType::StreamGetCaptureInfo, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let status = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let id = u64::from_le_bytes(resp[8..16].try_into().unwrap());
+        assert_eq!(status, 1);
+        assert_ne!(id, 0);
+    }
+
+    #[test]
+    fn test_stream_get_capture_info_truncated() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::StreamGetCaptureInfo, 4);
+        let (_, resp) = dispatch(&gpu, &hdr, &[0; 4]);
+        assert_eq!(response_result(&resp), CuResult::InvalidValue);
+    }
+
+    #[test]
+    fn test_graph_full_lifecycle_via_handler() {
+        // Full lifecycle: create stream -> begin capture -> end capture ->
+        // instantiate -> launch -> destroy exec -> destroy graph.
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+        let stream = setup_stream(&gpu, &mut session);
+
+        // Begin capture
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&stream.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        let hdr = req(MessageType::StreamBeginCapture, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // End capture
+        let payload = stream.to_le_bytes();
+        let hdr = req(MessageType::StreamEndCapture, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let graph = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Instantiate
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&graph.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::GraphInstantiate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+        let exec = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+
+        // Launch on the same stream
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&exec.to_le_bytes());
+        payload.extend_from_slice(&stream.to_le_bytes());
+        let hdr = req(MessageType::GraphLaunch, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Destroy exec
+        let payload = exec.to_le_bytes();
+        let hdr = req(MessageType::GraphExecDestroy, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        // Destroy graph
+        let payload = graph.to_le_bytes();
+        let hdr = req(MessageType::GraphDestroy, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        assert_eq!(response_result(&resp), CuResult::Success);
+
+        assert_eq!(session.graph_count(), 0);
+        assert_eq!(session.graph_exec_count(), 0);
+    }
+
+    #[test]
+    fn test_graph_session_cleanup() {
+        // Resources should be cleaned up when session drops.
+        let gpu = StubGpuBackend::new();
+        let mut session = ConnectionSession::new();
+
+        // Create graph + exec
+        let payload = 0u32.to_le_bytes();
+        let hdr = req(MessageType::GraphCreate, payload.len() as u32);
+        let (_, resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+        let graph = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&graph.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let hdr = req(MessageType::GraphInstantiate, payload.len() as u32);
+        let (_, _resp) = dispatch_with(&gpu, &hdr, &payload, &mut session);
+
+        assert_eq!(session.graph_count(), 1);
+        assert_eq!(session.graph_exec_count(), 1);
+
+        // Cleanup
+        let report = session.cleanup(&gpu);
+        assert!(report.succeeded >= 2); // at least graph + exec
+        assert_eq!(report.failed, 0);
+        assert_eq!(session.graph_count(), 0);
+        assert_eq!(session.graph_exec_count(), 0);
     }
 }

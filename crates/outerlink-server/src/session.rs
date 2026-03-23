@@ -57,6 +57,10 @@ pub struct ConnectionSession {
     libraries: HashSet<u64>,
     /// CUDA 12 kernels obtained by this session.
     kernels: HashSet<u64>,
+    /// CUDA graphs created by this session.
+    graphs: HashSet<u64>,
+    /// CUDA graph execution instances created by this session.
+    graph_execs: HashSet<u64>,
     /// Dedicated callback channel connection (set when client connects
     /// a second TCP stream with CallbackChannelInit).
     callback_channel: Option<Arc<TcpTransportConnection>>,
@@ -86,6 +90,8 @@ impl ConnectionSession {
             link_states: HashSet::new(),
             libraries: HashSet::new(),
             kernels: HashSet::new(),
+            graphs: HashSet::new(),
+            graph_execs: HashSet::new(),
             callback_channel: None,
         }
     }
@@ -311,6 +317,36 @@ impl ConnectionSession {
         self.kernels.len()
     }
 
+    /// Record that this session created a CUDA graph with handle `graph`.
+    pub fn track_graph(&mut self, graph: u64) {
+        self.graphs.insert(graph);
+    }
+
+    /// Remove `graph` from this session's tracked graphs.
+    pub fn untrack_graph(&mut self, graph: u64) {
+        self.graphs.remove(&graph);
+    }
+
+    /// Number of graphs tracked by this session.
+    pub fn graph_count(&self) -> usize {
+        self.graphs.len()
+    }
+
+    /// Record that this session created a CUDA graph exec with handle `exec`.
+    pub fn track_graph_exec(&mut self, exec: u64) {
+        self.graph_execs.insert(exec);
+    }
+
+    /// Remove `exec` from this session's tracked graph execs.
+    pub fn untrack_graph_exec(&mut self, exec: u64) {
+        self.graph_execs.remove(&exec);
+    }
+
+    /// Number of graph execs tracked by this session.
+    pub fn graph_exec_count(&self) -> usize {
+        self.graph_execs.len()
+    }
+
     // --- Resource queries ---
 
     /// Number of device memory allocations tracked by this session.
@@ -376,6 +412,34 @@ impl ConnectionSession {
     /// and the number that failed.
     pub fn cleanup(&mut self, backend: &dyn GpuBackend) -> CleanupReport {
         let mut report = CleanupReport::default();
+
+        // 0-pre-pre. Graph execs (destroy before graphs)
+        for exec in self.graph_execs.drain() {
+            match backend.graph_exec_destroy(exec) {
+                Ok(()) => {
+                    tracing::debug!(handle = exec, "session cleanup: destroyed graph exec");
+                    report.succeeded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(handle = exec, error = ?e, "session cleanup: failed to destroy graph exec");
+                    report.failed += 1;
+                }
+            }
+        }
+
+        // 0-pre-a. Graphs (destroy before streams, as captured graphs reference streams)
+        for graph in self.graphs.drain() {
+            match backend.graph_destroy(graph) {
+                Ok(()) => {
+                    tracing::debug!(handle = graph, "session cleanup: destroyed graph");
+                    report.succeeded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(handle = graph, error = ?e, "session cleanup: failed to destroy graph");
+                    report.failed += 1;
+                }
+            }
+        }
 
         // 0-pre. Libraries (unload before modules, as libraries wrap modules)
         // Note: kernels don't need explicit cleanup -- they are invalidated when

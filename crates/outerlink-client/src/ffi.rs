@@ -5373,41 +5373,107 @@ pub extern "C" fn ol_cuMemGetAllocationGranularity(
 }
 
 // ===========================================================================
-// CUDA Graph safety stubs (torch.compile reduce-overhead mode)
+// ===========================================================================
+// CUDA Graph API (torch.compile reduce-overhead mode)
 // ===========================================================================
 //
-// These stubs prevent segfaults when torch.compile(mode="reduce-overhead")
-// tries to capture a CUDA graph. Without them, calls fall through to the
-// real libcuda.so which knows nothing about our virtual handles.
-//
-// Graph capture is NOT supported in Phase 1 — stubs return NOT_SUPPORTED
-// so PyTorch falls back to eager mode gracefully. Query functions return
-// SUCCESS with "not capturing" status so defensive callers work correctly.
+// Full graph lifecycle: capture, create, instantiate, launch, destroy.
+// These enable torch.compile(mode="reduce-overhead") to work with OuterLink.
 
 #[no_mangle]
 pub extern "C" fn ol_cuStreamBeginCapture_v2(stream: u64, mode: i32) -> u32 {
-    let _ = (stream, mode);
+    let client = get_client();
+    // Resolve stream handle (0 = default stream, passed as-is).
+    let remote_stream = if stream == 0 {
+        0
+    } else {
+        match client.handles.streams.to_remote(stream) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        }
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = [0u8; 12];
+        payload[..8].copy_from_slice(&remote_stream.to_le_bytes());
+        payload[8..12].copy_from_slice(&mode.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::StreamBeginCapture, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    // Stub: not connected — cannot capture without a server.
     CUDA_ERROR_NOT_SUPPORTED
 }
 
 #[no_mangle]
 pub extern "C" fn ol_cuStreamEndCapture(stream: u64, graph: *mut u64) -> u32 {
-    let _ = (stream, graph);
+    if graph.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let client = get_client();
+    let remote_stream = if stream == 0 {
+        0
+    } else {
+        match client.handles.streams.to_remote(stream) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        }
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let payload = remote_stream.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::StreamEndCapture, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_graph = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.graphs.insert(remote_graph);
+                unsafe { *graph = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
     CUDA_ERROR_NOT_SUPPORTED
 }
 
-/// Returns SUCCESS with captureStatus=0 (CU_STREAM_CAPTURE_STATUS_NONE).
-/// Apps check this defensively — returning NOT_SUPPORTED would break them.
 #[no_mangle]
 pub extern "C" fn ol_cuStreamIsCapturing(stream: u64, capture_status: *mut i32) -> u32 {
-    let _ = stream;
+    let client = get_client();
+    let remote_stream = if stream == 0 {
+        0
+    } else {
+        match client.handles.streams.to_remote(stream) {
+            Some(r) => r,
+            // Unknown stream: return NONE (not an error).
+            None => {
+                if !capture_status.is_null() {
+                    unsafe { *capture_status = 0 };
+                }
+                return CUDA_SUCCESS;
+            }
+        }
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let payload = remote_stream.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::StreamIsCapturing, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 8 && !capture_status.is_null() {
+                let status = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                unsafe { *capture_status = status };
+            }
+            return CUDA_SUCCESS;
+        }
+    }
+    // Stub fallback: not capturing.
     if !capture_status.is_null() {
         unsafe { *capture_status = 0 }; // CU_STREAM_CAPTURE_STATUS_NONE
     }
     CUDA_SUCCESS
 }
 
-/// Returns SUCCESS with captureStatus=0 and all output pointers zeroed.
 #[no_mangle]
 pub extern "C" fn ol_cuStreamGetCaptureInfo_v2(
     stream: u64,
@@ -5417,53 +5483,133 @@ pub extern "C" fn ol_cuStreamGetCaptureInfo_v2(
     deps: *mut *const u64,
     num_deps: *mut usize,
 ) -> u32 {
-    let _ = stream;
-    if !capture_status.is_null() {
-        unsafe { *capture_status = 0 }; // CU_STREAM_CAPTURE_STATUS_NONE
+    let client = get_client();
+    let remote_stream = if stream == 0 {
+        0
+    } else {
+        match client.handles.streams.to_remote(stream) {
+            Some(r) => r,
+            None => {
+                // Unknown stream: return NONE status and zero everything.
+                if !capture_status.is_null() { unsafe { *capture_status = 0 }; }
+                if !id.is_null() { unsafe { *id = 0 }; }
+                if !graph.is_null() { unsafe { *graph = 0 }; }
+                if !deps.is_null() { unsafe { *deps = ptr::null() }; }
+                if !num_deps.is_null() { unsafe { *num_deps = 0 }; }
+                return CUDA_SUCCESS;
+            }
+        }
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let payload = remote_stream.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::StreamGetCaptureInfo, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 16 {
+                let status = i32::from_le_bytes(resp[4..8].try_into().unwrap());
+                let cap_id = u64::from_le_bytes(resp[8..16].try_into().unwrap());
+                if !capture_status.is_null() { unsafe { *capture_status = status }; }
+                if !id.is_null() { unsafe { *id = cap_id }; }
+                // graph, deps, num_deps not returned by server in Phase 1.
+                if !graph.is_null() { unsafe { *graph = 0 }; }
+                if !deps.is_null() { unsafe { *deps = ptr::null() }; }
+                if !num_deps.is_null() { unsafe { *num_deps = 0 }; }
+                return CUDA_SUCCESS;
+            }
+        }
     }
-    if !id.is_null() {
-        unsafe { *id = 0 };
-    }
-    if !graph.is_null() {
-        unsafe { *graph = 0 };
-    }
-    if !deps.is_null() {
-        unsafe { *deps = ptr::null() };
-    }
-    if !num_deps.is_null() {
-        unsafe { *num_deps = 0 };
-    }
+    // Stub fallback: not capturing.
+    if !capture_status.is_null() { unsafe { *capture_status = 0 }; }
+    if !id.is_null() { unsafe { *id = 0 }; }
+    if !graph.is_null() { unsafe { *graph = 0 }; }
+    if !deps.is_null() { unsafe { *deps = ptr::null() }; }
+    if !num_deps.is_null() { unsafe { *num_deps = 0 }; }
     CUDA_SUCCESS
 }
 
 #[no_mangle]
 pub extern "C" fn ol_cuGraphCreate(graph: *mut u64, flags: u32) -> u32 {
-    let _ = (graph, flags);
-    CUDA_ERROR_NOT_SUPPORTED
+    if graph.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let payload = flags.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::GraphCreate, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_graph = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.graphs.insert(remote_graph);
+                unsafe { *graph = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: generate local-only handle.
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.graphs.insert(stub_remote);
+    unsafe { *graph = synthetic };
+    CUDA_SUCCESS
+}
+
+fn graph_instantiate_impl(graph_exec: *mut u64, graph: u64, flags: u64) -> u32 {
+    if graph_exec.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let client = get_client();
+    let remote_graph = match client.handles.graphs.to_remote(graph) {
+        Some(r) => r,
+        None => return CUDA_ERROR_INVALID_VALUE,
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = [0u8; 16];
+        payload[..8].copy_from_slice(&remote_graph.to_le_bytes());
+        payload[8..16].copy_from_slice(&flags.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::GraphInstantiate, &payload) {
+            let result = parse_result(&resp);
+            if result != CUDA_SUCCESS {
+                return result;
+            }
+            if resp.len() >= 12 {
+                let remote_exec = u64::from_le_bytes(resp[4..12].try_into().unwrap());
+                let synthetic = client.handles.graph_execs.insert(remote_exec);
+                unsafe { *graph_exec = synthetic };
+                return CUDA_SUCCESS;
+            }
+        }
+    }
+    // Stub: generate local-only handle.
+    let stub_remote = STUB_HANDLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let synthetic = client.handles.graph_execs.insert(stub_remote);
+    unsafe { *graph_exec = synthetic };
+    CUDA_SUCCESS
 }
 
 #[no_mangle]
 pub extern "C" fn ol_cuGraphInstantiate_v2(
     graph_exec: *mut u64,
     graph: u64,
-    err_node: *mut u64,
-    log_buffer: *mut u8,
-    buffer_size: usize,
+    _err_node: *mut u64,
+    _log_buffer: *mut u8,
+    _buffer_size: usize,
 ) -> u32 {
-    let _ = (graph_exec, graph, err_node, log_buffer, buffer_size);
-    CUDA_ERROR_NOT_SUPPORTED
+    graph_instantiate_impl(graph_exec, graph, 0)
 }
 
 #[no_mangle]
 pub extern "C" fn ol_cuGraphInstantiate(
     graph_exec: *mut u64,
     graph: u64,
-    err_node: *mut u64,
-    log_buffer: *mut u8,
-    buffer_size: usize,
+    _err_node: *mut u64,
+    _log_buffer: *mut u8,
+    _buffer_size: usize,
 ) -> u32 {
-    let _ = (graph_exec, graph, err_node, log_buffer, buffer_size);
-    CUDA_ERROR_NOT_SUPPORTED
+    graph_instantiate_impl(graph_exec, graph, 0)
 }
 
 #[no_mangle]
@@ -5472,26 +5618,78 @@ pub extern "C" fn ol_cuGraphInstantiateWithFlags(
     graph: u64,
     flags: u64,
 ) -> u32 {
-    let _ = (graph_exec, graph, flags);
-    CUDA_ERROR_NOT_SUPPORTED
+    graph_instantiate_impl(graph_exec, graph, flags)
 }
 
 #[no_mangle]
 pub extern "C" fn ol_cuGraphLaunch(graph_exec: u64, stream: u64) -> u32 {
-    let _ = (graph_exec, stream);
-    CUDA_ERROR_NOT_SUPPORTED
+    let client = get_client();
+    let remote_exec = match client.handles.graph_execs.to_remote(graph_exec) {
+        Some(r) => r,
+        None => return CUDA_ERROR_INVALID_VALUE,
+    };
+    let remote_stream = if stream == 0 {
+        0
+    } else {
+        match client.handles.streams.to_remote(stream) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        }
+    };
+    if client.connected.load(Ordering::Acquire) {
+        let mut payload = [0u8; 16];
+        payload[..8].copy_from_slice(&remote_exec.to_le_bytes());
+        payload[8..16].copy_from_slice(&remote_stream.to_le_bytes());
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::GraphLaunch, &payload) {
+            return parse_result(&resp);
+        }
+    }
+    // Stub: no-op launch.
+    CUDA_SUCCESS
 }
 
 #[no_mangle]
 pub extern "C" fn ol_cuGraphExecDestroy(graph_exec: u64) -> u32 {
-    let _ = graph_exec;
-    CUDA_ERROR_NOT_SUPPORTED
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let remote_exec = match client.handles.graph_execs.to_remote(graph_exec) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_exec.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::GraphExecDestroy, &payload) {
+            let result = parse_result(&resp);
+            client.handles.graph_execs.remove_by_local(graph_exec);
+            return result;
+        }
+    }
+    // Stub: remove local handle.
+    if client.handles.graph_execs.remove_by_local(graph_exec).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
 }
 
 #[no_mangle]
 pub extern "C" fn ol_cuGraphDestroy(graph: u64) -> u32 {
-    let _ = graph;
-    CUDA_ERROR_NOT_SUPPORTED
+    let client = get_client();
+    if client.connected.load(Ordering::Acquire) {
+        let remote_graph = match client.handles.graphs.to_remote(graph) {
+            Some(r) => r,
+            None => return CUDA_ERROR_INVALID_VALUE,
+        };
+        let payload = remote_graph.to_le_bytes();
+        if let Ok((_hdr, resp)) = client.send_request(MessageType::GraphDestroy, &payload) {
+            let result = parse_result(&resp);
+            client.handles.graphs.remove_by_local(graph);
+            return result;
+        }
+    }
+    // Stub: remove local handle.
+    if client.handles.graphs.remove_by_local(graph).is_none() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    CUDA_SUCCESS
 }
 
 // ===========================================================================
@@ -8467,19 +8665,19 @@ mod tests {
         let _ = ol_cuLinkDestroy(s2);
     }
 
-    // -- CUDA Graph safety stubs --
+    // -- CUDA Graph API tests (stub mode, not connected to server) --
 
     #[test]
-    fn test_graph_stream_begin_capture_returns_not_supported() {
+    fn test_graph_stream_begin_capture_stub_not_connected() {
+        // Default stream (0): not connected, returns NOT_SUPPORTED.
         assert_eq!(ol_cuStreamBeginCapture_v2(0, 0), CUDA_ERROR_NOT_SUPPORTED);
-        assert_eq!(ol_cuStreamBeginCapture_v2(0xBEEF, 1), CUDA_ERROR_NOT_SUPPORTED);
+        // Unknown stream handle: returns INVALID_VALUE (handle not in store).
+        assert_eq!(ol_cuStreamBeginCapture_v2(0xBEEF, 1), CUDA_ERROR_INVALID_VALUE);
     }
 
     #[test]
-    fn test_graph_stream_end_capture_returns_not_supported() {
-        let mut graph: u64 = 0;
-        assert_eq!(ol_cuStreamEndCapture(0, &mut graph), CUDA_ERROR_NOT_SUPPORTED);
-        assert_eq!(ol_cuStreamEndCapture(0, ptr::null_mut()), CUDA_ERROR_NOT_SUPPORTED);
+    fn test_graph_stream_end_capture_null_graph() {
+        assert_eq!(ol_cuStreamEndCapture(0, ptr::null_mut()), CUDA_ERROR_INVALID_VALUE);
     }
 
     #[test]
@@ -8530,51 +8728,136 @@ mod tests {
     }
 
     #[test]
-    fn test_graph_create_returns_not_supported() {
+    fn test_graph_create_stub() {
         let mut graph: u64 = 0;
-        assert_eq!(ol_cuGraphCreate(&mut graph, 0), CUDA_ERROR_NOT_SUPPORTED);
+        assert_eq!(ol_cuGraphCreate(&mut graph, 0), CUDA_SUCCESS);
+        assert_ne!(graph, 0);
+        assert_eq!(ol_cuGraphDestroy(graph), CUDA_SUCCESS);
     }
 
     #[test]
-    fn test_graph_instantiate_v2_returns_not_supported() {
+    fn test_graph_create_null_ptr() {
+        assert_eq!(ol_cuGraphCreate(ptr::null_mut(), 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_graph_instantiate_v2_stub() {
+        let mut graph: u64 = 0;
+        assert_eq!(ol_cuGraphCreate(&mut graph, 0), CUDA_SUCCESS);
         let mut exec: u64 = 0;
-        let mut err_node: u64 = 0;
-        let mut log_buf = [0u8; 64];
         assert_eq!(
-            ol_cuGraphInstantiate_v2(&mut exec, 0, &mut err_node, log_buf.as_mut_ptr(), 64),
-            CUDA_ERROR_NOT_SUPPORTED
+            ol_cuGraphInstantiate_v2(&mut exec, graph, ptr::null_mut(), ptr::null_mut(), 0),
+            CUDA_SUCCESS
+        );
+        assert_ne!(exec, 0);
+        assert_eq!(ol_cuGraphExecDestroy(exec), CUDA_SUCCESS);
+        assert_eq!(ol_cuGraphDestroy(graph), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_graph_instantiate_stub() {
+        let mut graph: u64 = 0;
+        assert_eq!(ol_cuGraphCreate(&mut graph, 0), CUDA_SUCCESS);
+        let mut exec: u64 = 0;
+        assert_eq!(
+            ol_cuGraphInstantiate(&mut exec, graph, ptr::null_mut(), ptr::null_mut(), 0),
+            CUDA_SUCCESS
+        );
+        assert_ne!(exec, 0);
+        assert_eq!(ol_cuGraphExecDestroy(exec), CUDA_SUCCESS);
+        assert_eq!(ol_cuGraphDestroy(graph), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_graph_instantiate_with_flags_stub() {
+        let mut graph: u64 = 0;
+        assert_eq!(ol_cuGraphCreate(&mut graph, 0), CUDA_SUCCESS);
+        let mut exec: u64 = 0;
+        assert_eq!(ol_cuGraphInstantiateWithFlags(&mut exec, graph, 0), CUDA_SUCCESS);
+        assert_ne!(exec, 0);
+        assert_eq!(ol_cuGraphExecDestroy(exec), CUDA_SUCCESS);
+        assert_eq!(ol_cuGraphDestroy(graph), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_graph_instantiate_null_exec() {
+        let mut graph: u64 = 0;
+        assert_eq!(ol_cuGraphCreate(&mut graph, 0), CUDA_SUCCESS);
+        assert_eq!(
+            ol_cuGraphInstantiate_v2(ptr::null_mut(), graph, ptr::null_mut(), ptr::null_mut(), 0),
+            CUDA_ERROR_INVALID_VALUE
+        );
+        assert_eq!(ol_cuGraphDestroy(graph), CUDA_SUCCESS);
+    }
+
+    #[test]
+    fn test_graph_instantiate_invalid_graph() {
+        let mut exec: u64 = 0;
+        assert_eq!(
+            ol_cuGraphInstantiate_v2(&mut exec, 0xBAD0000, ptr::null_mut(), ptr::null_mut(), 0),
+            CUDA_ERROR_INVALID_VALUE
         );
     }
 
     #[test]
-    fn test_graph_instantiate_returns_not_supported() {
+    fn test_graph_launch_stub() {
+        let mut graph: u64 = 0;
+        assert_eq!(ol_cuGraphCreate(&mut graph, 0), CUDA_SUCCESS);
         let mut exec: u64 = 0;
-        let mut err_node: u64 = 0;
-        assert_eq!(
-            ol_cuGraphInstantiate(&mut exec, 0, &mut err_node, ptr::null_mut(), 0),
-            CUDA_ERROR_NOT_SUPPORTED
-        );
+        assert_eq!(ol_cuGraphInstantiateWithFlags(&mut exec, graph, 0), CUDA_SUCCESS);
+        // Launch on default stream.
+        assert_eq!(ol_cuGraphLaunch(exec, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuGraphExecDestroy(exec), CUDA_SUCCESS);
+        assert_eq!(ol_cuGraphDestroy(graph), CUDA_SUCCESS);
     }
 
     #[test]
-    fn test_graph_instantiate_with_flags_returns_not_supported() {
+    fn test_graph_launch_invalid_exec() {
+        assert_eq!(ol_cuGraphLaunch(0xBEEF, 0), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_graph_exec_destroy_invalid_handle() {
+        assert_eq!(ol_cuGraphExecDestroy(0xBEEF), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_graph_destroy_invalid_handle() {
+        assert_eq!(ol_cuGraphDestroy(0xBEEF), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn test_graph_full_lifecycle_stub() {
+        // Create graph -> instantiate -> launch -> destroy all
+        let mut graph: u64 = 0;
+        assert_eq!(ol_cuGraphCreate(&mut graph, 0), CUDA_SUCCESS);
+        assert_ne!(graph, 0);
+
         let mut exec: u64 = 0;
-        assert_eq!(ol_cuGraphInstantiateWithFlags(&mut exec, 0, 0), CUDA_ERROR_NOT_SUPPORTED);
+        assert_eq!(ol_cuGraphInstantiateWithFlags(&mut exec, graph, 0), CUDA_SUCCESS);
+        assert_ne!(exec, 0);
+
+        // Launch on default stream
+        assert_eq!(ol_cuGraphLaunch(exec, 0), CUDA_SUCCESS);
+
+        // Destroy exec, then graph
+        assert_eq!(ol_cuGraphExecDestroy(exec), CUDA_SUCCESS);
+        assert_eq!(ol_cuGraphDestroy(graph), CUDA_SUCCESS);
+
+        // Double-destroy should fail
+        assert_eq!(ol_cuGraphExecDestroy(exec), CUDA_ERROR_INVALID_VALUE);
+        assert_eq!(ol_cuGraphDestroy(graph), CUDA_ERROR_INVALID_VALUE);
     }
 
     #[test]
-    fn test_graph_launch_returns_not_supported() {
-        assert_eq!(ol_cuGraphLaunch(0xBEEF, 0), CUDA_ERROR_NOT_SUPPORTED);
-    }
-
-    #[test]
-    fn test_graph_exec_destroy_returns_not_supported() {
-        assert_eq!(ol_cuGraphExecDestroy(0xBEEF), CUDA_ERROR_NOT_SUPPORTED);
-    }
-
-    #[test]
-    fn test_graph_destroy_returns_not_supported() {
-        assert_eq!(ol_cuGraphDestroy(0xBEEF), CUDA_ERROR_NOT_SUPPORTED);
+    fn test_graph_unique_handles() {
+        let mut g1: u64 = 0;
+        let mut g2: u64 = 0;
+        assert_eq!(ol_cuGraphCreate(&mut g1, 0), CUDA_SUCCESS);
+        assert_eq!(ol_cuGraphCreate(&mut g2, 0), CUDA_SUCCESS);
+        assert_ne!(g1, g2);
+        assert_eq!(ol_cuGraphDestroy(g1), CUDA_SUCCESS);
+        assert_eq!(ol_cuGraphDestroy(g2), CUDA_SUCCESS);
     }
 
     // -- cuLaunchKernelEx --

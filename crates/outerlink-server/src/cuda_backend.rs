@@ -104,6 +104,18 @@ type FnCuStreamGetPriority = unsafe extern "C" fn(stream: usize, priority: *mut 
 type FnCuStreamGetFlags = unsafe extern "C" fn(stream: usize, flags: *mut u32) -> i32;
 type FnCuStreamGetCtx = unsafe extern "C" fn(stream: usize, pctx: *mut usize) -> i32;
 
+// Stream capture / graph operations
+type FnCuStreamBeginCapture = unsafe extern "C" fn(stream: usize, mode: i32) -> i32;
+type FnCuStreamEndCapture = unsafe extern "C" fn(stream: usize, graph: *mut usize) -> i32;
+type FnCuStreamIsCapturing = unsafe extern "C" fn(stream: usize, status: *mut i32) -> i32;
+type FnCuStreamGetCaptureInfo = unsafe extern "C" fn(stream: usize, status: *mut i32, id: *mut u64, graph: *mut usize, deps: *mut *const usize, num_deps: *mut usize) -> i32;
+type FnCuGraphCreate = unsafe extern "C" fn(graph: *mut usize, flags: u32) -> i32;
+type FnCuGraphInstantiate = unsafe extern "C" fn(exec: *mut usize, graph: usize, err_node: *mut usize, log_buf: *mut u8, buf_size: usize) -> i32;
+type FnCuGraphInstantiateWithFlags = unsafe extern "C" fn(exec: *mut usize, graph: usize, flags: u64) -> i32;
+type FnCuGraphLaunch = unsafe extern "C" fn(exec: usize, stream: usize) -> i32;
+type FnCuGraphExecDestroy = unsafe extern "C" fn(exec: usize) -> i32;
+type FnCuGraphDestroy = unsafe extern "C" fn(graph: usize) -> i32;
+
 // Event operations
 type FnCuEventCreate = unsafe extern "C" fn(event: *mut usize, flags: u32) -> i32;
 type FnCuEventDestroy = unsafe extern "C" fn(event: usize) -> i32;
@@ -407,6 +419,18 @@ struct CudaApi {
     cu_stream_get_ctx: Option<FnCuStreamGetCtx>,
     cu_stream_wait_event: Option<FnCuStreamWaitEvent>,
 
+    // Stream capture / graph operations
+    cu_stream_begin_capture: Option<FnCuStreamBeginCapture>,
+    cu_stream_end_capture: Option<FnCuStreamEndCapture>,
+    cu_stream_is_capturing: Option<FnCuStreamIsCapturing>,
+    cu_stream_get_capture_info: Option<FnCuStreamGetCaptureInfo>,
+    cu_graph_create: Option<FnCuGraphCreate>,
+    cu_graph_instantiate: Option<FnCuGraphInstantiate>,
+    cu_graph_instantiate_with_flags: Option<FnCuGraphInstantiateWithFlags>,
+    cu_graph_launch: Option<FnCuGraphLaunch>,
+    cu_graph_exec_destroy: Option<FnCuGraphExecDestroy>,
+    cu_graph_destroy: Option<FnCuGraphDestroy>,
+
     cu_event_create: Option<FnCuEventCreate>,
     cu_event_destroy: Option<FnCuEventDestroy>,
     cu_event_record: Option<FnCuEventRecord>,
@@ -598,6 +622,17 @@ impl CudaApi {
             cu_stream_get_flags: load_sym!(lib, b"cuStreamGetFlags_v2\0", b"cuStreamGetFlags\0"),
             cu_stream_get_ctx: load_sym!(lib, b"cuStreamGetCtx_v2\0", b"cuStreamGetCtx\0"),
             cu_stream_wait_event: load_sym!(lib, b"cuStreamWaitEvent\0"),
+
+            cu_stream_begin_capture: load_sym!(lib, b"cuStreamBeginCapture_v2\0", b"cuStreamBeginCapture\0"),
+            cu_stream_end_capture: load_sym!(lib, b"cuStreamEndCapture\0"),
+            cu_stream_is_capturing: load_sym!(lib, b"cuStreamIsCapturing\0"),
+            cu_stream_get_capture_info: load_sym!(lib, b"cuStreamGetCaptureInfo_v2\0", b"cuStreamGetCaptureInfo\0"),
+            cu_graph_create: load_sym!(lib, b"cuGraphCreate\0"),
+            cu_graph_instantiate: load_sym!(lib, b"cuGraphInstantiate_v2\0", b"cuGraphInstantiate\0"),
+            cu_graph_instantiate_with_flags: load_sym!(lib, b"cuGraphInstantiateWithFlags\0"),
+            cu_graph_launch: load_sym!(lib, b"cuGraphLaunch\0"),
+            cu_graph_exec_destroy: load_sym!(lib, b"cuGraphExecDestroy\0"),
+            cu_graph_destroy: load_sym!(lib, b"cuGraphDestroy\0"),
 
             cu_event_create: load_sym!(lib, b"cuEventCreate\0"),
             cu_event_destroy: load_sym!(lib, b"cuEventDestroy_v2\0", b"cuEventDestroy\0"),
@@ -1945,6 +1980,106 @@ impl GpuBackend for CudaGpuBackend {
             map_cuda_result(func(&mut function, kernel as usize))?;
         }
         Ok(function as u64)
+    }
+
+    fn stream_begin_capture(&self, stream: u64, mode: i32) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_stream_begin_capture)?;
+        unsafe {
+            map_cuda_result(func(stream as usize, mode))?;
+        }
+        Ok(())
+    }
+
+    fn stream_end_capture(&self, stream: u64) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_stream_end_capture)?;
+        let mut graph: usize = 0;
+        unsafe {
+            map_cuda_result(func(stream as usize, &mut graph))?;
+        }
+        Ok(graph as u64)
+    }
+
+    fn stream_is_capturing(&self, stream: u64) -> Result<i32, CuResult> {
+        let func = require_fn(&self.api.cu_stream_is_capturing)?;
+        let mut status: i32 = 0;
+        unsafe {
+            map_cuda_result(func(stream as usize, &mut status))?;
+        }
+        Ok(status)
+    }
+
+    fn stream_get_capture_info(&self, stream: u64) -> Result<(i32, u64), CuResult> {
+        let func = require_fn(&self.api.cu_stream_get_capture_info)?;
+        let mut status: i32 = 0;
+        let mut id: u64 = 0;
+        unsafe {
+            map_cuda_result(func(
+                stream as usize,
+                &mut status,
+                &mut id,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ))?;
+        }
+        Ok((status, id))
+    }
+
+    fn graph_create(&self, flags: u32) -> Result<u64, CuResult> {
+        let func = require_fn(&self.api.cu_graph_create)?;
+        let mut graph: usize = 0;
+        unsafe {
+            map_cuda_result(func(&mut graph, flags))?;
+        }
+        Ok(graph as u64)
+    }
+
+    fn graph_instantiate(&self, graph: u64, flags: u64) -> Result<u64, CuResult> {
+        let mut exec: usize = 0;
+        // Try cuGraphInstantiateWithFlags first (CUDA 11.4+), fall back to v2.
+        if flags != 0 {
+            if let Ok(func) = require_fn(&self.api.cu_graph_instantiate_with_flags) {
+                unsafe {
+                    map_cuda_result(func(&mut exec, graph as usize, flags))?;
+                }
+                return Ok(exec as u64);
+            }
+        }
+        let func = require_fn(&self.api.cu_graph_instantiate)?;
+        unsafe {
+            map_cuda_result(func(
+                &mut exec,
+                graph as usize,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            ))?;
+        }
+        Ok(exec as u64)
+    }
+
+    fn graph_launch(&self, graph_exec: u64, stream: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_graph_launch)?;
+        unsafe {
+            map_cuda_result(func(graph_exec as usize, stream as usize))?;
+        }
+        Ok(())
+    }
+
+    fn graph_exec_destroy(&self, graph_exec: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_graph_exec_destroy)?;
+        unsafe {
+            map_cuda_result(func(graph_exec as usize))?;
+        }
+        Ok(())
+    }
+
+    fn graph_destroy(&self, graph: u64) -> Result<(), CuResult> {
+        let func = require_fn(&self.api.cu_graph_destroy)?;
+        unsafe {
+            map_cuda_result(func(graph as usize))?;
+        }
+        Ok(())
     }
 
     fn shutdown(&self) {

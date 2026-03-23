@@ -194,6 +194,17 @@ pub enum MessageType {
     LibraryGetModule = 0x00D8,
     KernelGetFunction = 0x00D9,
 
+    // CUDA Graph API
+    StreamBeginCapture = 0x00E5,
+    StreamEndCapture = 0x00E6,
+    StreamIsCapturing = 0x00E7,
+    StreamGetCaptureInfo = 0x00E8,
+    GraphCreate = 0x00E9,
+    GraphInstantiate = 0x00EA,
+    GraphLaunch = 0x00EB,
+    GraphExecDestroy = 0x00EC,
+    GraphDestroy = 0x00ED,
+
     // Response (server -> client)
     Response = 0x00F0,
     Error = 0x00FF,
@@ -335,6 +346,15 @@ impl MessageType {
             0x00D7 => Some(Self::LibraryGetKernel),
             0x00D8 => Some(Self::LibraryGetModule),
             0x00D9 => Some(Self::KernelGetFunction),
+            0x00E5 => Some(Self::StreamBeginCapture),
+            0x00E6 => Some(Self::StreamEndCapture),
+            0x00E7 => Some(Self::StreamIsCapturing),
+            0x00E8 => Some(Self::StreamGetCaptureInfo),
+            0x00E9 => Some(Self::GraphCreate),
+            0x00EA => Some(Self::GraphInstantiate),
+            0x00EB => Some(Self::GraphLaunch),
+            0x00EC => Some(Self::GraphExecDestroy),
+            0x00ED => Some(Self::GraphDestroy),
             0x00F0 => Some(Self::Response),
             0x00FF => Some(Self::Error),
             _ => None,
