@@ -1,8 +1,8 @@
 # OutterLink - Project Vision
 
 **Created:** 2026-03-19
-**Last Updated:** 2026-03-19
-**Status:** Draft
+**Last Updated:** 2026-03-23
+**Status:** Active Development
 
 ## Purpose
 
@@ -78,8 +78,8 @@ For memory-bound workloads (large model inference, batch processing, model paral
 
 ## Technical Approach
 
-1. **CUDA Driver API interception** via LD_PRELOAD + dlsym + cuGetProcAddress hooking (222+ functions, following HAMi-core patterns)
-2. **Pluggable transport layer** - TCP + io_uring (Phase 1), UCX/RDMA (Phase 2)
+1. **CUDA Driver API interception** via LD_PRELOAD + dlsym + cuGetProcAddress hooking (~250 hook table entries, following HAMi-core patterns)
+2. **Pluggable transport layer** - TCP + Tokio (Phase 1), UCX/RDMA (Phase 2)
 3. **Host-staged GPU memory transfers** - cudaMemcpy to/from pinned host memory for network transport
 4. **Distributed memory manager** to track and coordinate VRAM + RAM across nodes
 5. **Connection manager** for node discovery, health monitoring, and scaling
@@ -93,6 +93,57 @@ For memory-bound workloads (large model inference, batch processing, model paral
 App -> LD_PRELOAD -> OutterLink Client (.so) -> Transport -> OutterLink Server -> Real GPU
 ```
 
+---
+
+## Current Status
+
+**As of 2026-03-23 — Active Implementation (Phase 1)**
+
+The core protocol layer and interception system are built and passing a full test suite. The project has moved well past planning into working code.
+
+### What Is Built
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Wire protocol | Done | 22-byte big-endian header (magic `OLNK`, version, flags, request_id, msg_type, payload_len). Payload little-endian. |
+| CUDA function coverage | Done | ~150 CUDA Driver API functions across all categories (see `docs/specs/cuda-function-coverage.md`) |
+| LD_PRELOAD interposition | Done | `interpose.c` — ~250 hook table entries, hooks both `dlsym()` and `cuGetProcAddress()` |
+| Client library | Done | Rust, `libouterlink_client.so`. HandleStore with 12 handle maps, retry + reconnect logic |
+| Handle translation | Done | Synthetic local handles (type-tagged prefixes) bidirectionally mapped to remote handles |
+| Server daemon | Done | Rust, Tokio-based, graceful shutdown, session registry |
+| Session management | Done | Per-connection resource tracking, full cleanup on disconnect |
+| GpuBackend trait | Done | `StubGpuBackend` (testing, no GPU required) + `CudaGpuBackend` (real GPU via libloading) |
+| Bidirectional callbacks | Done | `cuStreamAddCallback` + `cuLaunchHostFunc` — dedicated callback channel, `CallbackRegistry` |
+| Stream-ordered memory | Done | 9 pool functions: `cuMemAllocAsync`, `cuMemFreeAsync`, `cuMemPoolCreate`, etc. |
+| CUDA Graphs | Done | 9 functions: `cuStreamBeginCapture`, `cuGraphInstantiate`, `cuGraphLaunch`, etc. |
+| JIT Linker | Done | 5 functions: `cuLinkCreate`, `cuLinkAddData`, `cuLinkComplete`, etc. |
+| Library API (CUDA 12+) | Done | 5 functions: `cuLibraryLoadData`, `cuLibraryGetKernel`, `cuKernelGetFunction`, etc. |
+| Occupancy API | Done | 4 functions including `cuOccupancyMaxPotentialBlockSize` |
+| Cooperative kernels | Done | `cuLaunchCooperativeKernel`, `cuLaunchKernelEx` |
+| PCI Bus ID functions | Done | `cuDeviceGetPCIBusId`, `cuDeviceGetByPCIBusId` |
+| Managed/unified memory | Done | `cuMemAllocManaged`, `cuMemPrefetchAsync`, `cuMemAdvise`, `cuMemRangeGetAttribute(s)` |
+| Test suite | Done | 50+ integration tests against StubGpuBackend; real GPU tests behind `real-gpu-test` feature flag |
+
+### What Is Not Yet Built
+
+| Component | Phase | Notes |
+|-----------|-------|-------|
+| NVML interception | Future | Present remote GPUs as local NVML devices |
+| UCX/RDMA transport | Phase 2 | Auto-negotiate RDMA vs TCP |
+| OpenDMA kernel module | Phase 5 | PCIe BAR1 direct VRAM access, bypasses GPUDirect |
+| Multi-node routing | Future | Transparent routing across N nodes |
+| outerlink-cli features | Future | Currently skeleton only |
+
+### Key Architecture Numbers
+
+- Protocol message types: ~80 (including handshake, response, error)
+- Hook table entries in `interpose.c`: ~250 (covers versioned aliases like `_v2`)
+- Handle map types: 12 (contexts, device_ptrs, modules, functions, streams, events, mem_pools, link_states, libraries, kernels, graphs, graph_execs)
+- Default server port: **14833**
+- Default retry policy: 3 retries (100ms / 500ms / 1000ms delays), 5 reconnect attempts with exponential backoff capped at 30s
+
+---
+
 ## Related Documents
 
 - [Pre-Planning Master](../../planning/pre-planning/00-master-preplan.md)
@@ -102,6 +153,8 @@ App -> LD_PRELOAD -> OutterLink Client (.so) -> Transport -> OutterLink Server -
 - [R4: ConnectX-5 + Transport](../../planning/research/R4-connectx5-transport-stack.md)
 - [R5: GPUDirect on GeForce](../../planning/research/R5-gpudirect-geforce-restriction.md)
 - [Hardware Inventory](../../planning/pre-planning/01-hardware-inventory.md)
+- [System Architecture](01-system-architecture.md)
+- [CUDA Function Coverage](../specs/cuda-function-coverage.md)
 
 ## Open Questions
 
@@ -109,6 +162,7 @@ App -> LD_PRELOAD -> OutterLink Client (.so) -> Transport -> OutterLink Server -
 - [x] Can PCIe BAR1 direct access bypass GPUDirect restriction? -> YES, viable via tinygrad patches + custom RDMA module (R7)
 - [x] Can NVLink physically bridge across PCs? -> NO, not feasible. ConnectX-5 covers the gap (R6)
 - [ ] What Linux distributions on target machines?
-- [ ] What CUDA version and driver versions?
-- [ ] First test workload? (LLM inference most likely)
+- [ ] What CUDA version and driver versions on each machine?
+- [ ] First real end-to-end test workload? (LLM inference most likely)
 - [ ] Maximum nodes to support in v1?
+- [ ] Does `StubGpuBackend` need persistent PTX/ELF introspection cache for correctness with complex kernels?

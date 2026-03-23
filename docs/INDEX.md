@@ -1,25 +1,29 @@
 # Documentation Index
 
+**Last Updated:** 2026-03-23
+
 ## Architecture
 *System design and component documentation*
 
 | Document | Status | Description |
 |----------|--------|-------------|
-| - | - | *Architecture docs will come after planning phase* |
+| [00-project-vision.md](architecture/00-project-vision.md) | Active | Core vision, goals, current implementation status |
+| [01-system-architecture.md](architecture/01-system-architecture.md) | Draft | Data flow, component details, protocol, handle translation, callbacks |
 
 ## Guides
 *How-to documents and setup instructions*
 
 | Document | Status | Description |
 |----------|--------|-------------|
-| - | - | *Guides will come during implementation* |
+| [01-installation.md](guides/01-installation.md) | Draft | Prerequisites, building, server setup, client setup |
+| [02-testing-on-linux.md](guides/02-testing-on-linux.md) | Draft | First Linux test: vector add, PyTorch, troubleshooting |
 
 ## Specs
 *Technical specifications and protocols*
 
 | Document | Status | Description |
 |----------|--------|-------------|
-| - | - | *Specs will come after research phase* |
+| [cuda-function-coverage.md](specs/cuda-function-coverage.md) | Draft | All ~150 implemented CUDA functions with message type codes |
 
 ## Decisions
 *Architecture Decision Records (ADRs)*
