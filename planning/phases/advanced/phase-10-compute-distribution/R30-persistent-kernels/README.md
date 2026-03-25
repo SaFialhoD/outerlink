@@ -1,7 +1,7 @@
 # R30: Persistent Kernels with Network Feed
 
 **Phase:** 10 — Compute Distribution
-**Status:** NOT STARTED
+**Status:** RESEARCH COMPLETE
 **Priority:** MEDIUM
 **Depends On:** R13 (CUDA Graph Interception)
 
@@ -21,9 +21,11 @@ Long-running GPU kernels that don't exit between data batches. They spin-wait on
 - Power consumption of spin-waiting GPU threads?
 
 ## Folder Contents
-- `research/` — Persistent kernel patterns, CUDA cooperative groups
+- `research/01-persistent-kernel-patterns.md` — CUDA cooperative groups, occupancy, TDR, power/thermal, error handling
+- `research/02-doorbell-mechanisms.md` — VRAM ring buffers, atomic counters, OpenDMA integration, cache coherency
+- `research/03-network-fed-execution.md` — Pipeline design, buffering strategies, performance analysis, reference architectures
 - `side-docs/` — Notes, experiments
-- `preplan.md` — TO BE CREATED
+- `preplan.md` — Pre-plan with scope, unknowns, dependencies, 3-phase implementation proposal
 - `plan.md` — TO BE CREATED
 - `progress.md` — Lifecycle tracker
 
