@@ -12,6 +12,7 @@ dashmap = { workspace = true }
 bitflags = { workspace = true }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }
+xxhash-rust = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }

@@ -8,10 +8,14 @@
 pub mod access_monitor;
 pub mod compression;
 pub mod config;
+pub mod dedup;
+#[cfg(test)]
+mod dedup_tests;
 pub mod eviction;
 pub mod migration;
 pub mod migration_engine;
 pub mod page_table;
+pub mod prefetch;
 pub mod pte;
 pub mod tier_manager;
 pub mod tier_status;
@@ -29,9 +33,11 @@ pub use migration::{
 };
 pub use access_monitor::{InterceptionAccessMonitor, MonitorConfig};
 pub use compression::{AdaptiveCompressor, CompressionAlgorithm, CompressionConfig};
+pub use dedup::{DedupConfig, DedupManager, DedupStats};
 pub use eviction::{ArcPolicy, CarPolicy, ClockPolicy};
 pub use migration_engine::TieredMigrationEngine;
 pub use page_table::RobinHoodPageTable;
+pub use prefetch::{PredictionSource, PrefetchConfig, PrefetchScheduler, PrefetchStats};
 pub use tier_manager::DefaultTierManager;
 pub use pte::{PageTableEntry, PteFlags};
 pub use tier_status::{
