@@ -13,6 +13,7 @@ pub mod gpu_mixing;
 pub mod gpu_storage;
 pub mod hip_interception;
 pub mod handle;
+pub mod kernel_splitting;
 pub mod live_migration;
 pub mod memory;
 pub mod multicast;
@@ -23,5 +24,6 @@ pub mod scatter_gather;
 pub mod tcp_transport;
 pub mod time_slicing;
 pub mod transport;
+pub mod virtual_nvlink;
 
 pub use error::{OuterLinkError, Result};
