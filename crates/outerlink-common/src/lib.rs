@@ -4,8 +4,10 @@
 //! used by both the client (interception library) and server (GPU daemon).
 
 pub mod cuda_types;
+pub mod dpu_offload;
 pub mod error;
 pub mod handle;
+pub mod persistent_kernels;
 pub mod protocol;
 pub mod retry;
 pub mod tcp_transport;
