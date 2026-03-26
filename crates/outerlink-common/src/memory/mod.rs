@@ -6,7 +6,9 @@
 //! monitoring.
 
 pub mod config;
+pub mod eviction;
 pub mod migration;
+pub mod migration_engine;
 pub mod page_table;
 pub mod pte;
 pub mod tier_status;
@@ -22,6 +24,8 @@ pub use migration::{
     MigrationError, MigrationHandle, MigrationPriority, MigrationReason, MigrationRequest,
     MigrationStatus,
 };
+pub use eviction::{ArcPolicy, CarPolicy, ClockPolicy};
+pub use migration_engine::TieredMigrationEngine;
 pub use page_table::RobinHoodPageTable;
 pub use pte::{PageTableEntry, PteFlags};
 pub use tier_status::{
