@@ -499,14 +499,19 @@ pub trait ClockSync: Send + Sync {
 
     /// Schedule an action to execute at a specific PTP time.
     ///
-    /// Strategy: coarse sleep until ~1ms before target, then spin-wait on
-    /// `PtpTime::now()` until the target is reached, then invoke the action.
+    /// Strategy: coarse sleep until `spin_margin` before target, then spin-wait
+    /// on `PtpTime::now()` until the target is reached, then invoke the action.
     /// Returns `TargetTimeInPast` if the target time has already passed.
+    ///
+    /// `spin_margin` controls how early to wake from coarse sleep to begin
+    /// the precision spin-wait phase. Use `CoordinatedLaunch.spin_margin` or
+    /// a default of 1ms for standalone scheduling.
     fn schedule_at(
         &self,
         target: PtpTime,
+        spin_margin: Duration,
         action: Box<dyn FnOnce() + Send>,
-    ) -> Result<(), ClockSyncError>;
+    ) -> Result<LaunchResult, ClockSyncError>;
 }
 
 /// Errors specific to the clock sync subsystem.
@@ -584,35 +589,33 @@ impl PtpHealthMonitor {
         let freq = tokens[3].parse::<i64>().unwrap_or(0);
         let path_delay = tokens[6].parse::<i64>().unwrap_or(0);
 
-        // Preserve stable_since when already in LockedStable to avoid resetting
-        // the stability timer on every ptp4l output line.
-        let existing_stable_since = if let Ok(h) = self.health.read() {
-            if let PtpSyncState::LockedStable { stable_since, .. } = h.state {
-                Some(stable_since)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let state = match servo_state {
-            "s0" => PtpSyncState::Unlocked,
-            "s1" => PtpSyncState::Stepping,
-            "s2" => {
-                if offset.abs() < self.stability_threshold_ns {
-                    PtpSyncState::LockedStable {
-                        offset_ns: offset,
-                        stable_since: existing_stable_since.unwrap_or_else(Instant::now),
-                    }
-                } else {
-                    PtpSyncState::Locked { offset_ns: offset }
-                }
-            }
-            _ => PtpSyncState::Unavailable,
-        };
-
+        // Single write lock for both reading existing state and writing new state,
+        // preventing a TOCTOU race where another thread changes state between
+        // a read lock and a subsequent write lock.
         if let Ok(mut health) = self.health.write() {
+            let existing_stable_since =
+                if let PtpSyncState::LockedStable { stable_since, .. } = health.state {
+                    Some(stable_since)
+                } else {
+                    None
+                };
+
+            let state = match servo_state {
+                "s0" => PtpSyncState::Unlocked,
+                "s1" => PtpSyncState::Stepping,
+                "s2" => {
+                    if offset.abs() < self.stability_threshold_ns {
+                        PtpSyncState::LockedStable {
+                            offset_ns: offset,
+                            stable_since: existing_stable_since.unwrap_or_else(Instant::now),
+                        }
+                    } else {
+                        PtpSyncState::Locked { offset_ns: offset }
+                    }
+                }
+                _ => PtpSyncState::Unavailable,
+            };
+
             health.state = state;
             health.master_offset_ns = offset;
             health.path_delay_ns = path_delay;
@@ -844,13 +847,14 @@ impl ClockSync for LinuxPtpClockSync {
             .get(&gpu_id)
             .ok_or(ClockSyncError::GpuNotCalibrated(gpu_id))?;
 
-        let ptp_ns = ptp_time.as_nanos() as i64;
-        let elapsed_since_cal = ptp_ns - cal.calibrated_at.as_nanos() as i64;
-        let drift_correction = (cal.drift_rate_ns_per_sec * elapsed_since_cal as f64
-            / 1_000_000_000.0) as i64;
+        // Stay in i128 to match PtpTime's native precision and avoid
+        // silent truncation that would diverge from GpuClockCalibration::current_offset_ns.
+        let ptp_ns = ptp_time.as_nanos();
+        let elapsed_since_cal_ns = (ptp_ns - cal.calibrated_at.as_nanos()) as f64;
+        let drift_correction =
+            (cal.drift_rate_ns_per_sec * elapsed_since_cal_ns / 1_000_000_000.0) as i128;
 
-        // gpu_time = ptp_time - offset - drift_correction
-        let gpu_time = ptp_ns - cal.offset_ns - drift_correction;
+        let gpu_time = ptp_ns - cal.offset_ns as i128 - drift_correction;
         if gpu_time < 0 {
             return Err(ClockSyncError::TargetTimeInPast);
         }
@@ -860,8 +864,9 @@ impl ClockSync for LinuxPtpClockSync {
     fn schedule_at(
         &self,
         target: PtpTime,
+        spin_margin: Duration,
         action: Box<dyn FnOnce() + Send>,
-    ) -> Result<(), ClockSyncError> {
+    ) -> Result<LaunchResult, ClockSyncError> {
         if !self.is_synced() {
             return Err(ClockSyncError::PtpNotSynced);
         }
@@ -871,11 +876,12 @@ impl ClockSync for LinuxPtpClockSync {
             return Err(ClockSyncError::TargetTimeInPast);
         }
 
-        // Coarse sleep: sleep until ~1ms before target to avoid burning CPU.
+        // Coarse sleep: sleep until spin_margin before target.
         let target_ns = target.as_nanos();
         let now_ns = now.as_nanos();
         let delta_ns = target_ns - now_ns;
-        let coarse_sleep_ns = delta_ns - 1_000_000; // wake 1ms early
+        let margin_ns = spin_margin.as_nanos() as i128;
+        let coarse_sleep_ns = delta_ns - margin_ns;
         if coarse_sleep_ns > 0 {
             std::thread::sleep(Duration::from_nanos(coarse_sleep_ns as u64));
         }
@@ -891,7 +897,14 @@ impl ClockSync for LinuxPtpClockSync {
         }
 
         action();
-        Ok(())
+
+        let actual_time = PtpTime::now();
+        let jitter_ns = (actual_time.as_nanos() - target_ns) as i64;
+        Ok(LaunchResult {
+            actual_time,
+            jitter_ns,
+            gpu_spin_used: false, // CPU spin-wait only; GPU spin requires CUDA
+        })
     }
 }
 

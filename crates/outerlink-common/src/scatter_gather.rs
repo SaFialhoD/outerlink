@@ -153,8 +153,6 @@ pub enum PrePackReason {
     ExceedsMaxSge,
     /// Fragments too small for efficient SGE processing.
     FragmentsTooSmall,
-    /// Compression requested and requires contiguous input.
-    CompressionRequired,
 }
 
 /// Wire-format transfer method descriptor.
@@ -252,15 +250,18 @@ pub struct StagingBuffer {
 pub struct StagingPool {
     /// Pre-allocated buffers.
     buffers: Vec<StagingBuffer>,
-    /// Indices of available buffers.
-    free_list: Mutex<VecDeque<usize>>,
-    /// Tracks which buffers are currently in use (true = in use).
-    /// Protected by the same mutex as `free_list` to prevent double-release.
-    in_use: Mutex<Vec<bool>>,
+    /// Free list + in-use tracking under a single mutex to prevent AB-BA deadlocks.
+    inner: Mutex<StagingPoolInner>,
     /// Total number of buffers.
     capacity: usize,
     /// Statistics.
     stats: RwLock<StagingPoolStats>,
+}
+
+/// Internal state for StagingPool, protected by a single Mutex.
+struct StagingPoolInner {
+    free_list: VecDeque<usize>,
+    in_use: Vec<bool>,
 }
 
 /// Statistics for staging pool usage.
@@ -297,8 +298,7 @@ impl StagingPool {
 
         Self {
             buffers,
-            free_list: Mutex::new(free_list),
-            in_use: Mutex::new(in_use),
+            inner: Mutex::new(StagingPoolInner { free_list, in_use }),
             capacity: config.buffer_count,
             stats: RwLock::new(StagingPoolStats::default()),
         }
@@ -309,13 +309,13 @@ impl StagingPool {
     /// Returns `None` if all buffers are in use. In production, callers should
     /// wait on a semaphore for backpressure rather than spinning.
     pub fn acquire(&self) -> Option<usize> {
-        let mut free = self.free_list.lock().expect("staging pool lock poisoned");
-        let result = free.pop_front();
+        let mut inner = self.inner.lock().expect("staging pool lock poisoned");
+        let result = inner.free_list.pop_front();
 
         if let Some(idx) = result {
-            let mut in_use = self.in_use.lock().expect("staging in_use lock poisoned");
-            in_use[idx] = true;
+            inner.in_use[idx] = true;
         }
+        drop(inner);
 
         let mut stats = self.stats.write().expect("staging stats lock poisoned");
         if result.is_some() {
@@ -335,16 +335,14 @@ impl StagingPool {
     pub fn release(&self, index: usize) {
         assert!(index < self.capacity, "staging buffer index out of range");
 
-        let mut in_use = self.in_use.lock().expect("staging in_use lock poisoned");
+        let mut inner = self.inner.lock().expect("staging pool lock poisoned");
         assert!(
-            in_use[index],
+            inner.in_use[index],
             "staging buffer {index} released twice (not currently in use)"
         );
-        in_use[index] = false;
-        drop(in_use);
-
-        let mut free = self.free_list.lock().expect("staging pool lock poisoned");
-        free.push_back(index);
+        inner.in_use[index] = false;
+        inner.free_list.push_back(index);
+        drop(inner);
 
         let mut stats = self.stats.write().expect("staging stats lock poisoned");
         stats.releases += 1;
@@ -357,8 +355,8 @@ impl StagingPool {
 
     /// Number of currently available buffers.
     pub fn available(&self) -> usize {
-        let free = self.free_list.lock().expect("staging pool lock poisoned");
-        free.len()
+        let inner = self.inner.lock().expect("staging pool lock poisoned");
+        inner.free_list.len()
     }
 
     /// Get a snapshot of pool statistics.
