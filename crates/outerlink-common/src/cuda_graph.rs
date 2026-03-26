@@ -684,7 +684,8 @@ pub fn estimate_node_cost(node: &ShadowNode, gpu: &GpuProfile) -> u64 {
                     gpu.fp32_tflops * 1e3 // GFLOPS -> ops/ns
                 }
                 WorkloadClass::MemoryBound => {
-                    gpu.memory_bandwidth_gbps * 1e9 / 8.0 / 1e9 // bytes/ns
+                    // GB/s == bytes/ns numerically, so no conversion needed.
+                    gpu.memory_bandwidth_gbps
                 }
                 WorkloadClass::TensorBound => {
                     let tensor_tflops = gpu
@@ -867,10 +868,19 @@ pub fn heft_assign(
     for node_id in priority_order {
         let node = graph.nodes[&node_id].clone();
 
-        // NCCL nodes: must be present on ALL GPUs
+        // NCCL nodes: must be present on ALL GPUs (replicated collective).
+        // Set assigned_gpu to the first GPU so cross-edge detection for
+        // successors doesn't see None and silently default to GPU 0.
         if node.node_class == NodeClass::NcclCollective {
             for profile in gpu_profiles {
                 assignments.entry(profile.gpu_id).or_default().push(node_id);
+            }
+            // Mark as assigned to first GPU for cross-edge accounting.
+            // The actual NCCL collective runs on all GPUs simultaneously.
+            if let Some(first_gpu) = gpu_profiles.first() {
+                if let Some(n) = graph.nodes.get_mut(&node_id) {
+                    n.assigned_gpu = Some(first_gpu.gpu_id);
+                }
             }
             continue;
         }

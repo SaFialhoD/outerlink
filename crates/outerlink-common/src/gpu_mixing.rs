@@ -448,11 +448,16 @@ impl CapabilityScorer {
         gpu_id: GpuId,
         kernel_hash: u64,
         observed_ns: u64,
-        _workload_class: WorkloadClass,
+        workload_class: WorkloadClass,
     ) {
+        // Key the affinity cache by (kernel_hash, workload_class) so that
+        // per-class score adjustments work correctly. Different workload
+        // classes on the same kernel can have different optimal GPUs.
+        let cache_key = kernel_hash ^ (workload_class as u64).wrapping_mul(0x9E3779B97F4A7C15);
+
         let entry = self
             .affinity_cache
-            .entry(kernel_hash)
+            .entry(cache_key)
             .or_insert(AffinityEntry {
                 best_gpu: gpu_id,
                 avg_execution_ns: observed_ns,
@@ -460,16 +465,19 @@ impl CapabilityScorer {
                 last_updated: Instant::now(),
             });
 
+        // Compare against the prior average BEFORE incorporating the new sample,
+        // so that the best_gpu decision isn't biased by the sample itself.
+        let prior_avg = entry.avg_execution_ns;
+        if observed_ns < prior_avg {
+            entry.best_gpu = gpu_id;
+        }
+
         // Exponential moving average (alpha = 0.2)
         let alpha = 0.2;
         entry.avg_execution_ns =
-            ((1.0 - alpha) * entry.avg_execution_ns as f64 + alpha * observed_ns as f64) as u64;
+            ((1.0 - alpha) * prior_avg as f64 + alpha * observed_ns as f64) as u64;
         entry.sample_count += 1;
         entry.last_updated = Instant::now();
-
-        if observed_ns < entry.avg_execution_ns {
-            entry.best_gpu = gpu_id;
-        }
     }
 
     /// Get affinity entry for a kernel hash, if any observations exist.
