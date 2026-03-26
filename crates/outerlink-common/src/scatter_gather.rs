@@ -254,6 +254,9 @@ pub struct StagingPool {
     buffers: Vec<StagingBuffer>,
     /// Indices of available buffers.
     free_list: Mutex<VecDeque<usize>>,
+    /// Tracks which buffers are currently in use (true = in use).
+    /// Protected by the same mutex as `free_list` to prevent double-release.
+    in_use: Mutex<Vec<bool>>,
     /// Total number of buffers.
     capacity: usize,
     /// Statistics.
@@ -290,9 +293,12 @@ impl StagingPool {
             free_list.push_back(i);
         }
 
+        let in_use = vec![false; config.buffer_count];
+
         Self {
             buffers,
             free_list: Mutex::new(free_list),
+            in_use: Mutex::new(in_use),
             capacity: config.buffer_count,
             stats: RwLock::new(StagingPoolStats::default()),
         }
@@ -305,6 +311,11 @@ impl StagingPool {
     pub fn acquire(&self) -> Option<usize> {
         let mut free = self.free_list.lock().expect("staging pool lock poisoned");
         let result = free.pop_front();
+
+        if let Some(idx) = result {
+            let mut in_use = self.in_use.lock().expect("staging in_use lock poisoned");
+            in_use[idx] = true;
+        }
 
         let mut stats = self.stats.write().expect("staging stats lock poisoned");
         if result.is_some() {
@@ -319,9 +330,19 @@ impl StagingPool {
     /// Release a staging buffer back to the pool.
     ///
     /// # Panics
-    /// Panics if `index` is out of range.
+    /// Panics if `index` is out of range or if the buffer was already released
+    /// (double-release detection).
     pub fn release(&self, index: usize) {
         assert!(index < self.capacity, "staging buffer index out of range");
+
+        let mut in_use = self.in_use.lock().expect("staging in_use lock poisoned");
+        assert!(
+            in_use[index],
+            "staging buffer {index} released twice (not currently in use)"
+        );
+        in_use[index] = false;
+        drop(in_use);
+
         let mut free = self.free_list.lock().expect("staging pool lock poisoned");
         free.push_back(index);
 
@@ -455,7 +476,14 @@ pub fn consider_compression(
     total_bytes: u64,
     estimated_ratio: f32,
 ) -> TransferMethod {
-    if total_bytes >= COMPRESSION_SIZE_THRESHOLD && estimated_ratio >= MIN_COMPRESSION_RATIO {
+    // Only overlay compression on SoftwarePrePack — compression requires a
+    // contiguous staging buffer which is already created in the pre-pack path.
+    // Upgrading SingleSge or HardwareScatterGather to compressed would silently
+    // regress a zero-copy hardware path to a gather-then-compress path.
+    if matches!(base, TransferMethod::SoftwarePrePack { .. })
+        && total_bytes >= COMPRESSION_SIZE_THRESHOLD
+        && estimated_ratio >= MIN_COMPRESSION_RATIO
+    {
         return TransferMethod::CompressedPrePack { estimated_ratio };
     }
     base
@@ -472,6 +500,11 @@ pub fn build_sge_list(runs: &[ContiguousRun]) -> ScatterGatherList {
     let mut total_bytes = 0u64;
 
     for run in runs {
+        assert!(
+            run.length <= u32::MAX as u64,
+            "contiguous run length {} exceeds u32::MAX for SgeEntry",
+            run.length
+        );
         entries.push(SgeEntry {
             addr: run.start_addr,
             length: run.length as u32,

@@ -76,9 +76,18 @@ impl PtpTime {
     }
 
     /// Create from total nanoseconds since epoch.
+    ///
+    /// Handles negative nanos correctly by normalizing the remainder
+    /// so that `nanoseconds` is always in `[0, 999_999_999]`.
     pub fn from_nanos(nanos: i128) -> Self {
-        let seconds = (nanos / 1_000_000_000) as i64;
-        let nanoseconds = (nanos % 1_000_000_000) as u32;
+        let mut seconds = (nanos / 1_000_000_000) as i64;
+        let remainder = (nanos % 1_000_000_000) as i64;
+        let nanoseconds = if remainder < 0 {
+            seconds -= 1;
+            (remainder + 1_000_000_000) as u32
+        } else {
+            remainder as u32
+        };
         Self {
             seconds,
             nanoseconds,
@@ -487,6 +496,17 @@ pub trait ClockSync: Send + Sync {
 
     /// Convert PTP time to GPU globaltimer value (for GPU-side spin-wait).
     fn ptp_to_gpu_time(&self, ptp_time: PtpTime, gpu_id: u32) -> Result<u64, ClockSyncError>;
+
+    /// Schedule an action to execute at a specific PTP time.
+    ///
+    /// Strategy: coarse sleep until ~1ms before target, then spin-wait on
+    /// `PtpTime::now()` until the target is reached, then invoke the action.
+    /// Returns `TargetTimeInPast` if the target time has already passed.
+    fn schedule_at(
+        &self,
+        target: PtpTime,
+        action: Box<dyn FnOnce() + Send>,
+    ) -> Result<(), ClockSyncError>;
 }
 
 /// Errors specific to the clock sync subsystem.
@@ -564,6 +584,18 @@ impl PtpHealthMonitor {
         let freq = tokens[3].parse::<i64>().unwrap_or(0);
         let path_delay = tokens[6].parse::<i64>().unwrap_or(0);
 
+        // Preserve stable_since when already in LockedStable to avoid resetting
+        // the stability timer on every ptp4l output line.
+        let existing_stable_since = if let Ok(h) = self.health.read() {
+            if let PtpSyncState::LockedStable { stable_since, .. } = h.state {
+                Some(stable_since)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let state = match servo_state {
             "s0" => PtpSyncState::Unlocked,
             "s1" => PtpSyncState::Stepping,
@@ -571,7 +603,7 @@ impl PtpHealthMonitor {
                 if offset.abs() < self.stability_threshold_ns {
                     PtpSyncState::LockedStable {
                         offset_ns: offset,
-                        stable_since: Instant::now(),
+                        stable_since: existing_stable_since.unwrap_or_else(Instant::now),
                     }
                 } else {
                     PtpSyncState::Locked { offset_ns: offset }
@@ -819,7 +851,47 @@ impl ClockSync for LinuxPtpClockSync {
 
         // gpu_time = ptp_time - offset - drift_correction
         let gpu_time = ptp_ns - cal.offset_ns - drift_correction;
+        if gpu_time < 0 {
+            return Err(ClockSyncError::TargetTimeInPast);
+        }
         Ok(gpu_time as u64)
+    }
+
+    fn schedule_at(
+        &self,
+        target: PtpTime,
+        action: Box<dyn FnOnce() + Send>,
+    ) -> Result<(), ClockSyncError> {
+        if !self.is_synced() {
+            return Err(ClockSyncError::PtpNotSynced);
+        }
+
+        let now = PtpTime::now();
+        if target.as_nanos() <= now.as_nanos() {
+            return Err(ClockSyncError::TargetTimeInPast);
+        }
+
+        // Coarse sleep: sleep until ~1ms before target to avoid burning CPU.
+        let target_ns = target.as_nanos();
+        let now_ns = now.as_nanos();
+        let delta_ns = target_ns - now_ns;
+        let coarse_sleep_ns = delta_ns - 1_000_000; // wake 1ms early
+        if coarse_sleep_ns > 0 {
+            std::thread::sleep(Duration::from_nanos(coarse_sleep_ns as u64));
+        }
+
+        // Spin-wait: busy-wait on PtpTime::now() until target is reached.
+        // This gives sub-microsecond precision on the action invocation.
+        loop {
+            let current = PtpTime::now();
+            if current.as_nanos() >= target_ns {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
+        action();
+        Ok(())
     }
 }
 
