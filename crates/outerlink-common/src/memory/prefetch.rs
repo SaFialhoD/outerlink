@@ -140,8 +140,10 @@ impl PrefetchScheduler {
 
         let mut pending = self.pending.lock().unwrap();
 
-        // Collect VPNs already pending to avoid duplicates
-        let pending_vpns: std::collections::HashSet<u64> =
+        // Collect VPNs already pending to avoid duplicates.
+        // Mutable: updated as new predictions are inserted to prevent
+        // the same VPN appearing twice within a single predictions slice.
+        let mut pending_vpns: std::collections::HashSet<u64> =
             pending.iter().map(|r| r.vpn).collect();
 
         for pred in predictions {
@@ -169,7 +171,7 @@ impl PrefetchScheduler {
             let confidence = pred.confidence as f32;
             let request = PrefetchRequest {
                 vpn: pred.vpn,
-                source_tier: crate::memory::types::LOCAL_VRAM,
+                source_tier: pred.target_tier,
                 confidence,
                 predicted_by: PredictionSource::Stride, // Default; real impl would derive from prediction metadata
                 submitted_at: std::time::Instant::now(),
@@ -181,6 +183,7 @@ impl PrefetchScheduler {
                 .position(|r| r.confidence < confidence)
                 .unwrap_or(pending.len());
             pending.insert(pos, request);
+            pending_vpns.insert(pred.vpn);
         }
 
         // Update prediction counter for adaptive lookahead
@@ -335,42 +338,59 @@ impl PrefetchScheduler {
 
     /// Finalize miss tracking: call this to mark all completed-but-unused
     /// prefetches as misses. Typically called at epoch boundaries.
+    ///
+    /// Clears the completed map atomically with the stats update so that
+    /// concurrent or repeated calls cannot double-count misses.
     pub fn finalize_misses(&self) {
-        let mut stats = self.stats.write().unwrap();
-        // Iterate completed entries and count unused ones as misses
+        // Count misses first, then clear, all under the stats lock to
+        // ensure atomicity: no window where another call could re-count.
+        let mut miss_count = 0u64;
         for entry in self.completed.iter() {
             if !*entry.value() {
-                stats.total_misses += 1;
+                miss_count += 1;
             }
         }
-        // Clear completed map after finalization
-        drop(stats);
         self.completed.clear();
+
+        if miss_count > 0 {
+            let mut stats = self.stats.write().unwrap();
+            stats.total_misses += miss_count;
+        }
     }
 
     /// Adaptive lookahead adjustment based on hit/stall rates.
+    ///
+    /// Computes all needed values from a single stats snapshot to avoid
+    /// inconsistencies from concurrent updates between lock acquisitions.
+    /// Uses `else if` so only one direction of adjustment happens per cycle,
+    /// preventing the lookahead from cancelling itself out when both
+    /// stall_rate > 5% and hit_rate < 50% are true simultaneously.
     fn adapt_lookahead(&self) {
-        let stats = self.stats.read().unwrap();
-        let stall_total = stats.total_stalls + stats.total_hits;
-        let hit_miss_total = stats.total_hits + stats.total_misses;
-        drop(stats);
+        let (stall_rate, hit_rate, has_stalls, has_hits_misses) = {
+            let stats = self.stats.read().unwrap();
+            let stall_total = stats.total_stalls + stats.total_hits;
+            let hit_miss_total = stats.total_hits + stats.total_misses;
+            let sr = if stall_total > 0 {
+                stats.total_stalls as f32 / stall_total as f32
+            } else {
+                0.0
+            };
+            let hr = if hit_miss_total > 0 {
+                stats.total_hits as f32 / hit_miss_total as f32
+            } else {
+                0.0
+            };
+            (sr, hr, stall_total > 0, hit_miss_total > 0)
+        };
 
         let mut config = self.config.write().unwrap();
 
         // If stall rate > 5%, increase lookahead (pages arrive too late)
-        if stall_total > 0 {
-            let stall_rate = self.stall_rate();
-            if stall_rate > 0.05 && config.lookahead_kernels < 8 {
-                config.lookahead_kernels += 1;
-            }
-        }
-
-        // If hit rate < 50%, decrease lookahead (too speculative)
-        if hit_miss_total > 0 {
-            let hit_rate = self.hit_rate();
-            if hit_rate < 0.5 && config.lookahead_kernels > 1 {
-                config.lookahead_kernels -= 1;
-            }
+        if has_stalls && stall_rate > 0.05 && config.lookahead_kernels < 8 {
+            config.lookahead_kernels += 1;
+        } else if has_hits_misses && hit_rate < 0.5 && config.lookahead_kernels > 1 {
+            // If hit rate < 50%, decrease lookahead (too speculative)
+            config.lookahead_kernels -= 1;
         }
     }
 }

@@ -36,14 +36,14 @@ pub use migration::{
 };
 pub use access_monitor::{InterceptionAccessMonitor, MonitorConfig};
 pub use compression::{AdaptiveCompressor, CompressionAlgorithm, CompressionConfig};
-pub use coherency::{CoherencyDirectory, CoherencyStats, DirectoryEntry, PageState};
+pub use coherency::{CoherencyDirectory, CoherencyStats, DirectoryEntry, PageState, ReadResponse, WriteResponse};
 pub use dedup::{DedupConfig, DedupManager, DedupStats};
-pub use fault_handler::{FaultConfig, FaultHandler, FaultResult, FaultStats, ThrashingDetector};
+pub use fault_handler::{FaultConfig, FaultHandler, FaultResult, FaultStats, ThrashingConfig, ThrashingDetector, ThrashingLevel};
 pub use eviction::{ArcPolicy, CarPolicy, ClockPolicy};
 pub use migration_engine::TieredMigrationEngine;
 pub use page_table::RobinHoodPageTable;
 pub use prefetch::{PredictionSource, PrefetchConfig, PrefetchScheduler, PrefetchStats};
-pub use topology::{LinkInfo, LinkType, NodeInfo, PlacementScorer, Route, TopologyGraph};
+pub use topology::{LinkInfo, LinkType, NodeInfo, PlacementScorer, PlacementWeights, Route, TopologyGraph};
 pub use tier_manager::DefaultTierManager;
 pub use pte::{PageTableEntry, PteFlags};
 pub use tier_status::{

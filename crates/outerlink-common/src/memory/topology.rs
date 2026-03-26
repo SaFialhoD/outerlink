@@ -17,7 +17,11 @@ pub struct NodeInfo {
     pub node_id: u8,
     pub hostname: String,
     pub gpu_count: u8,
+    /// Total installed VRAM on this node.
     pub vram_bytes: u64,
+    /// Currently available (free) VRAM. Updated dynamically.
+    /// Used by `nearest_node_with_capacity` for placement decisions.
+    pub free_vram_bytes: u64,
     pub dram_bytes: u64,
     pub nvme_bytes: u64,
     pub online: bool,
@@ -122,13 +126,21 @@ impl TopologyGraph {
     }
 
     /// Add or update a link between two nodes.
+    ///
+    /// Invalidates the route cache since the new/updated link may provide
+    /// shorter paths. Call `compute_routes()` to rebuild.
     pub fn add_link(&self, info: LinkInfo) {
         self.links.insert((info.from_node, info.to_node), info);
+        self.routes.clear();
     }
 
     /// Remove a link.
+    ///
+    /// Invalidates the route cache since existing routes may have used this
+    /// link. Call `compute_routes()` to rebuild.
     pub fn remove_link(&self, from: u8, to: u8) {
         self.links.remove(&(from, to));
+        self.routes.clear();
     }
 
     /// Get a clone of a node's info.
@@ -174,13 +186,26 @@ impl TopologyGraph {
             .map(|e| e.value().node_id)
             .collect();
 
-        // Build adjacency list from links.
+        // Build adjacency list from links, filtering to only include edges
+        // between online nodes. This makes the offline-node exclusion explicit
+        // rather than relying on the visited-map fallback.
+        // Effective latency includes a congestion penalty: latency * (1 + utilization^2).
+        // This biases routing away from congested links while keeping the base
+        // cost equal to raw latency when utilization is zero.
+        let online_set: std::collections::HashSet<u8> = node_ids.iter().copied().collect();
         let mut adj: HashMap<u8, Vec<(u8, u64, u64, LinkType)>> = HashMap::new();
         for entry in self.links.iter() {
             let link = entry.value();
+            // Skip links where either endpoint is offline.
+            if !online_set.contains(&link.from_node) || !online_set.contains(&link.to_node) {
+                continue;
+            }
+            let congestion_penalty = (link.utilization * link.utilization) as f64;
+            let effective_latency =
+                (link.latency_ns as f64 * (1.0 + congestion_penalty)) as u64;
             adj.entry(link.from_node)
                 .or_default()
-                .push((link.to_node, link.latency_ns, link.bandwidth_bps, link.link_type));
+                .push((link.to_node, effective_latency, link.bandwidth_bps, link.link_type));
         }
 
         // Run Dijkstra from each node.
@@ -284,7 +309,7 @@ impl TopologyGraph {
             .iter()
             .filter(|entry| {
                 let n = entry.value();
-                n.online && n.node_id != from && n.vram_bytes >= min_bytes
+                n.online && n.node_id != from && n.free_vram_bytes >= min_bytes
             })
             .map(|entry| entry.value().node_id)
             .collect();
@@ -365,6 +390,10 @@ impl PlacementScorer {
     ///
     /// Each input value should be normalised to 0.0..=1.0.
     /// Higher score = better placement candidate.
+    ///
+    /// `migration_cost` is inverted internally: a high cost (close to 1.0)
+    /// produces a low contribution to the score, matching the intuition that
+    /// expensive migrations are penalised.
     pub fn score(
         &self,
         affinity: f32,
@@ -376,7 +405,7 @@ impl PlacementScorer {
         self.weights.affinity * affinity
             + self.weights.bandwidth * bandwidth
             + self.weights.capacity * capacity
-            + self.weights.migration_cost * migration_cost
+            + self.weights.migration_cost * (1.0 - migration_cost)
             + self.weights.gpu_capability * gpu_capability
     }
 }
@@ -395,6 +424,7 @@ mod tests {
             hostname: format!("node-{}", id),
             gpu_count: 1,
             vram_bytes: vram,
+            free_vram_bytes: vram, // Tests assume fully free by default
             dram_bytes: 64 * 1024 * 1024 * 1024,
             nvme_bytes: 1_000_000_000_000,
             online,
@@ -564,22 +594,30 @@ mod tests {
     fn placement_scorer_weighted() {
         let scorer = PlacementScorer::with_default_weights();
 
-        // All ones => weighted sum = sum of weights = 1.0.
-        let score_all_ones = scorer.score(1.0, 1.0, 1.0, 1.0, 1.0);
-        assert!((score_all_ones - 1.0).abs() < 0.001);
+        // All ones with zero cost => all weights contribute fully = 1.0.
+        let score_best = scorer.score(1.0, 1.0, 1.0, 0.0, 1.0);
+        assert!((score_best - 1.0).abs() < 0.001);
 
-        // All zeros => 0.0.
-        let score_all_zeros = scorer.score(0.0, 0.0, 0.0, 0.0, 0.0);
+        // All zeros with max cost => 0.0.
+        let score_all_zeros = scorer.score(0.0, 0.0, 0.0, 1.0, 0.0);
         assert!(score_all_zeros.abs() < f32::EPSILON);
 
-        // Affinity-heavy scenario: high affinity, low everything else.
-        let score_affinity = scorer.score(1.0, 0.0, 0.0, 0.0, 0.0);
+        // migration_cost inversion: cost=1.0 means expensive, contributes 0;
+        // cost=0.0 means cheap, contributes full weight.
+        let score_cheap = scorer.score(0.0, 0.0, 0.0, 0.0, 0.0);
+        let score_expensive = scorer.score(0.0, 0.0, 0.0, 1.0, 0.0);
+        assert!((score_cheap - 0.10).abs() < 0.001); // migration_cost weight
+        assert!(score_expensive.abs() < f32::EPSILON);
+
+        // Affinity-heavy scenario: high affinity, zero cost, low everything else.
+        let score_affinity = scorer.score(1.0, 0.0, 0.0, 1.0, 0.0);
         assert!((score_affinity - 0.35).abs() < 0.001);
 
-        // Compare two candidates.
+        // Compare two candidates: A has strong affinity+bandwidth+low cost,
+        // B has high cost.
         let candidate_a = scorer.score(0.9, 0.8, 0.5, 0.3, 0.7);
         let candidate_b = scorer.score(0.2, 0.3, 0.9, 0.8, 0.4);
-        // A should score higher (strong affinity + bandwidth).
+        // A should score higher (strong affinity + bandwidth + lower cost).
         assert!(candidate_a > candidate_b);
     }
 

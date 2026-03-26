@@ -76,56 +76,64 @@ impl CoherencyDirectory {
     /// - Shared -> Shared (add requester to sharers)
     /// - Exclusive -> Shared (downgrade owner, add requester)
     pub fn handle_read_request(&self, vpn: u64, requesting_node: u8) -> ReadResponse {
-        {
-            let mut stats = self.stats.write().unwrap();
-            stats.read_requests += 1;
-        }
+        // Perform all DashMap mutations first, collecting stat deltas.
+        // Stats are updated after releasing the DashMap shard lock to avoid
+        // nested lock acquisition (DashMap shard + RwLock<Stats>).
+        let mut stat_downgrade = false;
 
-        let mut entry = self.entries.entry(vpn).or_insert_with(|| DirectoryEntry {
-            vpn,
-            home_node: self.local_node,
-            state: PageState::Invalid,
-            owner: None,
-            sharers: Vec::new(),
-        });
+        let response = {
+            let mut entry = self.entries.entry(vpn).or_insert_with(|| DirectoryEntry {
+                vpn,
+                home_node: self.local_node,
+                state: PageState::Invalid,
+                owner: None,
+                sharers: Vec::new(),
+            });
 
-        match entry.state {
-            PageState::Invalid => {
-                entry.state = PageState::Shared;
-                entry.sharers.push(requesting_node);
-                ReadResponse::Granted {
-                    data_source: entry.home_node,
-                }
-            }
-            PageState::Shared => {
-                if entry.sharers.contains(&requesting_node) {
-                    ReadResponse::AlreadyShared
-                } else {
-                    // Data can come from home or any existing sharer
-                    let data_source = entry.home_node;
+            match entry.state {
+                PageState::Invalid => {
+                    entry.state = PageState::Shared;
                     entry.sharers.push(requesting_node);
+                    ReadResponse::Granted {
+                        data_source: entry.home_node,
+                    }
+                }
+                PageState::Shared => {
+                    if entry.sharers.contains(&requesting_node) {
+                        ReadResponse::AlreadyShared
+                    } else {
+                        let data_source = entry.home_node;
+                        entry.sharers.push(requesting_node);
+                        ReadResponse::Granted { data_source }
+                    }
+                }
+                PageState::Exclusive => {
+                    let previous_owner =
+                        entry.owner.expect("Exclusive state must have an owner");
+                    stat_downgrade = true;
+
+                    let data_source = previous_owner;
+                    entry.state = PageState::Shared;
+                    entry.owner = None;
+                    entry.sharers.clear();
+                    entry.sharers.push(previous_owner);
+                    entry.sharers.push(requesting_node);
+
                     ReadResponse::Granted { data_source }
                 }
             }
-            PageState::Exclusive => {
-                // Downgrade the exclusive owner to shared
-                let previous_owner = entry.owner.expect("Exclusive state must have an owner");
+        }; // DashMap shard lock released here
 
-                {
-                    let mut stats = self.stats.write().unwrap();
-                    stats.downgrades += 1;
-                }
-
-                let data_source = previous_owner;
-                entry.state = PageState::Shared;
-                entry.owner = None;
-                entry.sharers.clear();
-                entry.sharers.push(previous_owner);
-                entry.sharers.push(requesting_node);
-
-                ReadResponse::Granted { data_source }
+        // Update stats after releasing DashMap guard.
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.read_requests += 1;
+            if stat_downgrade {
+                stats.downgrades += 1;
             }
         }
+
+        response
     }
 
     /// Handle a write request from a remote node.
@@ -134,72 +142,79 @@ impl CoherencyDirectory {
     /// - Invalid -> Exclusive (grant to requester)
     /// - Shared -> Exclusive (invalidate all sharers, grant to requester)
     /// - Exclusive (same node) -> AlreadyExclusive
-    /// - Exclusive (other node) -> Exclusive (invalidate old owner)
+    /// - Exclusive (other node) -> Exclusive (invalidate old owner, caller
+    ///   must fetch current data from the invalidated node before granting)
     pub fn handle_write_request(&self, vpn: u64, requesting_node: u8) -> WriteResponse {
-        {
-            let mut stats = self.stats.write().unwrap();
-            stats.write_requests += 1;
-        }
+        // Collect stat deltas while holding the DashMap guard, then apply
+        // after releasing it to avoid nested locks.
+        let mut stat_invalidations: u64 = 0;
+        let mut stat_upgrade = false;
 
-        let mut entry = self.entries.entry(vpn).or_insert_with(|| DirectoryEntry {
-            vpn,
-            home_node: self.local_node,
-            state: PageState::Invalid,
-            owner: None,
-            sharers: Vec::new(),
-        });
+        let response = {
+            let mut entry = self.entries.entry(vpn).or_insert_with(|| DirectoryEntry {
+                vpn,
+                home_node: self.local_node,
+                state: PageState::Invalid,
+                owner: None,
+                sharers: Vec::new(),
+            });
 
-        match entry.state {
-            PageState::Invalid => {
-                entry.state = PageState::Exclusive;
-                entry.owner = Some(requesting_node);
-                entry.sharers.clear();
-                WriteResponse::Granted {
-                    invalidated: Vec::new(),
-                }
-            }
-            PageState::Shared => {
-                // Invalidate all sharers except the requester
-                let invalidated: Vec<u8> = entry
-                    .sharers
-                    .iter()
-                    .copied()
-                    .filter(|&n| n != requesting_node)
-                    .collect();
-
-                let was_sharer = entry.sharers.contains(&requesting_node);
-
-                {
-                    let mut stats = self.stats.write().unwrap();
-                    stats.invalidations_sent += invalidated.len() as u64;
-                    if was_sharer {
-                        stats.upgrades += 1;
-                    }
-                }
-
-                entry.state = PageState::Exclusive;
-                entry.owner = Some(requesting_node);
-                entry.sharers.clear();
-
-                WriteResponse::Granted { invalidated }
-            }
-            PageState::Exclusive => {
-                let current_owner = entry.owner.expect("Exclusive state must have an owner");
-                if current_owner == requesting_node {
-                    WriteResponse::AlreadyExclusive
-                } else {
-                    {
-                        let mut stats = self.stats.write().unwrap();
-                        stats.invalidations_sent += 1;
-                    }
-
-                    let invalidated = vec![current_owner];
+            match entry.state {
+                PageState::Invalid => {
+                    entry.state = PageState::Exclusive;
                     entry.owner = Some(requesting_node);
+                    entry.sharers.clear();
+                    WriteResponse::Granted {
+                        invalidated: Vec::new(),
+                    }
+                }
+                PageState::Shared => {
+                    let invalidated: Vec<u8> = entry
+                        .sharers
+                        .iter()
+                        .copied()
+                        .filter(|&n| n != requesting_node)
+                        .collect();
+
+                    stat_invalidations = invalidated.len() as u64;
+                    stat_upgrade = entry.sharers.contains(&requesting_node);
+
+                    entry.state = PageState::Exclusive;
+                    entry.owner = Some(requesting_node);
+                    entry.sharers.clear();
 
                     WriteResponse::Granted { invalidated }
                 }
+                PageState::Exclusive => {
+                    let current_owner =
+                        entry.owner.expect("Exclusive state must have an owner");
+                    if current_owner == requesting_node {
+                        WriteResponse::AlreadyExclusive
+                    } else {
+                        // Ownership transfer: the caller (transport layer) must
+                        // fetch current page data from current_owner before
+                        // granting write access to requesting_node.
+                        stat_invalidations = 1;
+                        let invalidated = vec![current_owner];
+                        entry.owner = Some(requesting_node);
+
+                        WriteResponse::Granted { invalidated }
+                    }
+                }
+            }
+        }; // DashMap shard lock released here
+
+        // Update stats after releasing DashMap guard.
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.write_requests += 1;
+            stats.invalidations_sent += stat_invalidations;
+            if stat_upgrade {
+                stats.upgrades += 1;
             }
         }
+
+        response
     }
 
     /// Handle notification that a node is evicting a page.

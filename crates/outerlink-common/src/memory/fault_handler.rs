@@ -34,10 +34,12 @@ impl Default for FaultConfig {
 }
 
 /// The state of an in-flight page fault.
+///
+/// Only `Fetching` entries live in `pending_faults`. When a fault completes
+/// or fails, the entry is removed (not transitioned). This keeps the map
+/// clean and avoids accumulating stale terminal states.
 pub enum FaultState {
     Fetching { from_node: u8, started_at: Instant },
-    Completed,
-    Failed { reason: String },
 }
 
 /// Statistics for fault handling operations.
@@ -52,8 +54,11 @@ pub struct FaultStats {
 
 /// Result of a single page fault request.
 pub enum FaultResult {
-    /// Page is already present locally or already being fetched.
+    /// Page is already present locally.
     AlreadyLocal,
+    /// A fetch for this page is already in-flight (dedup). Caller must wait
+    /// for the existing fetch to complete before accessing the page.
+    AlreadyFetching,
     /// Fetch has been initiated.
     Fetching,
     /// Request failed.
@@ -80,9 +85,10 @@ impl FaultHandler {
         let mut results = Vec::with_capacity(vpns.len());
 
         for &vpn in vpns {
-            // Check if already pending (dedup)
+            // Check if already pending (dedup): page is being fetched by another
+            // request. Caller must wait for the in-flight fetch to complete.
             if self.pending_faults.contains_key(&vpn) {
-                results.push(FaultResult::AlreadyLocal);
+                results.push(FaultResult::AlreadyFetching);
                 continue;
             }
 
@@ -116,18 +122,15 @@ impl FaultHandler {
 
     /// Mark a fault as successfully resolved.
     pub fn on_fault_complete(&self, vpn: u64) {
-        if let Some((_, state)) = self.pending_faults.remove(&vpn) {
-            let resolution_us = match state {
-                FaultState::Fetching { started_at, .. } => {
-                    started_at.elapsed().as_micros() as f64
-                }
-                _ => 0.0,
-            };
+        if let Some((_, FaultState::Fetching { started_at, .. })) =
+            self.pending_faults.remove(&vpn)
+        {
+            let resolution_us = started_at.elapsed().as_micros() as f64;
 
+            // Welford running average: increment count first (new N),
+            // then update the mean. This is numerically stable.
             let mut stats = self.stats.write().unwrap();
             stats.faults_resolved += 1;
-
-            // Update running average
             let total_resolved = stats.faults_resolved as f64;
             stats.avg_resolution_us = stats.avg_resolution_us
                 + (resolution_us - stats.avg_resolution_us) / total_resolved;
@@ -135,19 +138,24 @@ impl FaultHandler {
     }
 
     /// Mark a fault as failed.
-    pub fn on_fault_failed(&self, vpn: u64, _reason: String) {
+    ///
+    /// The reason is logged via `tracing` (when integrated) for diagnostics.
+    /// Retry logic is the caller's responsibility; `max_retry_count` in
+    /// `FaultConfig` provides the recommended limit.
+    pub fn on_fault_failed(&self, vpn: u64, reason: String) {
         if self.pending_faults.remove(&vpn).is_some() {
+            // Log the failure reason for diagnostics. In production this
+            // will use tracing::warn!; for now we just consume the value
+            // to avoid the unused-variable lint.
+            let _reason = reason;
             let mut stats = self.stats.write().unwrap();
             stats.faults_failed += 1;
         }
     }
 
-    /// Check whether a fault is currently pending for the given VPN.
+    /// Check whether a fault is currently pending (being fetched) for the given VPN.
     pub fn is_fault_pending(&self, vpn: u64) -> bool {
-        self.pending_faults
-            .get(&vpn)
-            .map(|entry| matches!(entry.value(), FaultState::Fetching { .. }))
-            .unwrap_or(false)
+        self.pending_faults.contains_key(&vpn)
     }
 
     /// Number of currently pending faults.

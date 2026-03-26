@@ -55,7 +55,9 @@ pub struct DedupStats {
     pub total_unique: u64,
     /// Reference pages that share storage with a canonical page.
     pub pages_saved: u64,
-    /// Bytes saved (pages_saved * page size used during check).
+    /// Bytes saved (accumulated from data.len() on each dedup match; upper-bound
+    /// estimate since freed references cannot be precisely subtracted without
+    /// per-entry size tracking).
     pub bytes_saved: u64,
 }
 
@@ -187,11 +189,21 @@ impl DedupHook for DedupManager {
             return None;
         }
 
+        // Guard: if this VPN is already tracked, skip to avoid it appearing
+        // as both canonical and reference of itself (or of two different hashes).
+        if self.vpn_to_hash.contains_key(&vpn) {
+            return None;
+        }
+
         let hash = Self::hash_page(data);
 
         // Try to get existing entry first.
         if let Some(mut entry) = self.table.get_mut(&hash) {
             // Match found: this page has identical content to the canonical.
+            // Note: verify_on_match would require access to canonical page data
+            // for memcmp verification. Currently we trust the xxHash128 collision
+            // resistance (probability ~2^-128). Full verification requires a
+            // PageTable reference which will be wired in during integration.
             entry.ref_count += 1;
             entry.references.push(vpn);
             let canonical = entry.canonical_vpn;
@@ -209,7 +221,8 @@ impl DedupHook for DedupManager {
         }
 
         // No match: check capacity before inserting.
-        if self.table.len() >= self.config.max_entries {
+        // max_entries == 0 means unlimited.
+        if self.config.max_entries > 0 && self.table.len() >= self.config.max_entries {
             // Table full; skip dedup for this page.
             let mut stats = self.stats.write().unwrap();
             stats.total_checks += 1;
@@ -240,10 +253,10 @@ impl DedupHook for DedupManager {
             None => return,
         };
 
-        // We need to handle the entry update carefully to avoid holding
-        // the DashMap write guard while modifying vpn_to_hash.
+        // Track whether a saved page was lost so we can update stats after
+        // releasing the DashMap guard.
         let should_remove;
-        let mut promoted_vpn = None;
+        let decrement_saved;
 
         {
             let mut entry = match self.table.get_mut(&hash) {
@@ -254,21 +267,29 @@ impl DedupHook for DedupManager {
             if entry.canonical_vpn == vpn {
                 // Freeing the canonical page.
                 if let Some(new_canonical) = entry.references.first().copied() {
-                    // Promote the first reference.
+                    // Promote the first reference to canonical.
+                    // The promoted reference was counted as a "saved" page;
+                    // now it becomes the canonical, so pages_saved drops by 1.
                     entry.references.remove(0);
                     entry.canonical_vpn = new_canonical;
                     entry.ref_count -= 1;
-                    promoted_vpn = Some(new_canonical);
                     should_remove = false;
+                    decrement_saved = true;
                 } else {
                     // No references left; remove the whole entry.
+                    // The canonical itself was never counted as "saved"
+                    // (only references are), so no decrement needed.
                     should_remove = true;
+                    decrement_saved = false;
                 }
             } else {
-                // Freeing a reference page.
+                // Freeing a reference page: one less saved page.
                 if let Some(pos) = entry.references.iter().position(|&v| v == vpn) {
                     entry.references.remove(pos);
                     entry.ref_count -= 1;
+                    decrement_saved = true;
+                } else {
+                    decrement_saved = false;
                 }
                 should_remove = false;
             }
@@ -278,24 +299,16 @@ impl DedupHook for DedupManager {
             self.table.remove(&hash);
         }
 
-        // Update stats: a freed reference means one less page saved.
-        // (If we freed the canonical with references, the promoted ref
-        // was already counted as a saved page, now it becomes canonical,
-        // so pages_saved decreases by 1.)
-        let mut stats = self.stats.write().unwrap();
-        if promoted_vpn.is_some() || stats.pages_saved > 0 {
-            // If canonical was freed and promoted, the old reference that
-            // became canonical no longer counts as "saved".
-            if promoted_vpn.is_some() && stats.pages_saved > 0 {
+        if decrement_saved {
+            let mut stats = self.stats.write().unwrap();
+            if stats.pages_saved > 0 {
                 stats.pages_saved -= 1;
             }
+            // We don't track per-entry page size, so bytes_saved cannot be
+            // decremented precisely. This is a known limitation documented
+            // in break_dedup as well. The caller should treat bytes_saved as
+            // an upper-bound estimate.
         }
-        // Note: if a reference was freed, pages_saved also decreases.
-        if promoted_vpn.is_none() && !should_remove && stats.pages_saved > 0 {
-            stats.pages_saved -= 1;
-        }
-
-        let _ = promoted_vpn; // already used above
     }
 }
 
