@@ -5,6 +5,7 @@ members = [
     "crates/outerlink-server",
     "crates/outerlink-client",
     "crates/outerlink-cli",
+    "crates/outerlink-nccl-plugin",
 ]
 
 [workspace.package]
