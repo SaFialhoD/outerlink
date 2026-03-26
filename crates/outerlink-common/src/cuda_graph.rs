@@ -938,13 +938,35 @@ pub fn heft_assign(
             }
         }
 
-        // If we found a forced GPU, compute its EFT
+        // If we found a forced GPU, compute its EFT including data-arrival
+        // time from predecessors (same logic as the normal scheduling path).
         if let Some(forced) = forced_gpu {
-            if best_gpu == Some(forced) && best_eft == u64::MAX {
+            if best_eft == u64::MAX {
                 let profile = gpu_profiles.iter().find(|p| p.gpu_id == forced);
                 if let Some(profile) = profile {
+                    // Compute data_ready: max finish time of predecessors,
+                    // plus transfer cost if they're on a different GPU.
+                    let data_ready = node
+                        .predecessors
+                        .iter()
+                        .map(|&pred_id| {
+                            let pred = &graph.nodes[&pred_id];
+                            let pred_gpu = pred.assigned_gpu.unwrap_or(0);
+                            if pred_gpu == forced {
+                                pred.earliest_finish_ns
+                            } else {
+                                let xfer = estimate_transfer_size(pred, &node);
+                                let xfer_cost = transfer_cost(pred_gpu, forced, xfer);
+                                pred.earliest_finish_ns + xfer_cost
+                            }
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    let est = data_ready.max(
+                        gpu_available.get(&forced).copied().unwrap_or(0),
+                    );
                     let cost = estimate_node_cost(&node, profile);
-                    best_eft = gpu_available.get(&forced).copied().unwrap_or(0) + cost;
+                    best_eft = est + cost;
                 }
             }
         }

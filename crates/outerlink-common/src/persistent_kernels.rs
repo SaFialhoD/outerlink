@@ -348,7 +348,9 @@ pub struct ControlBlock {
     pub batches_processed: u64,
     /// Total bytes processed.
     pub bytes_processed: u64,
-    _pad1: [u8; 32],
+    // Explicit padding to fill second cache line to 64 bytes:
+    // shutdown_requested(4) + error_code(4) + batches_processed(8) + bytes_processed(8) + pad(40) = 64
+    _pad1: [u8; 40],
 }
 
 impl ControlBlock {
@@ -361,7 +363,7 @@ impl ControlBlock {
             error_code: 0,
             batches_processed: 0,
             bytes_processed: 0,
-            _pad1: [0; 32],
+            _pad1: [0; 40],
         }
     }
 
