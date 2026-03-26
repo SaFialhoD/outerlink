@@ -6,6 +6,8 @@
 pub mod clock_sync;
 pub mod cuda_types;
 pub mod error;
+pub mod fault_tolerance;
+pub mod gpu_storage;
 pub mod handle;
 pub mod memory;
 pub mod protocol;
