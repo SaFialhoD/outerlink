@@ -11,6 +11,7 @@ pub mod error;
 pub mod fault_tolerance;
 pub mod gpu_mixing;
 pub mod gpu_storage;
+pub mod hip_interception;
 pub mod handle;
 pub mod memory;
 pub mod multicast;
