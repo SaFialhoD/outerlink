@@ -29,7 +29,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -110,7 +110,7 @@ impl Default for MulticastConfig {
             max_groups: 64,
             mcast_range_start: Ipv4Addr::new(239, 0, 0, 1),
             mcast_range_end: Ipv4Addr::new(239, 0, 0, 254),
-            max_acceptable_loss_rate: 0.02, // 2% — crossover point from perf model
+            max_acceptable_loss_rate: 0.05, // 5% — crossover point from perf model (preplan spec)
             nack_backoff_min: Duration::from_micros(10),
             nack_backoff_max: Duration::from_micros(100),
             max_retransmit_buffer: 2 * 1024 * 1024 * 1024, // 2GB
@@ -323,11 +323,27 @@ impl RetransmitBuffer {
 
     /// Store a chunk for potential retransmission.
     /// Returns false if the buffer is full and the chunk was not stored.
+    ///
+    /// Uses a compare-exchange loop to atomically reserve space before
+    /// inserting, preventing TOCTOU races where concurrent callers both
+    /// pass the capacity check.
     pub fn store(&self, transfer_id: u64, sequence: u64, data: &[u8]) -> bool {
         let chunk_bytes = data.len() as u64;
-        let current = self.total_bytes.load(Ordering::Relaxed);
-        if current + chunk_bytes > self.max_bytes {
-            return false;
+
+        // Atomically reserve space: CAS loop ensures no two threads can
+        // both pass the capacity check for the same bytes.
+        loop {
+            let current = self.total_bytes.load(Ordering::Relaxed);
+            if current + chunk_bytes > self.max_bytes {
+                return false;
+            }
+            if self
+                .total_bytes
+                .compare_exchange(current, current + chunk_bytes, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
         }
 
         self.transfers
@@ -340,7 +356,6 @@ impl RetransmitBuffer {
             .value_mut()
             .store_chunk(sequence, data);
 
-        self.total_bytes.fetch_add(chunk_bytes, Ordering::Relaxed);
         true
     }
 
@@ -519,12 +534,25 @@ impl ReassemblyBuffer {
         self.nack_state.nack_rounds >= config.max_nack_rounds
     }
 
-    /// Compute the ranges of missing sequence numbers.
+    /// Compute the ranges of missing sequence numbers up to `highest_seen`.
+    ///
+    /// Use `compute_all_missing_ranges()` after receiving `TransferComplete`
+    /// to also detect trailing sequences that were never seen.
     pub fn compute_missing_ranges(&self) -> Vec<SequenceRange> {
-        let mut ranges = Vec::new();
-        let limit = (self.highest_seen + 1) as usize;
-        let limit = std::cmp::min(limit, self.total_sequences as usize);
+        self.compute_missing_up_to((self.highest_seen + 1).min(self.total_sequences) as usize)
+    }
 
+    /// Compute all missing ranges across the full transfer.
+    ///
+    /// Call this after receiving `TransferComplete` when the receiver knows
+    /// the final sequence count. This catches trailing sequences that were
+    /// never seen (above `highest_seen`).
+    pub fn compute_all_missing_ranges(&self) -> Vec<SequenceRange> {
+        self.compute_missing_up_to(self.total_sequences as usize)
+    }
+
+    fn compute_missing_up_to(&self, limit: usize) -> Vec<SequenceRange> {
+        let mut ranges = Vec::new();
         let mut i = 0;
         while i < limit {
             if !self.received[i] {
@@ -632,18 +660,21 @@ impl MulticastAddrAllocator {
     }
 
     /// Allocate the next available multicast address.
+    ///
+    /// Uses u16 arithmetic internally to prevent u8 overflow when
+    /// computing candidate addresses near the top of the range.
     pub fn allocate(&mut self) -> Result<Ipv4Addr, MulticastError> {
-        let start_last = self.range_start.octets()[3];
-        let end_last = self.range_end.octets()[3];
+        let start_last = self.range_start.octets()[3] as u16;
+        let end_last = self.range_end.octets()[3] as u16;
         let range_size = end_last - start_last + 1;
 
         // Linear scan for next available
         for _ in 0..range_size {
-            let candidate_last = start_last + self.next_candidate;
+            let candidate_last = (start_last + self.next_candidate as u16) as u8;
             let octets = self.range_start.octets();
             let candidate = Ipv4Addr::new(octets[0], octets[1], octets[2], candidate_last);
 
-            self.next_candidate = (self.next_candidate + 1) % range_size;
+            self.next_candidate = ((self.next_candidate as u16 + 1) % range_size) as u8;
 
             if !self.allocated.contains(&candidate) {
                 self.allocated.push(candidate);
@@ -809,16 +840,16 @@ impl BroadcastTree {
     /// Collect all node IDs in BFS order.
     pub fn all_nodes_bfs(&self) -> Vec<NodeId> {
         let mut result = Vec::new();
-        let mut queue = vec![&self.root];
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(&self.root);
 
-        while let Some(node) = queue.first().copied() {
-            queue.remove(0);
+        while let Some(node) = queue.pop_front() {
             result.push(node.id);
             if let Some(ref left) = node.left {
-                queue.push(left);
+                queue.push_back(left);
             }
             if let Some(ref right) = node.right {
-                queue.push(right);
+                queue.push_back(right);
             }
         }
 
@@ -938,8 +969,8 @@ pub fn next_transfer_id() -> u64 {
     NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Group ID generator.
-static NEXT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
+/// Group ID generator (u32 to match MulticastGroupId).
+static NEXT_GROUP_ID: AtomicU32 = AtomicU32::new(1);
 
 /// Multicast group manager -- handles creation, join, leave, and cleanup.
 pub struct MulticastManager {
@@ -1277,7 +1308,7 @@ mod tests {
         assert_eq!(config.max_nack_rounds, 10);
         assert_eq!(config.mcast_range_start, Ipv4Addr::new(239, 0, 0, 1));
         assert_eq!(config.mcast_range_end, Ipv4Addr::new(239, 0, 0, 254));
-        assert!((config.max_acceptable_loss_rate - 0.02).abs() < f64::EPSILON);
+        assert!((config.max_acceptable_loss_rate - 0.05).abs() < f64::EPSILON);
     }
 
     // -- Gid tests --
@@ -1810,8 +1841,8 @@ mod tests {
         mgr.set_igmp_verified(true, 0.001);
         assert!(mgr.is_multicast_available());
 
-        // Set high loss rate
-        mgr.set_igmp_verified(true, 0.05); // 5% > 2% threshold
+        // Set high loss rate (above 5% threshold)
+        mgr.set_igmp_verified(true, 0.08); // 8% > 5% threshold
         assert!(!mgr.is_multicast_available());
 
         // Set IGMP not verified
