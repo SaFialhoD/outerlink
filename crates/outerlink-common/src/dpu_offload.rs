@@ -306,8 +306,8 @@ impl BackendCapabilities {
     }
 }
 
-/// Opaque node identifier within the OuterLink cluster.
-pub type NodeId = u32;
+/// Re-export the canonical NodeId from memory::types (u8, max 255 nodes).
+pub use crate::memory::types::NodeId;
 
 /// Opaque connection identifier.
 pub type ConnectionId = u64;
@@ -420,6 +420,8 @@ pub enum DpuToHostMsg {
     Stats { stats: DpuStatsSnapshot },
     /// Error on the DPU.
     Error { code: DpuErrorCode, message: String },
+    /// Sync barrier acknowledged — all prior messages processed.
+    SyncComplete { id: u64 },
 }
 
 /// Transport error codes sent from DPU to host.
@@ -1074,9 +1076,20 @@ impl DpuService {
                     reason: DisconnectReason::Graceful,
                 })
             }
-            HostToDpuMsg::SyncBarrier { .. } | HostToDpuMsg::ConfigUpdate { .. } => {
-                // TODO: SyncBarrier should return an ack when all prior messages are processed.
-                // TODO: ConfigUpdate should apply to self.config.
+            HostToDpuMsg::SyncBarrier { id } => {
+                // In the single-threaded stub, all prior messages are already processed
+                // when we reach this point. Return the ack immediately.
+                // Production: flush the DOCA pipeline before acking.
+                Some(DpuToHostMsg::SyncComplete { id })
+            }
+            HostToDpuMsg::ConfigUpdate { config } => {
+                // Apply the new config and update derived state.
+                self.compress_config = if config.bf_generation.has_lz4() {
+                    AdaptiveCompressConfig::for_bf3()
+                } else {
+                    AdaptiveCompressConfig::default()
+                };
+                self.config = config;
                 None
             }
         }

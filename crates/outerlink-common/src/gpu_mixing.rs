@@ -480,9 +480,12 @@ impl CapabilityScorer {
         entry.last_updated = Instant::now();
     }
 
-    /// Get affinity entry for a kernel hash, if any observations exist.
-    pub fn get_affinity(&self, kernel_hash: u64) -> Option<&AffinityEntry> {
-        self.affinity_cache.get(&kernel_hash)
+    /// Get affinity entry for a kernel hash + workload class, if any observations exist.
+    ///
+    /// The key must match the (hash, class) pair used in `adapt_from_observation`.
+    pub fn get_affinity(&self, kernel_hash: u64, workload_class: WorkloadClass) -> Option<&AffinityEntry> {
+        let cache_key = kernel_hash ^ (workload_class as u64).wrapping_mul(0x9E3779B97F4A7C15);
+        self.affinity_cache.get(&cache_key)
     }
 
     /// Number of entries in the affinity cache.
@@ -1374,13 +1377,13 @@ mod tests {
         scorer.adapt_from_observation(1, 0xDEAD, 1000, WorkloadClass::ComputeBound);
         assert_eq!(scorer.affinity_cache_len(), 1);
 
-        let entry = scorer.get_affinity(0xDEAD).expect("should exist");
+        let entry = scorer.get_affinity(0xDEAD, WorkloadClass::ComputeBound).expect("should exist");
         assert_eq!(entry.best_gpu, 1);
         assert_eq!(entry.sample_count, 1);
 
         // Second observation with faster time
         scorer.adapt_from_observation(2, 0xDEAD, 500, WorkloadClass::ComputeBound);
-        let entry = scorer.get_affinity(0xDEAD).expect("should exist");
+        let entry = scorer.get_affinity(0xDEAD, WorkloadClass::ComputeBound).expect("should exist");
         assert_eq!(entry.sample_count, 2);
         // EMA should decrease
         assert!(entry.avg_execution_ns < 1000);
