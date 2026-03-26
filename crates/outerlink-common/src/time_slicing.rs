@@ -873,7 +873,13 @@ impl DrfScheduler {
         };
 
         let pool = &self.pool_resources;
-        let total_geu_seconds = pool.total_geu;
+        // For DRF fairness, compute shares as fractions of pool capacity.
+        // geu_seconds accumulates over time; total_geu is pool capacity.
+        // The ratio gives "how many pool-seconds of GEU this tenant has consumed."
+        // DRF only needs relative proportions between tenants to be correct,
+        // so the absolute scale doesn't affect fairness — only the ranking matters.
+        // Shares above 1.0 are valid (means tenant consumed more than 1 pool-second).
+        let total_geu = pool.total_geu;
         let total_vram = pool.total_vram_bytes as f64;
         let total_network = pool.total_network_bw as f64;
 
@@ -888,8 +894,8 @@ impl DrfScheduler {
                 .unwrap_or(1.0);
 
             if let Some(consumption) = self.tenant_consumption.get_mut(&tenant_id) {
-                consumption.compute_share = if total_geu_seconds > 0.0 {
-                    consumption.geu_seconds / total_geu_seconds
+                consumption.compute_share = if total_geu > 0.0 {
+                    consumption.geu_seconds / total_geu
                 } else {
                     0.0
                 };
@@ -1038,16 +1044,42 @@ impl DrfScheduler {
             return;
         }
 
-        let _min_count = (total_slices * self.config.min_share_percent).ceil() as u32;
+        let min_count = (total_slices * self.config.min_share_percent).ceil() as u32;
 
-        // Check if any tier with pending work got less than min_share_percent.
-        // In a full implementation, we would replace lowest-priority excess slices
-        // with slices for the starved tier. For now, we detect the condition.
+        // Find starved tiers and inject slices by replacing excess from over-served tiers.
         for tier in [PriorityTier::Background, PriorityTier::Development] {
             let count = tier_counts.get(&tier).copied().unwrap_or(0);
-            if count < _min_count {
-                // TODO: Find a tenant at this tier with pending work and inject slices.
-                // This requires replacing lowest-priority excess slices.
+            if count >= min_count {
+                continue;
+            }
+
+            // Find a tenant at this tier with active sessions
+            let starved_tenant = self.tenants.iter().find(|(_, t)| {
+                t.priority == tier && t.enabled && !t.active_sessions.is_empty()
+            });
+
+            if let Some((&tenant_id, tenant)) = starved_tenant {
+                let needed = min_count.saturating_sub(count);
+                let session_id = *tenant.active_sessions.iter().next().unwrap();
+
+                // Replace lowest-priority excess slices from the end
+                let mut replaced = 0u32;
+                for i in (0..slices.len()).rev() {
+                    if replaced >= needed {
+                        break;
+                    }
+                    // Only replace slices from higher-count tiers
+                    let victim_tier = slices[i].priority;
+                    let victim_count = tier_counts.get(&victim_tier).copied().unwrap_or(0);
+                    if victim_count > min_count && victim_tier != tier {
+                        slices[i].tenant_id = tenant_id;
+                        slices[i].session_id = session_id;
+                        slices[i].priority = tier;
+                        *tier_counts.entry(victim_tier).or_insert(0) -= 1;
+                        *tier_counts.entry(tier).or_insert(0) += 1;
+                        replaced += 1;
+                    }
+                }
             }
         }
     }
@@ -1072,7 +1104,6 @@ pub struct QuotaEnforcer {
     /// Reference to tenant data.
     tenants: HashMap<TenantId, Tenant>,
     /// Configuration (used by periodic enforcement and billing rollover).
-    #[allow(dead_code)]
     config: SharingConfig,
 }
 
@@ -1097,6 +1128,11 @@ impl QuotaEnforcer {
         gpu_id: GpuId,
         size_bytes: u64,
     ) -> Result<(), QuotaViolation> {
+        // Advisory mode: always allow
+        if !self.config.enforce_quotas {
+            return Ok(());
+        }
+
         let tenant = self
             .tenants
             .get(&tenant_id)
@@ -1135,6 +1171,11 @@ impl QuotaEnforcer {
         tenant_id: TenantId,
         _session_id: SessionId,
     ) -> Result<(), QuotaViolation> {
+        // Advisory mode: always allow
+        if !self.config.enforce_quotas {
+            return Ok(());
+        }
+
         let tenant = self
             .tenants
             .get(&tenant_id)

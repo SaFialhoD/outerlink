@@ -254,15 +254,12 @@ impl LiveMigrationState {
         )
     }
 
-    /// Returns true if the migration is still actively running.
+    /// Returns true if the migration is in flight (not terminal).
+    ///
+    /// Includes `Requested` because a requested migration is consuming
+    /// resources (slot in the migration table, pending preparations).
     pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            LiveMigrationState::Preparing { .. }
-                | LiveMigrationState::PreCopy { .. }
-                | LiveMigrationState::Blackout { .. }
-                | LiveMigrationState::PostCopy { .. }
-        )
+        !self.is_terminal()
     }
 
     /// Returns the state name as a string.
@@ -1242,8 +1239,18 @@ impl LiveMigrationOrchestrator {
             }
         }
 
-        // Check convergence: can we finish in one blackout?
-        let estimated_context_size = 4096; // conservative estimate for context metadata
+        // Check convergence using threshold (primary) and blackout estimate (secondary).
+        // Default context metadata estimate: 64MB covers typical cubin binaries + state.
+        // If we have an actual snapshot, use its real size.
+        let estimated_context_size = self
+            .context_snapshot
+            .as_ref()
+            .map(|ctx| {
+                // Rough size: each allocation record ~64B, each module record ~1KB avg
+                // (actual binary data is tracked separately during transfer)
+                ctx.allocations.len() * 64 + ctx.modules.len() * 1024 + 4096
+            })
+            .unwrap_or(64 * 1024 * 1024); // 64MB conservative default
         let transfer_rate_bps = if transfer_time.as_secs_f64() > 0.0 {
             transfer_bytes as f64 / transfer_time.as_secs_f64()
         } else {
@@ -1257,6 +1264,30 @@ impl LiveMigrationOrchestrator {
             transfer_rate_bps,
         );
 
+        // Primary convergence criterion: dirty ratio below threshold
+        let dirty_ratio = if total_pages > 0 {
+            dirty_vpns.len() as f64 / total_pages as f64
+        } else {
+            0.0
+        };
+
+        let convergence_threshold = match &self.config.strategy {
+            MigrationStrategy::Hybrid {
+                convergence_threshold,
+                ..
+            } => *convergence_threshold,
+            _ => 0.02, // default 2% for PreCopy and PostCopy
+        };
+
+        // Converged if dirty ratio is below threshold AND blackout fits
+        if dirty_ratio < convergence_threshold && estimated_blackout < self.config.max_blackout {
+            return ConvergenceResult::Converged {
+                final_dirty_count: dirty_vpns.len() as u64,
+                estimated_blackout,
+            };
+        }
+
+        // Secondary: even if threshold not met, converge if blackout is small enough
         if estimated_blackout < self.config.max_blackout {
             return ConvergenceResult::Converged {
                 final_dirty_count: dirty_vpns.len() as u64,
@@ -1786,7 +1817,8 @@ mod tests {
     #[test]
     fn state_is_active() {
         let now = Instant::now();
-        assert!(!LiveMigrationState::Requested { requested_at: now }.is_active());
+        // Requested is active (not terminal) — migration is in flight
+        assert!(LiveMigrationState::Requested { requested_at: now }.is_active());
         assert!(LiveMigrationState::Preparing { started_at: now }.is_active());
         assert!(LiveMigrationState::PreCopy {
             started_at: now,
