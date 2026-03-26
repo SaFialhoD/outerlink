@@ -4,13 +4,17 @@
 //! used by both the client (interception library) and server (GPU daemon).
 
 pub mod clock_sync;
+pub mod cuda_graph;
 pub mod cuda_types;
+pub mod dpu_offload;
 pub mod error;
 pub mod fault_tolerance;
+pub mod gpu_mixing;
 pub mod gpu_storage;
 pub mod handle;
 pub mod memory;
 pub mod multicast;
+pub mod persistent_kernels;
 pub mod protocol;
 pub mod retry;
 pub mod scatter_gather;
