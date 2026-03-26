@@ -5,12 +5,14 @@
 //! page table operations, tier management, eviction, migration, and access
 //! monitoring.
 
+pub mod access_monitor;
 pub mod config;
 pub mod eviction;
 pub mod migration;
 pub mod migration_engine;
 pub mod page_table;
 pub mod pte;
+pub mod tier_manager;
 pub mod tier_status;
 pub mod traits;
 pub mod types;
@@ -24,9 +26,11 @@ pub use migration::{
     MigrationError, MigrationHandle, MigrationPriority, MigrationReason, MigrationRequest,
     MigrationStatus,
 };
+pub use access_monitor::{InterceptionAccessMonitor, MonitorConfig};
 pub use eviction::{ArcPolicy, CarPolicy, ClockPolicy};
 pub use migration_engine::TieredMigrationEngine;
 pub use page_table::RobinHoodPageTable;
+pub use tier_manager::DefaultTierManager;
 pub use pte::{PageTableEntry, PteFlags};
 pub use tier_status::{
     AllocationError, AllocationHints, EvictionCandidate, PrefetchPrediction, TierAllocation,
