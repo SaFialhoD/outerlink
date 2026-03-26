@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -173,10 +173,33 @@ impl ClusterMembership {
             .count()
     }
 
-    /// Recompute the quorum size based on active members.
+    /// Recompute the quorum size based on total known members.
+    ///
+    /// Uses total membership (including dead) for static quorum safety:
+    /// a single surviving node cannot unilaterally claim quorum.
+    /// Dead nodes must be explicitly removed via `remove_node()` to shrink
+    /// the quorum requirement (administrative action after confirmed failure).
     fn recompute_quorum(&mut self) {
         let total = self.members.len();
         self.quorum_size = total / 2 + 1;
+    }
+
+    /// Remove a dead node from the membership entirely, shrinking the quorum.
+    ///
+    /// This is an administrative action: after confirming a node is permanently
+    /// gone, call this to allow the remaining cluster to re-establish quorum.
+    pub fn remove_node(&mut self, node_id: NodeId) -> Result<(), FaultToleranceError> {
+        match self.members.get(&node_id) {
+            Some(NodeState::Dead { .. }) => {
+                self.members.remove(&node_id);
+                self.recompute_quorum();
+                Ok(())
+            }
+            Some(_) => Err(FaultToleranceError::InvalidStateTransition(
+                format!("node {} is not Dead, cannot remove", node_id),
+            )),
+            None => Err(FaultToleranceError::UnknownNode(node_id)),
+        }
     }
 
     /// Fence a node: mark it as Fencing and bump generation.
@@ -837,10 +860,12 @@ impl Default for FaultToleranceConfig {
             critical_config: ErasureConfig {
                 k: 3,
                 m: 1,
-                scheme: CodingScheme::ReedSolomon,
+                // XOR is the only working encoder. ReedSolomon requires ISA-L
+                // hardware library and returns HardwareRequired at runtime.
+                scheme: CodingScheme::Xor,
             },
             recoverable_config: ErasureConfig {
-                k: 3,
+                k: 2,
                 m: 1,
                 scheme: CodingScheme::Xor,
             },
@@ -903,7 +928,7 @@ pub struct ErasureParityManager {
     /// VPN -> group_id mapping (reverse index).
     vpn_to_group: DashMap<Vpn, u32>,
     /// Next group ID counter.
-    next_group_id: AtomicU64,
+    next_group_id: AtomicU32,
     /// Dirty VPNs awaiting parity update.
     dirty_queue: DashMap<Vpn, ()>,
     /// Configuration.
@@ -920,7 +945,7 @@ impl ErasureParityManager {
         Self {
             groups: DashMap::new(),
             vpn_to_group: DashMap::new(),
-            next_group_id: AtomicU64::new(1),
+            next_group_id: AtomicU32::new(1),
             dirty_queue: DashMap::new(),
             config,
             stats: FaultToleranceStats::default(),
@@ -1139,7 +1164,11 @@ impl ParityHook for ErasureParityManager {
             }
         }
 
-        self.stats.pages_protected.fetch_sub(1, Ordering::Relaxed);
+        // Only decrement if this page was actually protected (non-Transient).
+        // Transient pages have group_id == 0 and were never counted.
+        if group_id != 0 {
+            self.stats.pages_protected.fetch_sub(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 }

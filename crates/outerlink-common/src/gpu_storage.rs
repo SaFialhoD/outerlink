@@ -184,7 +184,8 @@ impl StorageFuture {
                 return Err(err);
             }
         }
-        Ok(self.bytes_transferred.load(Ordering::Acquire))
+        // Relaxed is safe: the Acquire on state synchronizes all prior stores.
+        Ok(self.bytes_transferred.load(Ordering::Relaxed))
     }
 
     /// Check if completed without blocking.
@@ -193,8 +194,13 @@ impl StorageFuture {
     }
 
     /// Complete the future successfully.
+    ///
+    /// Memory ordering: `bytes_transferred` uses Relaxed because the
+    /// subsequent `state` store with Release creates a happens-before
+    /// relationship. The Acquire load on `state` in `wait()` ensures
+    /// `bytes_transferred` is visible when the spin loop exits.
     pub fn complete(&self, bytes: usize) {
-        self.bytes_transferred.store(bytes, Ordering::Release);
+        self.bytes_transferred.store(bytes, Ordering::Relaxed);
         self.state.store(1, Ordering::Release);
     }
 
