@@ -1282,7 +1282,9 @@ impl PtxTransformer {
         };
 
         let mut injections = String::new();
-        let mut reg_counter = 100; // Use high register numbers to avoid conflicts
+        // Register names use fixed %__ol_off_{dim} convention which is safe
+        // because the __ol_ prefix is reserved by OuterLink and will never
+        // collide with compiler-generated register names (%r0, %rd1, etc.).
 
         for (dim, used) in [("x", dims.x), ("y", dims.y), ("z", dims.z)] {
             if !used {
@@ -1296,8 +1298,6 @@ impl PtxTransformer {
                 "\n    .reg .u32 {};\n    ld.param.u32 {}, [{}];",
                 offset_reg, offset_reg, param_name
             ));
-
-            reg_counter += 1;
         }
 
         // Insert after body opening brace
@@ -1630,6 +1630,12 @@ pub enum SplitDecisionReason {
     },
     /// Not splitting: only one GPU available.
     SingleGpu,
+    /// Not splitting: a required feature is not yet implemented.
+    /// The kernel could be split once the feature lands (e.g., atomic redirection for YELLOW).
+    FeatureGated {
+        /// Human-readable description of what's missing.
+        feature: &'static str,
+    },
     /// Not splitting: data not distributed (would need full replication).
     DataNotDistributed {
         /// Estimated replication cost in microseconds.
@@ -1874,7 +1880,13 @@ impl MergeExecutor {
     }
 
     /// Determines merge strategy for a given operation.
+    ///
+    /// Returns `Scalar` for 0 or 1 elements. An element_count of 0 means
+    /// no data to merge — the merge step should be a no-op (0 microseconds).
     pub fn merge_strategy(&self, element_count: u32) -> MergeStrategy {
+        if element_count == 0 {
+            return MergeStrategy::Scalar; // No-op: nothing to merge
+        }
         if element_count <= 1 {
             MergeStrategy::Scalar
         } else if element_count <= self.large_merge_threshold {
@@ -1888,6 +1900,9 @@ impl MergeExecutor {
     pub fn estimate_merge_time(&self, plan: &MergePlan, gpu_count: usize) -> f64 {
         let mut total_us = 0.0;
         for op in &plan.merge_ops {
+            if op.element_count == 0 {
+                continue; // No-op merge: zero elements, zero cost
+            }
             let strategy = self.merge_strategy(op.element_count);
             total_us += match strategy {
                 MergeStrategy::Scalar => {
@@ -2139,7 +2154,9 @@ impl SplitLaunchOrchestrator {
                 original: launch.clone(),
                 classification: classification.clone(),
                 should_split: false,
-                decision_reason: SplitDecisionReason::RedClassification,
+                decision_reason: SplitDecisionReason::FeatureGated {
+                    feature: "PtxTransformer::redirect_atomics (atomic redirection for YELLOW kernels)",
+                },
                 partition: None,
                 target_gpus: Vec::new(),
                 merge_plan: None,
