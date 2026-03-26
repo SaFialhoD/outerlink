@@ -10,6 +10,7 @@ pub mod fault_tolerance;
 pub mod gpu_storage;
 pub mod handle;
 pub mod memory;
+pub mod multicast;
 pub mod protocol;
 pub mod retry;
 pub mod scatter_gather;
