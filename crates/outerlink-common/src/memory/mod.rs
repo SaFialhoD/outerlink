@@ -6,11 +6,13 @@
 //! monitoring.
 
 pub mod access_monitor;
+pub mod coherency;
 pub mod compression;
 pub mod config;
 pub mod dedup;
 #[cfg(test)]
 mod dedup_tests;
+pub mod fault_handler;
 pub mod eviction;
 pub mod migration;
 pub mod migration_engine;
@@ -19,6 +21,7 @@ pub mod prefetch;
 pub mod pte;
 pub mod tier_manager;
 pub mod tier_status;
+pub mod topology;
 pub mod traits;
 pub mod types;
 
@@ -33,11 +36,14 @@ pub use migration::{
 };
 pub use access_monitor::{InterceptionAccessMonitor, MonitorConfig};
 pub use compression::{AdaptiveCompressor, CompressionAlgorithm, CompressionConfig};
+pub use coherency::{CoherencyDirectory, CoherencyStats, DirectoryEntry, PageState};
 pub use dedup::{DedupConfig, DedupManager, DedupStats};
+pub use fault_handler::{FaultConfig, FaultHandler, FaultResult, FaultStats, ThrashingDetector};
 pub use eviction::{ArcPolicy, CarPolicy, ClockPolicy};
 pub use migration_engine::TieredMigrationEngine;
 pub use page_table::RobinHoodPageTable;
 pub use prefetch::{PredictionSource, PrefetchConfig, PrefetchScheduler, PrefetchStats};
+pub use topology::{LinkInfo, LinkType, NodeInfo, PlacementScorer, Route, TopologyGraph};
 pub use tier_manager::DefaultTierManager;
 pub use pte::{PageTableEntry, PteFlags};
 pub use tier_status::{
