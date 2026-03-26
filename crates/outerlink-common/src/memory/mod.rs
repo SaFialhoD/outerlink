@@ -6,6 +6,7 @@
 //! monitoring.
 
 pub mod access_monitor;
+pub mod compression;
 pub mod config;
 pub mod eviction;
 pub mod migration;
@@ -27,6 +28,7 @@ pub use migration::{
     MigrationStatus,
 };
 pub use access_monitor::{InterceptionAccessMonitor, MonitorConfig};
+pub use compression::{AdaptiveCompressor, CompressionAlgorithm, CompressionConfig};
 pub use eviction::{ArcPolicy, CarPolicy, ClockPolicy};
 pub use migration_engine::TieredMigrationEngine;
 pub use page_table::RobinHoodPageTable;
