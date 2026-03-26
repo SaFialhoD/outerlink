@@ -9,6 +9,7 @@ description = "Shared types, protocol, and transport traits for OuterLink"
 tokio = { workspace = true }
 bincode = { workspace = true }
 dashmap = { workspace = true }
+bitflags = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
