@@ -1,7 +1,7 @@
 # R10: Memory Tiering & NVMe as Tier 3
 
 **Phase:** 7 — Memory Intelligence
-**Status:** NOT STARTED
+**Status:** PRE-PLAN COMPLETE (awaiting decision review)
 **Priority:** CRITICAL
 **Depends On:** P5 (PoC working)
 
@@ -27,7 +27,7 @@ Define and implement a 5-tier memory hierarchy across the OuterLink cluster: Loc
 
 - `research/` — Research findings on memory tiering approaches
 - `side-docs/` — Notes, experiments, diagrams
-- `preplan.md` — Pre-plan (scope, dependencies, decisions) — TO BE CREATED
+- `preplan.md` — Pre-plan (scope, dependencies, decisions) — COMPLETE
 - `plan.md` — Detailed implementation plan — TO BE CREATED
 - `progress.md` — Lifecycle progress tracker
 
