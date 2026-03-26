@@ -737,6 +737,87 @@ impl Default for ApiVendor {
     }
 }
 
+/// Wire protocol header extension that embeds the API vendor discriminator.
+///
+/// Extends the existing `MessageHeader` (defined in the protocol module) with
+/// a vendor byte at offset [12] in the padding region. This allows the server
+/// to dispatch incoming messages to the correct executor (CUDA vs HIP) before
+/// parsing the payload.
+///
+/// Layout (16 bytes total):
+/// - bytes [0..3]:  message_type (u32)
+/// - bytes [4..7]:  payload_size (u32)
+/// - bytes [8..11]: request_id (u32)
+/// - byte  [12]:    api_vendor (u8) — 0=CUDA, 1=HIP
+/// - bytes [13..15]: reserved (zeroed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct VendorMessageHeader {
+    /// Message type code.
+    pub message_type: u32,
+    /// Payload size in bytes (following the header).
+    pub payload_size: u32,
+    /// Request ID for correlating request/response pairs.
+    pub request_id: u32,
+    /// API vendor discriminator.
+    pub api_vendor: ApiVendor,
+    /// Reserved for future use.
+    pub _reserved: [u8; 3],
+}
+
+impl VendorMessageHeader {
+    /// Size of the header on the wire.
+    pub const SIZE: usize = 16;
+
+    /// Create a new header for a HIP message.
+    pub fn new_hip(message_type: u32, payload_size: u32, request_id: u32) -> Self {
+        Self {
+            message_type,
+            payload_size,
+            request_id,
+            api_vendor: ApiVendor::Hip,
+            _reserved: [0; 3],
+        }
+    }
+
+    /// Create a new header for a CUDA message (backwards compatible).
+    pub fn new_cuda(message_type: u32, payload_size: u32, request_id: u32) -> Self {
+        Self {
+            message_type,
+            payload_size,
+            request_id,
+            api_vendor: ApiVendor::Cuda,
+            _reserved: [0; 3],
+        }
+    }
+
+    /// Serialize to bytes (little-endian).
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..4].copy_from_slice(&self.message_type.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.payload_size.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.request_id.to_le_bytes());
+        buf[12] = self.api_vendor as u8;
+        // bytes 13..15 stay zero (reserved)
+        buf
+    }
+
+    /// Deserialize from bytes (little-endian).
+    pub fn from_bytes(buf: &[u8; Self::SIZE]) -> Option<Self> {
+        let message_type = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let payload_size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let request_id = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let api_vendor = ApiVendor::from_u8(buf[12])?;
+        Some(Self {
+            message_type,
+            payload_size,
+            request_id,
+            api_vendor,
+            _reserved: [0; 3],
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HIP Device Properties Cache
 // ---------------------------------------------------------------------------
@@ -1246,12 +1327,20 @@ pub fn build_hip_function_table() -> Vec<HipFunctionMapping> {
 ///
 /// Returns None if the function is not in the interception table,
 /// meaning it should be forwarded to the real libamdhip64.so.
+/// Lazily-built static lookup table for O(1) function resolution.
+/// The table is built once on first access and reused for the lifetime
+/// of the process — critical for hot-path interception performance.
+static HIP_FUNCTION_TABLE: std::sync::OnceLock<HashMap<&'static str, HipFunctionMapping>> =
+    std::sync::OnceLock::new();
+
 pub fn lookup_hip_function(name: &str) -> Option<HipFunctionMapping> {
-    // In production, this would be a HashMap for O(1) lookup.
-    // For the common module, we build the table and search linearly.
-    build_hip_function_table()
-        .into_iter()
-        .find(|m| m.hip_name == name)
+    let table = HIP_FUNCTION_TABLE.get_or_init(|| {
+        build_hip_function_table()
+            .into_iter()
+            .map(|m| (m.hip_name, m))
+            .collect()
+    });
+    table.get(name).cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1430,6 +1519,16 @@ pub struct HipInterceptClient {
     allocations: std::sync::Mutex<HashMap<u64, u64>>,
     /// Module entries (local_handle -> entry).
     modules: std::sync::Mutex<HashMap<u64, HipModuleEntry>>,
+    /// Handle translation table: synthetic local handles <-> real remote handles.
+    /// Maps local_handle -> remote_handle for all object types.
+    // TODO: Production uses HandleStore with typed sub-tables per object kind.
+    handle_map: std::sync::Mutex<HashMap<u64, u64>>,
+    /// Whether a reconnect is currently in progress (prevents concurrent reconnects).
+    reconnect_in_progress: std::sync::Mutex<bool>,
+    /// Number of reconnection attempts made in the current session.
+    reconnect_attempts: AtomicU64,
+    /// Whether the callback listener thread is running.
+    callback_listener_running: AtomicBool,
 }
 
 impl HipInterceptClient {
@@ -1449,6 +1548,10 @@ impl HipInterceptClient {
             last_error: AtomicU64::new(0),
             allocations: std::sync::Mutex::new(HashMap::new()),
             modules: std::sync::Mutex::new(HashMap::new()),
+            handle_map: std::sync::Mutex::new(HashMap::new()),
+            reconnect_in_progress: std::sync::Mutex::new(false),
+            reconnect_attempts: AtomicU64::new(0),
+            callback_listener_running: AtomicBool::new(false),
         }
     }
 
@@ -1581,11 +1684,20 @@ impl HipInterceptClient {
     }
 
     /// Disconnect from the server.
+    ///
+    /// Resets ALL client state to prevent stale data on reconnect:
+    /// atomics (error, context, session), allocation/module maps, handle map,
+    /// device props cache, and callback listener flag.
     pub fn disconnect(&self) {
         self.set_connected(false);
+        self.last_error.store(0, Ordering::Release);
+        self.current_remote_ctx.store(0, Ordering::Release);
+        self.session_id.store(0, Ordering::Release);
+        self.callback_listener_running.store(false, Ordering::Release);
         self.allocations.lock().unwrap().clear();
         self.modules.lock().unwrap().clear();
         self.device_props_cache.lock().unwrap().clear();
+        self.handle_map.lock().unwrap().clear();
     }
 }
 

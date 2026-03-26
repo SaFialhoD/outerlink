@@ -948,10 +948,12 @@ impl DrfScheduler {
             candidates.push((*tenant_id, dominant_share));
         }
 
-        // Pick tenant with lowest dominant share
+        // Pick tenant with lowest dominant share.
+        // Tie-break by tenant_id for deterministic scheduling.
         candidates.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
         });
 
         let (tenant_id, _) = candidates.first()?;
@@ -2274,9 +2276,14 @@ mod tests {
         let prod_slice = s.assign_slice(0);
 
         // Production gets longer slices (weight 2.0 vs 0.25)
-        assert!(bg_slice.is_some());
-        assert!(prod_slice.is_some());
-        assert!(prod_slice.unwrap().duration_ns > bg_slice.unwrap().duration_ns);
+        assert!(bg_slice.is_some(), "bg_slice should be Some");
+        assert!(prod_slice.is_some(), "prod_slice should be Some");
+        let bg_dur = bg_slice.unwrap().duration_ns;
+        let prod_dur = prod_slice.unwrap().duration_ns;
+        assert!(
+            prod_dur > bg_dur,
+            "prod duration ({prod_dur}) should be > bg duration ({bg_dur})"
+        );
     }
 
     #[test]
