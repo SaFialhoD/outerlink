@@ -379,7 +379,7 @@ pub enum HostToDpuMsg {
     /// Notify DPU of a new GPU memory allocation (keeps page table in sync).
     AllocNotify { gpu_id: u8, addr: u64, size: u64 },
     /// Notify DPU of a GPU memory free.
-    FreeNotify { gpu_id: u8, addr: u64 },
+    FreeNotify { gpu_id: u8, addr: u64, size: u64 },
     /// Synchronization barrier.
     SyncBarrier { id: u64 },
     /// Connect to a remote peer.
@@ -948,6 +948,10 @@ pub struct DpuService {
     pub page_maps: Vec<GpuPageMap>,
     /// Per-connection compression stats (R14 integration).
     pub compression_stats: HashMap<ConnectionId, CompressionStats>,
+    /// Active connection IDs (for disconnect tracking / underflow prevention).
+    active_connections: std::collections::HashSet<ConnectionId>,
+    /// Next connection ID for allocation.
+    next_conn_id: ConnectionId,
     /// Adaptive compression config.
     pub compress_config: AdaptiveCompressConfig,
 }
@@ -970,6 +974,8 @@ impl DpuService {
             core_allocation,
             page_maps: Vec::new(),
             compression_stats: HashMap::new(),
+            active_connections: std::collections::HashSet::new(),
+            next_conn_id: 1,
             compress_config,
         }
     }
@@ -999,12 +1005,15 @@ impl DpuService {
                 }
                 None
             }
-            HostToDpuMsg::FreeNotify { gpu_id, addr } => {
+            HostToDpuMsg::FreeNotify { gpu_id, addr, size } => {
                 let page_size: u64 = 4096;
-                let page = addr / page_size;
+                let start_page = addr / page_size;
+                let num_pages = (size + page_size - 1) / page_size;
                 if let Some(map) = self.page_maps.iter_mut().find(|m| m.gpu_id == gpu_id) {
-                    if let Some(entry) = map.get_mut(page as u32) {
-                        entry.state = PageState::Invalid;
+                    for p in start_page..(start_page + num_pages) {
+                        if let Some(entry) = map.get_mut(p as u32) {
+                            entry.state = PageState::Invalid;
+                        }
                     }
                 }
                 None
@@ -1048,19 +1057,28 @@ impl DpuService {
             }
             HostToDpuMsg::ConnectPeer { peer } => {
                 // TODO: requires hardware -- DOCA RDMA connection
-                let conn_id = 1; // Stub
+                let conn_id = self.next_conn_id;
+                self.next_conn_id += 1;
+                self.active_connections.insert(conn_id);
                 self.stats.connections_active.fetch_add(1, Ordering::Relaxed);
                 Some(DpuToHostMsg::PeerConnected { conn_id, peer })
             }
             HostToDpuMsg::DisconnectPeer { conn_id } => {
-                self.stats.connections_active.fetch_sub(1, Ordering::Relaxed);
+                // Only decrement if connection was actually tracked (prevents underflow).
+                if self.active_connections.remove(&conn_id) {
+                    self.stats.connections_active.fetch_sub(1, Ordering::Relaxed);
+                }
                 self.compression_stats.remove(&conn_id);
                 Some(DpuToHostMsg::PeerDisconnected {
                     conn_id,
                     reason: DisconnectReason::Graceful,
                 })
             }
-            HostToDpuMsg::SyncBarrier { .. } | HostToDpuMsg::ConfigUpdate { .. } => None,
+            HostToDpuMsg::SyncBarrier { .. } | HostToDpuMsg::ConfigUpdate { .. } => {
+                // TODO: SyncBarrier should return an ack when all prior messages are processed.
+                // TODO: ConfigUpdate should apply to self.config.
+                None
+            }
         }
     }
 }
@@ -1499,6 +1517,7 @@ mod tests {
         let msg = HostToDpuMsg::FreeNotify {
             gpu_id: 0,
             addr: 10 * 4096,
+            size: 4096,
         };
         let resp = service.handle_message(msg);
         assert!(resp.is_none());
