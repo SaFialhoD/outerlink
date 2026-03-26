@@ -1694,10 +1694,63 @@ impl HipInterceptClient {
         self.current_remote_ctx.store(0, Ordering::Release);
         self.session_id.store(0, Ordering::Release);
         self.callback_listener_running.store(false, Ordering::Release);
+        self.reconnect_attempts.store(0, Ordering::Release);
+        *self.reconnect_in_progress.lock().unwrap() = false;
         self.allocations.lock().unwrap().clear();
         self.modules.lock().unwrap().clear();
         self.device_props_cache.lock().unwrap().clear();
         self.handle_map.lock().unwrap().clear();
+    }
+
+    /// Check if a reconnection is currently in progress.
+    pub fn is_reconnecting(&self) -> bool {
+        *self.reconnect_in_progress.lock().unwrap()
+    }
+
+    /// Attempt to begin a reconnection. Returns false if one is already in progress.
+    ///
+    /// Callers must call `finish_reconnect()` when done (success or failure).
+    /// This prevents concurrent reconnects from creating duplicate sessions.
+    pub fn begin_reconnect(&self) -> bool {
+        let mut guard = self.reconnect_in_progress.lock().unwrap();
+        if *guard {
+            return false; // already reconnecting
+        }
+        *guard = true;
+        self.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Mark reconnection as finished (success or failure).
+    pub fn finish_reconnect(&self) {
+        *self.reconnect_in_progress.lock().unwrap() = false;
+    }
+
+    /// Get the number of reconnection attempts since last successful connect.
+    pub fn reconnect_attempts(&self) -> u64 {
+        self.reconnect_attempts.load(Ordering::Relaxed)
+    }
+
+    /// Check if the callback listener thread is running.
+    pub fn is_callback_listener_running(&self) -> bool {
+        self.callback_listener_running.load(Ordering::Acquire)
+    }
+
+    /// Start the callback listener (sets the flag).
+    ///
+    /// Returns false if the listener is already running (prevents duplicates).
+    /// In production, this would spawn a thread that listens for async callbacks
+    /// from the server (hipStreamAddCallback, hipLaunchHostFunc results).
+    pub fn start_callback_listener(&self) -> bool {
+        // CAS: only set to true if currently false
+        self.callback_listener_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Stop the callback listener.
+    pub fn stop_callback_listener(&self) {
+        self.callback_listener_running.store(false, Ordering::Release);
     }
 }
 
