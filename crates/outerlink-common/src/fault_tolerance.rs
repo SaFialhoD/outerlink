@@ -789,11 +789,12 @@ pub struct DeltaRegion {
 // 8. Parity Hook (R10 integration interface)
 // ---------------------------------------------------------------------------
 
-/// Trait for R10 page table integration.
+/// Erasure parity lifecycle trait for R15.
 ///
-/// Called by R10's page table on page writes, allocations, frees, and
-/// migrations to maintain parity consistency.
-pub trait ParityHook: Send + Sync {
+/// Called by the page table on page writes, allocations, frees, and
+/// migrations to maintain parity consistency. Extends the base
+/// `memory::traits::ParityHook` with R15-specific operations.
+pub trait ErasureParityHook: Send + Sync {
     /// Called when a page is written. Updates parity based on policy.
     fn on_page_write(&self, vpn: Vpn) -> Result<(), FaultToleranceError>;
 
@@ -1083,7 +1084,7 @@ impl ErasureParityManager {
     }
 }
 
-impl ParityHook for ErasureParityManager {
+impl ErasureParityHook for ErasureParityManager {
     fn on_page_write(&self, vpn: Vpn) -> Result<(), FaultToleranceError> {
         let group_id = match self.vpn_to_group.get(&vpn) {
             Some(g) => *g,
@@ -1173,6 +1174,40 @@ impl ParityHook for ErasureParityManager {
     }
 }
 
+/// Bridge implementation: allows `ErasureParityManager` to be used as the
+/// R10 memory system's `ParityHook` (defined in `memory::traits`).
+impl crate::memory::traits::ParityHook for ErasureParityManager {
+    fn notify_migration(&self, vpn: u64, _old_tier: crate::memory::types::TierId, _new_tier: crate::memory::types::TierId) {
+        // When a page migrates between tiers, parity may need updating
+        // since the parity data might reference the old location.
+        // Treat migration as a write for parity consistency.
+        let _ = self.on_page_write(vpn);
+    }
+
+    fn rebuild_page(&self, vpn: u64, parity_group_id: u32) -> Result<Vec<u8>, String> {
+        // Collect all other data pages in the group and use XOR to reconstruct.
+        let group = self
+            .groups
+            .get(&parity_group_id)
+            .ok_or_else(|| format!("parity group {} not found", parity_group_id))?;
+
+        // Verify the page is actually in this group.
+        if !group.data_pages.contains(&vpn) {
+            return Err(format!("vpn {} not in parity group {}", vpn, parity_group_id));
+        }
+
+        // In production: read the parity shard and surviving data shards,
+        // then XOR-reconstruct the missing page. Here we return an error
+        // indicating the data shards are needed from the caller.
+        // TODO: requires actual page data access via PageTable
+        Err(format!(
+            "rebuild requires {} surviving data pages + parity from group {}",
+            group.config.k - 1,
+            parity_group_id
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 10. MultiLayerDetector (failure detection)
 // ---------------------------------------------------------------------------
@@ -1185,7 +1220,9 @@ pub struct MultiLayerDetector {
     membership: RwLock<ClusterMembership>,
     /// Configuration.
     phi_threshold: f64,
-    #[allow(dead_code)]
+    /// Interval at which heartbeats should be sent. Exposed via
+    /// `heartbeat_interval()` so external schedulers can drive the
+    /// heartbeat loop at the correct rate.
     heartbeat_interval: Duration,
     /// Per-node overridden states (e.g., from RDMA events).
     overridden_states: DashMap<NodeId, NodeState>,
@@ -1214,6 +1251,15 @@ impl MultiLayerDetector {
     /// Get the phi threshold.
     pub fn phi_threshold(&self) -> f64 {
         self.phi_threshold
+    }
+
+    /// Get the configured heartbeat interval for external schedulers.
+    ///
+    /// The phi accrual detector requires heartbeats at this interval
+    /// to maintain accurate failure detection. External code should
+    /// call `on_heartbeat()` at this rate for each node.
+    pub fn heartbeat_interval(&self) -> Duration {
+        self.heartbeat_interval
     }
 
     /// Access the cluster membership.

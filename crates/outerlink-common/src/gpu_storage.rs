@@ -13,6 +13,14 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+/// Global handle ID generator for `StorageHandle` allocation.
+static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Generate a unique storage handle ID.
+pub fn next_handle_id() -> u64 {
+    NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed)
+}
 use std::time::Duration;
 
 use crate::memory::types::NodeId;
@@ -48,9 +56,8 @@ pub struct StorageHandle {
     pub path: StoragePath,
     /// Alignment requirements for direct DMA.
     pub alignment: AlignmentRequirements,
-    /// Unique handle ID for tracking.
-    #[allow(dead_code)]
-    pub(crate) handle_id: u64,
+    /// Unique handle ID for tracking. Use `next_handle_id()` to generate.
+    pub handle_id: u64,
 }
 
 /// NVMe namespace description.
