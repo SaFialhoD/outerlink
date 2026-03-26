@@ -5,6 +5,7 @@ members = [
     "crates/outerlink-server",
     "crates/outerlink-client",
     "crates/outerlink-cli",
+    "crates/outerlink-nccl-plugin",
 ]
 
 [workspace.package]
@@ -17,6 +18,7 @@ description = "Unified GPU pool across networked PCs"
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 bincode = "1"
+bitflags = "2"
 dashmap = "6"
 thiserror = "2"
 tracing = "0.1"
@@ -29,3 +31,6 @@ async-trait = "0.1"
 anyhow = "1"
 serde_json = "1"
 libloading = "0.8"
+lz4_flex = "0.11"
+zstd = "0.13"
+xxhash-rust = { version = "0.8", features = ["xxh32"] }

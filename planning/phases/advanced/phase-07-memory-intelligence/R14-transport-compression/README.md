@@ -1,7 +1,7 @@
 # R14: Transport-Layer Compression
 
 **Phase:** 7 — Memory Intelligence
-**Status:** NOT STARTED
+**Status:** PRE-PLAN COMPLETE
 **Priority:** HIGH
 **Depends On:** P6 (Core Transport working)
 
@@ -27,7 +27,7 @@ Add pluggable compression to OuterLink's transport layer. Different strategies f
 
 - `research/` — Research on compression algorithms and benchmarks
 - `side-docs/` — Notes, experiments
-- `preplan.md` — TO BE CREATED
+- `preplan.md` — Scope, dependencies, decisions, risks, implementation phases
 - `plan.md` — TO BE CREATED
 - `progress.md` — Lifecycle tracker
 
