@@ -510,6 +510,10 @@ pub enum CasComputeFn {
     Dec { modulo: u32 },
     /// Float add (reinterpret bits).
     FloatAdd,
+    /// Integer wrapping add: `old.wrapping_add(operand)`.
+    IntAdd,
+    /// Integer wrapping sub: `old.wrapping_sub(operand)`.
+    IntSub,
     /// Exchange: CAS(addr, old, new_value) -- always succeeds on match.
     Exchange,
 }
@@ -554,6 +558,8 @@ impl CasComputeFn {
                 f64::to_bits(a + b)
             }
             CasComputeFn::Exchange => operand,
+            CasComputeFn::IntAdd => old.wrapping_add(operand),
+            CasComputeFn::IntSub => old.wrapping_sub(operand),
         }
     }
 
@@ -706,10 +712,13 @@ impl HotAtomicEntry {
     pub fn update_mode(&self, proxy_threshold: u32, is_rdma_capable: bool) {
         let freq = self.remote_frequency.load(Ordering::Relaxed);
         let mut mode = self.mode.lock().unwrap();
-        if freq > proxy_threshold {
-            *mode = AtomicMode::Proxy;
-        } else if is_rdma_capable {
+        // RdmaDirect always takes priority when the operation is directly
+        // mappable to an RDMA atomic (64-bit CAS/FetchAdd). Hot atomics
+        // over RDMA are faster than proxying through a remote CPU.
+        if is_rdma_capable {
             *mode = AtomicMode::RdmaDirect;
+        } else if freq > proxy_threshold {
+            *mode = AtomicMode::Proxy;
         } else {
             *mode = AtomicMode::Migrate;
         }
@@ -904,14 +913,10 @@ impl RemoteAtomicEngine {
             CudaAtomicOp::Exch { .. } => CasComputeFn::Exchange,
             // Integer add/sub/CAS should use direct RDMA when 64-bit.
             // For 32-bit, they go through CAS emulation with appropriate compute.
-            CudaAtomicOp::Add { is_float: false, .. } => {
-                // For CAS emulation of integer add, compute = old + operand
-                // This is handled specially in the emulation loop.
-                // We use FloatAdd as placeholder -- actually we do wrapping add.
-                // Define inline: old.wrapping_add(operand)
-                CasComputeFn::Exchange // Will be overridden; see note below.
-            }
-            CudaAtomicOp::Sub { .. } => CasComputeFn::Exchange,
+            CudaAtomicOp::Add { is_float: false, .. } => CasComputeFn::IntAdd,
+            CudaAtomicOp::Sub { .. } => CasComputeFn::IntSub,
+            // CAS-via-CAS: the compute is Exchange (replace if old matches).
+            // For sub-word CAS, the caller handles compare+masking externally.
             CudaAtomicOp::CAS { .. } => CasComputeFn::Exchange,
         }
     }
@@ -1311,9 +1316,15 @@ impl Default for FenceState {
 /// and adds NVLink-specific behavior (atomic-aware transitions, fencing).
 /// When R19 is not available, this adapter is `None` in the NvlinkEmulator.
 pub struct NvlinkCoherencyAdapter {
+    /// R19's coherency directory for I/S/E state tracking.
+    /// TODO: Wire to actual R19 CoherencyDirectory when available.
+    directory: Option<Arc<CoherencyDirectory>>,
+    /// R10's page table for PTE lookups and sharer bitmap management.
+    /// TODO: Wire to actual R10 PageTable when available.
+    page_table: Option<Arc<PageTableRef>>,
     /// R29 multicast group for bulk invalidation fast-path.
-    /// TODO: Replace Option<MulticastGroup> with actual R29 integration.
-    has_multicast: bool,
+    /// TODO: Wire to actual R29 MulticastGroup when available.
+    invalidation_multicast: Option<Arc<MulticastGroup>>,
     /// Fencing state per QP for memory ordering guarantees.
     fence_state: DashMap<QueuePairId, FenceState>,
     /// Page size for coherency (default 64KB, configurable to 4KB).
@@ -1324,7 +1335,13 @@ impl NvlinkCoherencyAdapter {
     /// Create a new coherency adapter.
     pub fn new(page_size: u64, has_multicast: bool) -> Self {
         Self {
-            has_multicast,
+            directory: None, // TODO: inject R19 CoherencyDirectory
+            page_table: None, // TODO: inject R10 PageTable
+            invalidation_multicast: if has_multicast {
+                Some(Arc::new(MulticastGroup))
+            } else {
+                None
+            },
             fence_state: DashMap::new(),
             page_size,
         }
@@ -1364,7 +1381,7 @@ impl NvlinkCoherencyAdapter {
 
     /// Whether multicast invalidation is available.
     pub fn has_multicast_invalidation(&self) -> bool {
-        self.has_multicast
+        self.invalidation_multicast.is_some()
     }
 
     /// Get the configured page size.
@@ -1397,7 +1414,7 @@ impl NvlinkCoherencyAdapter {
     /// Returns `InvalidationStrategy::Multicast` if multicast is available,
     /// otherwise `InvalidationStrategy::Unicast` with the number of sharers.
     pub fn invalidation_strategy(&self, sharer_count: u32) -> InvalidationStrategy {
-        if self.has_multicast && sharer_count > 1 {
+        if self.has_multicast_invalidation() && sharer_count > 1 {
             InvalidationStrategy::Multicast
         } else {
             InvalidationStrategy::Unicast {
@@ -1683,31 +1700,38 @@ impl PeerAccessManager {
 
         let key = (local_device, remote_device);
 
-        // Check if already enabled
-        if let Some(conn) = self.peer_connections.get(&key) {
-            if conn.is_enabled() {
-                return Err(PeerAccessError::AlreadyEnabled);
-            }
-        }
-
-        // Check topology
+        // Check topology first (before taking entry lock)
         if !self.topology.has_path(local_node, remote_node) {
             return Err(PeerAccessError::NoRoute);
         }
 
-        // Build route info from topology
-        let hop_count = self.topology.hop_count(local_node, remote_node).unwrap_or(255);
-        let route = RouteInfo::new(
-            hop_count,
-            hop_count as f32, // Simple cost = hop count for now
-            false,            // TODO: Check RDMA availability from transport layer
-            None,
-        );
-
-        // Create or update connection
-        let conn = PeerConnection::new(local_device, remote_device, remote_node, route);
-        conn.enable();
-        self.peer_connections.insert(key, conn);
+        // Atomic check-and-insert via DashMap entry API to prevent TOCTOU race
+        // where two concurrent enable_peer_access calls both pass the check.
+        match self.peer_connections.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(occ) => {
+                if occ.get().is_enabled() {
+                    return Err(PeerAccessError::AlreadyEnabled);
+                }
+                // Re-enable a previously disabled connection
+                occ.get().enable();
+            }
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                let hop_count = self
+                    .topology
+                    .hop_count(local_node, remote_node)
+                    .unwrap_or(255);
+                let route = RouteInfo::new(
+                    hop_count,
+                    hop_count as f32,
+                    false, // TODO: Check RDMA availability from transport layer
+                    None,
+                );
+                let conn =
+                    PeerConnection::new(local_device, remote_device, remote_node, route);
+                conn.enable();
+                vac.insert(conn);
+            }
+        }
 
         Ok(())
     }
