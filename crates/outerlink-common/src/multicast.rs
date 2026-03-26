@@ -140,6 +140,10 @@ pub enum GroupLifecycle {
 }
 
 /// State of a single member within a multicast group.
+///
+/// Update sites (to be wired when RDMA send/receive is implemented):
+/// - `transfer_complete`: set to true when `ReceiverAck` received from this member
+/// - `observed_loss_rate`: updated from `ReceiverAck::observed_loss_rate` field
 #[derive(Clone, Debug)]
 pub struct MemberState {
     /// Node identifier for this member.
@@ -176,6 +180,14 @@ pub struct MulticastGroup {
 }
 
 /// Statistics tracked per multicast group.
+///
+/// Update sites (to be wired when RDMA hardware send/receive is implemented):
+/// - `bytes_multicast`: after successful multicast fragment send
+/// - `bytes_tree_fallback`: after tree-based unicast send
+/// - `transfers_completed`: when all receivers ACK a transfer
+/// - `sequences_retransmitted`: on each unicast retransmit triggered by NACK
+/// - `nacks_received`: on each NACK message received from a receiver
+/// - `tree_fallback_count`: when `ReassemblyBuffer::should_request_tree_fallback()` triggers
 #[derive(Clone, Debug, Default)]
 pub struct MulticastGroupStats {
     /// Total transfers completed via this group.
@@ -433,6 +445,8 @@ pub struct ReassemblyBuffer {
     data: Vec<u8>,
     /// Number of sequences received so far.
     pub received_count: u64,
+    /// Whether any sequence has been received (disambiguates highest_seen == 0).
+    any_received: bool,
     /// Highest sequence number seen (for gap detection).
     pub highest_seen: u64,
     /// NACK state tracking.
@@ -464,6 +478,7 @@ impl ReassemblyBuffer {
             received: vec![false; total_sequences as usize],
             data: vec![0u8; expected_size as usize],
             received_count: 0,
+            any_received: false,
             highest_seen: 0,
             nack_state: NackState {
                 nacked: vec![false; total_sequences as usize],
@@ -492,6 +507,7 @@ impl ReassemblyBuffer {
 
         self.received[seq] = true;
         self.received_count += 1;
+        self.any_received = true;
         if header.sequence > self.highest_seen {
             self.highest_seen = header.sequence;
         }
@@ -506,11 +522,11 @@ impl ReassemblyBuffer {
 
     /// Check if there are gaps in the received sequence numbers.
     pub fn has_gaps(&self) -> bool {
-        if self.highest_seen == 0 && self.received_count <= 1 {
-            return false;
+        if !self.any_received {
+            return false; // Nothing received yet — no gaps to report.
         }
         // There are gaps if we've seen sequence N but haven't received
-        // all sequences 0..=N
+        // all sequences 0..=N.
         self.received_count < self.highest_seen + 1
     }
 
@@ -702,8 +718,8 @@ impl MulticastAddrAllocator {
 
     /// Total capacity of the address pool.
     pub fn capacity(&self) -> usize {
-        let start_last = self.range_start.octets()[3];
-        let end_last = self.range_end.octets()[3];
+        let start_last = self.range_start.octets()[3] as u16;
+        let end_last = self.range_end.octets()[3] as u16;
         (end_last - start_last + 1) as usize
     }
 
