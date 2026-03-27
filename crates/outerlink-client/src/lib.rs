@@ -660,6 +660,8 @@ impl OuterLinkClient {
 
 pub mod callback;
 pub mod ffi;
+pub mod nvml;
+pub mod nvml_ffi;
 
 // ---------------------------------------------------------------------------
 // Tests

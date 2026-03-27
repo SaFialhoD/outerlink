@@ -17,6 +17,7 @@ pub mod kernel_splitting;
 pub mod live_migration;
 pub mod memory;
 pub mod multicast;
+pub mod nvml_types;
 pub mod persistent_kernels;
 pub mod protocol;
 pub mod retry;

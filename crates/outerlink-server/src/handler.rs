@@ -2316,6 +2316,26 @@ pub fn handle_request_full(
             }
         }
 
+        // NVML snapshot: return stub GPU snapshots for all devices.
+        MessageType::NvmlSnapshotRequest => {
+            let count = match backend.device_get_count() {
+                Ok(c) => c,
+                Err(e) => return error_response(rid, e),
+            };
+            let mut data = (count as u32).to_le_bytes().to_vec();
+            for i in 0..count {
+                let snap = outerlink_common::nvml_types::NvmlGpuSnapshot::stub_rtx3090(i as u32);
+                data.extend_from_slice(&snap.to_bytes());
+            }
+            success_with(rid, &data)
+        }
+
+        // NvmlSnapshotResponse is a server->client message, should never arrive here.
+        MessageType::NvmlSnapshotResponse => {
+            tracing::warn!("NvmlSnapshotResponse received on server -- invalid direction");
+            error_response(rid, CuResult::InvalidValue)
+        }
+
         // They are handled in the accept loop (server.rs).
         MessageType::CallbackReady
         | MessageType::CallbackChannelInit
@@ -7660,5 +7680,25 @@ mod tests {
         assert_eq!(report.failed, 0);
         assert_eq!(session.graph_count(), 0);
         assert_eq!(session.graph_exec_count(), 0);
+    }
+
+    #[test]
+    fn test_nvml_snapshot_request() {
+        let gpu = StubGpuBackend::new();
+        let hdr = req(MessageType::NvmlSnapshotRequest, 0);
+        let (_, resp) = dispatch(&gpu, &hdr, &[]);
+        // Should succeed
+        assert_eq!(response_result(&resp), CuResult::Success);
+        // After the 4-byte CuResult, payload starts with u32 device count
+        let count = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(count, 1); // StubGpuBackend has 1 device
+        // Followed by one NvmlGpuSnapshot (380 bytes)
+        assert_eq!(resp.len(), 4 + 4 + outerlink_common::nvml_types::NVML_SNAPSHOT_SIZE);
+        // Verify the snapshot deserializes correctly
+        let snap = outerlink_common::nvml_types::NvmlGpuSnapshot::from_bytes(&resp[8..])
+            .expect("snapshot should deserialize");
+        assert_eq!(snap.name_str(), "NVIDIA GeForce RTX 3090");
+        assert_eq!(snap.compute_cap_major, 8);
+        assert_eq!(snap.compute_cap_minor, 6);
     }
 }
