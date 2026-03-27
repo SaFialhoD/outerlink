@@ -308,6 +308,7 @@ pub fn select_next_job(
     queue: &[QueuedJob],
     policy: &SchedulingPolicy,
     tenants: &[Tenant],
+    total_gpus: u32,
 ) -> Option<usize> {
     let pending: Vec<(usize, &QueuedJob)> = queue
         .iter()
@@ -353,13 +354,20 @@ pub fn select_next_job(
                 .map(|(i, _)| *i)
         }
         SchedulingPolicy::DominantResourceFairness => {
-            // Pick a job from the tenant with the lowest dominant resource share.
-            // We approximate DRF with gpu_used / total_tenant_quota for now.
+            // True DRF: pick tenant with lowest gpu_used / total_cluster_gpus.
+            // This differs from FairShare which uses gpu_used / tenant_quota.
+            let total = if total_gpus == 0 { 1.0 } else { total_gpus as f64 };
             pending
                 .iter()
                 .min_by(|(_, a), (_, b)| {
-                    let drf_a = tenant_utilization(tenants, &a.tenant_id);
-                    let drf_b = tenant_utilization(tenants, &b.tenant_id);
+                    let drf_a = tenants.iter()
+                        .find(|t| t.id == a.tenant_id)
+                        .map(|t| t.gpu_used as f64 / total)
+                        .unwrap_or(f64::MAX);
+                    let drf_b = tenants.iter()
+                        .find(|t| t.id == b.tenant_id)
+                        .map(|t| t.gpu_used as f64 / total)
+                        .unwrap_or(f64::MAX);
                     drf_a
                         .partial_cmp(&drf_b)
                         .unwrap_or(std::cmp::Ordering::Equal)
