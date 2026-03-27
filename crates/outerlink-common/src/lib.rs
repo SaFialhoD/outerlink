@@ -11,7 +11,6 @@ pub mod connection_pool;
 pub mod cuda_graph;
 pub mod dashboard;
 pub mod container;
-pub mod container;
 pub mod cuda_types;
 pub mod cuda_version;
 pub mod discovery;
