@@ -13,6 +13,7 @@ pub mod dashboard;
 pub mod container;
 pub mod container;
 pub mod cuda_types;
+pub mod cuda_version;
 pub mod discovery;
 pub mod dpu_offload;
 pub mod error;
