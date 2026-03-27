@@ -35,19 +35,12 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::gpu_mixing::GpuId;
+use crate::gpu_mixing::{DeviceId, GpuId, VirtualAddr};
 use crate::memory::types::NodeId;
 
 // ---------------------------------------------------------------------------
 // Type aliases used throughout this module
 // ---------------------------------------------------------------------------
-
-/// Device identifier within the OuterLink virtual device space.
-/// Maps to CUDA device ordinals as seen by the application.
-pub type DeviceId = u32;
-
-/// Virtual address in the unified GPU address space.
-pub type VirtualAddr = u64;
 
 /// Queue pair identifier for RDMA connections.
 pub type QueuePairId = u32;

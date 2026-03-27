@@ -33,6 +33,13 @@ use crate::memory::types::NodeId;
 /// Unique identifier for a GPU in the OuterLink pool.
 pub type GpuId = u32;
 
+/// Device identifier within the OuterLink virtual device space.
+/// Maps to CUDA device ordinals as seen by the application.
+pub type DeviceId = u32;
+
+/// Virtual address in the unified GPU address space.
+pub type VirtualAddr = u64;
+
 // ---------------------------------------------------------------------------
 // Workload classification (shared with R13)
 // ---------------------------------------------------------------------------
