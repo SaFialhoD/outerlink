@@ -9,6 +9,7 @@ pub mod handle;
 pub mod protocol;
 pub mod retry;
 pub mod tcp_transport;
+pub mod queue_management;
 pub mod transport;
 
 pub use error::{OuterLinkError, Result};
