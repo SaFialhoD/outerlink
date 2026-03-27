@@ -89,6 +89,14 @@ impl UsageAccumulator {
         self.bytes_transferred_d2h
     }
 
+    pub fn bytes_transferred_d2d(&self) -> u64 {
+        self.bytes_transferred_d2d
+    }
+
+    pub fn bytes_transferred_p2p(&self) -> u64 {
+        self.bytes_transferred_p2p
+    }
+
     pub fn cuda_api_calls(&self) -> u64 {
         self.cuda_api_calls
     }
@@ -184,6 +192,8 @@ pub struct UsageSnapshot {
     pub kernel_launches: u64,
     pub bytes_transferred_h2d: u64,
     pub bytes_transferred_d2h: u64,
+    pub bytes_transferred_d2d: u64,
+    pub bytes_transferred_p2p: u64,
     pub cuda_api_calls: u64,
     pub snapshot_at_epoch_ms: u64,
 }
@@ -198,6 +208,8 @@ impl UsageSnapshot {
             kernel_launches: acc.kernel_launches,
             bytes_transferred_h2d: acc.bytes_transferred_h2d,
             bytes_transferred_d2h: acc.bytes_transferred_d2h,
+            bytes_transferred_d2d: acc.bytes_transferred_d2d,
+            bytes_transferred_p2p: acc.bytes_transferred_p2p,
             cuda_api_calls: acc.cuda_api_calls,
             snapshot_at_epoch_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -211,8 +223,10 @@ impl UsageSnapshot {
     pub fn cost_estimate(&self, rate: &BillingRate) -> f64 {
         let gpu_hours = self.gpu_time_ns as f64 / NS_PER_HOUR;
         let vram_gb_hours = self.vram_byte_seconds as f64 / (BYTES_PER_GB * SECS_PER_HOUR);
-        let total_transfer_bytes =
-            (self.bytes_transferred_h2d as f64) + (self.bytes_transferred_d2h as f64);
+        let total_transfer_bytes = (self.bytes_transferred_h2d as f64)
+            + (self.bytes_transferred_d2h as f64)
+            + (self.bytes_transferred_d2d as f64)
+            + (self.bytes_transferred_p2p as f64);
         let transfer_gb = total_transfer_bytes / BYTES_PER_GB;
 
         (gpu_hours * rate.gpu_hour_cost)
