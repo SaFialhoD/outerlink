@@ -235,8 +235,9 @@ pub struct EccCounters {
     pub pending_retirement: bool,
 }
 
-/// Threshold for retired pages that triggers investigation (from R48 Q5).
-const RETIRED_PAGE_INVESTIGATION_THRESHOLD: u32 = 5;
+/// Threshold for retired pages that triggers investigation.
+/// R48 Q5: "> 5 retired pages = warning", so 6+ pages triggers.
+const RETIRED_PAGE_INVESTIGATION_THRESHOLD: u32 = 6;
 
 impl EccCounters {
     /// Any double-bit error means data may be corrupted -- evict immediately.
