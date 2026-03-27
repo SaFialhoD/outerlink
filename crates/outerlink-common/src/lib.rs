@@ -9,6 +9,7 @@ pub mod bandwidth_scheduler;
 pub mod clock_sync;
 pub mod connection_pool;
 pub mod cuda_graph;
+pub mod dashboard;
 pub mod container;
 pub mod container;
 pub mod cuda_types;
