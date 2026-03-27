@@ -64,7 +64,8 @@ impl ClusterOverview {
         if self.total_nodes == 0 {
             return 0.0;
         }
-        (self.healthy_nodes as f64 / self.total_nodes as f64) * 100.0
+        let nodes = self.healthy_nodes.min(self.total_nodes);
+        (nodes as f64 / self.total_nodes as f64) * 100.0
     }
 
     /// VRAM utilization as a percentage (0.0 -- 100.0).
@@ -72,7 +73,8 @@ impl ClusterOverview {
         if self.total_vram_bytes == 0 {
             return 0.0;
         }
-        (self.used_vram_bytes as f64 / self.total_vram_bytes as f64) * 100.0
+        let used = self.used_vram_bytes.min(self.total_vram_bytes);
+        (used as f64 / self.total_vram_bytes as f64) * 100.0
     }
 
     /// Percentage of GPUs currently in use (0.0 -- 100.0).
@@ -158,7 +160,8 @@ impl GpuView {
         if self.vram_total_bytes == 0 {
             return 0.0;
         }
-        (self.vram_used_bytes as f64 / self.vram_total_bytes as f64) * 100.0
+        let used = self.vram_used_bytes.min(self.vram_total_bytes);
+        (used as f64 / self.vram_total_bytes as f64) * 100.0
     }
 
     /// Free VRAM in bytes.
