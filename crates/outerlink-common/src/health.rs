@@ -271,6 +271,49 @@ impl PhiAccrualDetector {
     pub fn is_ready(&self) -> bool {
         self.intervals.len() >= 2
     }
+
+    // -----------------------------------------------------------------------
+    // Compatibility methods (used by fault_tolerance::MultiLayerDetector)
+    // -----------------------------------------------------------------------
+
+    /// Record a heartbeat arrival at a specific instant.
+    ///
+    /// Alias for [`heartbeat_at`](Self::heartbeat_at), matching the
+    /// `record_heartbeat` name used by the fault-tolerance subsystem.
+    pub fn record_heartbeat(&mut self, now: Instant) {
+        self.heartbeat_at(now);
+    }
+
+    /// Compute phi at a specific instant.
+    ///
+    /// Returns 0.0 if there is not enough data (fewer than 2 intervals).
+    /// Unlike [`phi`](Self::phi) (which uses `Instant::now()` and returns
+    /// `Option`), this variant accepts an explicit timestamp and always
+    /// returns a concrete `f64`, which is the API expected by
+    /// `MultiLayerDetector`.
+    pub fn phi_at_instant(&self, now: Instant) -> f64 {
+        if self.intervals.len() < 2 {
+            return 0.0;
+        }
+        let last = match self.last_heartbeat {
+            Some(t) => t,
+            None => return 0.0,
+        };
+        let elapsed_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+        self.compute_phi(elapsed_ms)
+    }
+
+    /// Get the time of the last recorded heartbeat.
+    pub fn last_heartbeat_time(&self) -> Option<Instant> {
+        self.last_heartbeat
+    }
+
+    /// Get the current mean inter-arrival time in milliseconds.
+    ///
+    /// Returns the default (1000 ms) when no intervals have been recorded.
+    pub fn mean_interval_ms(&self) -> f64 {
+        self.mean()
+    }
 }
 
 /// Compute -log10(Q(y)) where Q(y) = 1 - Phi(y) is the complementary
