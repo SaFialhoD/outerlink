@@ -4,6 +4,7 @@
 //! used by both the client (interception library) and server (GPU daemon).
 
 pub mod cuda_types;
+pub mod dashboard;
 pub mod error;
 pub mod handle;
 pub mod protocol;
