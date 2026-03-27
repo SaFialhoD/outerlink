@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::health::XidSeverity;
+use crate::health::{ThermalThresholds, XidSeverity};
 
 // ---------------------------------------------------------------------------
 // RecoveryTier
@@ -257,36 +257,35 @@ impl EccCounters {
 
 /// Thermal response action based on GPU temperature.
 ///
-/// Thresholds from R48 Q7: 85 warn, 90 stop, 95 migrate, 100 emergency.
+/// Uses thresholds from [`ThermalThresholds`] to determine the action.
+/// Default thresholds are 80C warn, 85C stop, 90C migrate, 95C emergency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ThermalAction {
     /// Temperature is nominal; no action.
     None,
-    /// Temperature >= 85C; reduce scheduling pressure.
+    /// Temperature >= throttle_warn; reduce scheduling pressure.
     ReduceLoad,
-    /// Temperature >= 90C; stop scheduling new work.
+    /// Temperature >= throttle_stop; stop scheduling new work.
     StopScheduling,
-    /// Temperature >= 95C; migrate in-flight work away.
+    /// Temperature >= migrate; migrate in-flight work away.
     MigrateWorkloads,
-    /// Temperature >= 100C; emergency shutdown of GPU workloads.
+    /// Temperature >= emergency; emergency shutdown of GPU workloads.
     EmergencyShutdown,
 }
 
 impl ThermalAction {
     /// Classify a GPU temperature into the appropriate thermal action.
     ///
-    /// Thresholds per R48 Q7: 85C reduce, 90C stop, 95C migrate.
-    /// 100C emergency is an extension beyond R48 for hardware protection.
-    /// NOTE: `health::ThermalThresholds::default()` uses 80/85/90/95 which is 5C
-    /// more conservative. This function uses R48's authoritative thresholds.
-    pub fn from_temperature(temp_c: f64) -> Self {
-        if temp_c >= 100.0 {
+    /// Uses thresholds from [`ThermalThresholds`] (the single source of truth
+    /// for thermal boundaries). See [`ThermalThresholds::default()`] for values.
+    pub fn from_temperature(temp_c: f64, thresholds: &ThermalThresholds) -> Self {
+        if temp_c >= thresholds.emergency {
             Self::EmergencyShutdown
-        } else if temp_c >= 95.0 {
+        } else if temp_c >= thresholds.migrate {
             Self::MigrateWorkloads
-        } else if temp_c >= 90.0 {
+        } else if temp_c >= thresholds.throttle_stop {
             Self::StopScheduling
-        } else if temp_c >= 85.0 {
+        } else if temp_c >= thresholds.throttle_warn {
             Self::ReduceLoad
         } else {
             Self::None

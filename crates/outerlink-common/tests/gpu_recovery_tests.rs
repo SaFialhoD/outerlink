@@ -6,7 +6,7 @@ use outerlink_common::gpu_recovery::{
     EccCounters, GpuRecoveryLog, GpuRecoveryState, RecoveryEvent, RecoveryTier, ThermalAction,
     XidRecoveryAction, recovery_action,
 };
-use outerlink_common::health::XidSeverity;
+use outerlink_common::health::{ThermalThresholds, XidSeverity};
 
 // ---------------------------------------------------------------------------
 // RecoveryTier ordering
@@ -234,48 +234,72 @@ fn ecc_needs_investigation_when_pending_retirement() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn thermal_none_below_85() {
-    assert_eq!(ThermalAction::from_temperature(84.9), ThermalAction::None);
+fn thermal_none_below_throttle_warn() {
+    let t = ThermalThresholds::default(); // 80/85/90/95
+    assert_eq!(ThermalAction::from_temperature(79.9, &t), ThermalAction::None);
 }
 
 #[test]
-fn thermal_reduce_load_at_85() {
-    assert_eq!(ThermalAction::from_temperature(85.0), ThermalAction::ReduceLoad);
+fn thermal_reduce_load_at_throttle_warn() {
+    let t = ThermalThresholds::default();
+    assert_eq!(ThermalAction::from_temperature(80.0, &t), ThermalAction::ReduceLoad);
 }
 
 #[test]
-fn thermal_stop_scheduling_at_90() {
-    assert_eq!(ThermalAction::from_temperature(90.0), ThermalAction::StopScheduling);
+fn thermal_stop_scheduling_at_throttle_stop() {
+    let t = ThermalThresholds::default();
+    assert_eq!(ThermalAction::from_temperature(85.0, &t), ThermalAction::StopScheduling);
 }
 
 #[test]
-fn thermal_migrate_at_95() {
-    assert_eq!(ThermalAction::from_temperature(95.0), ThermalAction::MigrateWorkloads);
+fn thermal_migrate_at_migrate_threshold() {
+    let t = ThermalThresholds::default();
+    assert_eq!(ThermalAction::from_temperature(90.0, &t), ThermalAction::MigrateWorkloads);
 }
 
 #[test]
-fn thermal_emergency_at_100() {
-    assert_eq!(ThermalAction::from_temperature(100.0), ThermalAction::EmergencyShutdown);
+fn thermal_emergency_at_emergency_threshold() {
+    let t = ThermalThresholds::default();
+    assert_eq!(ThermalAction::from_temperature(95.0, &t), ThermalAction::EmergencyShutdown);
 }
 
 #[test]
-fn thermal_emergency_above_100() {
-    assert_eq!(ThermalAction::from_temperature(110.0), ThermalAction::EmergencyShutdown);
+fn thermal_emergency_above_emergency() {
+    let t = ThermalThresholds::default();
+    assert_eq!(ThermalAction::from_temperature(110.0, &t), ThermalAction::EmergencyShutdown);
 }
 
 #[test]
-fn thermal_between_85_and_90() {
-    assert_eq!(ThermalAction::from_temperature(87.5), ThermalAction::ReduceLoad);
+fn thermal_between_warn_and_stop() {
+    let t = ThermalThresholds::default();
+    assert_eq!(ThermalAction::from_temperature(82.5, &t), ThermalAction::ReduceLoad);
 }
 
 #[test]
-fn thermal_between_90_and_95() {
-    assert_eq!(ThermalAction::from_temperature(92.0), ThermalAction::StopScheduling);
+fn thermal_between_stop_and_migrate() {
+    let t = ThermalThresholds::default();
+    assert_eq!(ThermalAction::from_temperature(87.0, &t), ThermalAction::StopScheduling);
 }
 
 #[test]
-fn thermal_between_95_and_100() {
-    assert_eq!(ThermalAction::from_temperature(97.0), ThermalAction::MigrateWorkloads);
+fn thermal_between_migrate_and_emergency() {
+    let t = ThermalThresholds::default();
+    assert_eq!(ThermalAction::from_temperature(92.0, &t), ThermalAction::MigrateWorkloads);
+}
+
+#[test]
+fn thermal_custom_thresholds() {
+    let t = ThermalThresholds {
+        throttle_warn: 70.0,
+        throttle_stop: 75.0,
+        migrate: 80.0,
+        emergency: 85.0,
+    };
+    assert_eq!(ThermalAction::from_temperature(69.9, &t), ThermalAction::None);
+    assert_eq!(ThermalAction::from_temperature(70.0, &t), ThermalAction::ReduceLoad);
+    assert_eq!(ThermalAction::from_temperature(75.0, &t), ThermalAction::StopScheduling);
+    assert_eq!(ThermalAction::from_temperature(80.0, &t), ThermalAction::MigrateWorkloads);
+    assert_eq!(ThermalAction::from_temperature(85.0, &t), ThermalAction::EmergencyShutdown);
 }
 
 // ---------------------------------------------------------------------------
