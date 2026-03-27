@@ -366,3 +366,114 @@ fn memory_pressure_ordering() {
     assert!(HostMemoryPressure::Warning < HostMemoryPressure::Critical);
     assert!(HostMemoryPressure::Critical < HostMemoryPressure::Emergency);
 }
+
+// ---------------------------------------------------------------------------
+// CDF Math Verification (phi accrual numerical accuracy)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn phi_at_mean_is_approximately_0_301() {
+    // At y=0 (elapsed == mean), Q(0) = 0.5, -log10(0.5) = 0.301
+    // Create detector with regular 1s heartbeats, check phi at exactly mean offset
+    let mut det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    let t0 = Instant::now();
+    // Seed with regular 1s intervals
+    for i in 0..10 {
+        det.heartbeat_at(t0 + Duration::from_secs(i));
+    }
+    // Phi at exactly 1 second after last heartbeat (at the mean)
+    let phi = det.phi_at_offset(Duration::from_secs(1)).unwrap();
+    assert!(
+        (phi - 0.301).abs() < 0.1,
+        "phi at mean should be ~0.301, got {}",
+        phi
+    );
+}
+
+#[test]
+fn phi_increases_monotonically_with_delay() {
+    let mut det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    let t0 = Instant::now();
+    for i in 0..20 {
+        det.heartbeat_at(t0 + Duration::from_secs(i));
+    }
+    let mut prev_phi = 0.0;
+    for secs in [1, 2, 3, 5, 8, 13, 21] {
+        let phi = det.phi_at_offset(Duration::from_secs(secs)).unwrap();
+        assert!(
+            phi >= prev_phi,
+            "phi must be monotonically non-decreasing: {} < {} at {}s",
+            phi,
+            prev_phi,
+            secs
+        );
+        prev_phi = phi;
+    }
+}
+
+#[test]
+fn phi_exceeds_suspect_threshold_after_sufficient_delay() {
+    let mut det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    let t0 = Instant::now();
+    for i in 0..20 {
+        det.heartbeat_at(t0 + Duration::from_secs(i));
+    }
+    // At 5x the mean interval, phi should be well above the suspect threshold (8)
+    let phi_5x = det.phi_at_offset(Duration::from_secs(5)).unwrap();
+    assert!(
+        phi_5x > 8.0,
+        "phi at 5x mean should exceed suspect threshold 8, got {}",
+        phi_5x
+    );
+}
+
+#[test]
+fn phi_exceeds_failed_threshold_after_long_delay() {
+    let mut det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    let t0 = Instant::now();
+    for i in 0..20 {
+        det.heartbeat_at(t0 + Duration::from_secs(i));
+    }
+    // At 10x the mean interval, phi should exceed the failed threshold (12)
+    let phi_10x = det.phi_at_offset(Duration::from_secs(10)).unwrap();
+    assert!(
+        phi_10x > 12.0,
+        "phi at 10x mean should exceed failed threshold 12, got {}",
+        phi_10x
+    );
+}
+
+#[test]
+fn phi_near_zero_when_heartbeat_arrives_early() {
+    let mut det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    let t0 = Instant::now();
+    for i in 0..20 {
+        det.heartbeat_at(t0 + Duration::from_secs(i));
+    }
+    // Heartbeat arrives 500ms early (half the 1s interval)
+    let phi = det.phi_at_offset(Duration::from_millis(500)).unwrap();
+    assert!(
+        phi < 1.0,
+        "phi when heartbeat arrives early should be near 0, got {}",
+        phi
+    );
+}
+
+#[test]
+fn phi_cdf_complement_is_non_negative() {
+    // The CDF complement function should never return negative
+    let mut det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    let t0 = Instant::now();
+    for i in 0..10 {
+        det.heartbeat_at(t0 + Duration::from_secs(i));
+    }
+    for ms in [0, 100, 500, 1000, 2000, 5000, 10000, 60000] {
+        let phi = det.phi_at_offset(Duration::from_millis(ms)).unwrap();
+        assert!(
+            phi >= 0.0,
+            "phi must be non-negative, got {} at {}ms",
+            phi,
+            ms
+        );
+    }
+}
