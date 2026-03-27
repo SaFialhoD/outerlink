@@ -168,6 +168,21 @@ impl Default for RecordingConfig {
     }
 }
 
+impl RecordingConfig {
+    /// Returns true if `function_name` passes the filter (or no filter is set).
+    pub fn allows_function(&self, function_name: &str) -> bool {
+        match &self.filter_functions {
+            None => true,
+            Some(list) => list.iter().any(|f| f == function_name),
+        }
+    }
+
+    /// Returns true if recording should accept more calls given session state.
+    pub fn should_record(&self, current_calls: u64) -> bool {
+        self.enabled && current_calls < self.max_calls
+    }
+}
+
 /// Configuration controlling how a recorded session is replayed.
 #[derive(Debug, Clone)]
 pub struct ReplayConfig {
@@ -225,10 +240,17 @@ pub struct ReplayResult {
 /// Null pointers (0) are always mapped to 0. Non-null pointers are assigned
 /// IDs starting at 1 in the order they are first seen. The same pointer
 /// always maps to the same ID within a given `map`.
+///
+/// INVARIANT: `map` must only be modified through this function. External
+/// modifications can cause ID collisions since next_id is derived from map.len().
 pub fn scrub_pointer(ptr: u64, map: &mut HashMap<u64, u64>) -> u64 {
     if ptr == 0 {
         return 0;
     }
     let next_id = map.len() as u64 + 1;
+    debug_assert!(
+        map.get(&ptr).is_some() || !map.values().any(|&v| v == next_id),
+        "scrub_pointer: next_id {next_id} already exists in map — map was modified externally"
+    );
     *map.entry(ptr).or_insert(next_id)
 }
