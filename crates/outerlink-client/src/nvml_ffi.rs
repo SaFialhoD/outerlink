@@ -21,6 +21,7 @@ const NVML_ERROR_UNINITIALIZED: u32 = 1;
 const NVML_ERROR_INVALID_ARGUMENT: u32 = 2;
 const NVML_ERROR_NOT_SUPPORTED: u32 = 3;
 const NVML_ERROR_NOT_FOUND: u32 = 6;
+const NVML_ERROR_INSUFFICIENT_SIZE: u32 = 7;
 const NVML_ERROR_UNKNOWN: u32 = 999;
 
 // ---------------------------------------------------------------------------
@@ -54,10 +55,11 @@ unsafe fn write_c_string(dst: *mut u8, len: u32, src: &[u8]) -> u32 {
         return NVML_ERROR_INVALID_ARGUMENT;
     }
     let max = (len as usize).saturating_sub(1); // reserve space for nul
+    let truncated = src.len() > max;
     let copy_len = src.len().min(max);
     std::ptr::copy_nonoverlapping(src.as_ptr(), dst, copy_len);
     *dst.add(copy_len) = 0; // nul terminator
-    NVML_SUCCESS
+    if truncated { NVML_ERROR_INSUFFICIENT_SIZE } else { NVML_SUCCESS }
 }
 
 // ===========================================================================

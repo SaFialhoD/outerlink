@@ -41,17 +41,20 @@ impl NvmlVirtualizer {
     ///
     /// Populates snapshots with stub data for now. When server connectivity
     /// is wired up, this will request real snapshots via the protocol.
+    ///
+    /// Thread-safe: takes the write lock before checking/setting `initialized`,
+    /// avoiding TOCTOU races. Supports shutdown+reinit cycles.
     pub fn init(&self) {
+        // Take the write lock FIRST to prevent TOCTOU: two threads could both
+        // pass an atomic load check before either acquires the lock.
+        let mut snaps = self.snapshots.write().unwrap();
         if self.initialized.load(Ordering::Acquire) {
-            return; // Already initialized
+            return; // Already initialized (checked under lock)
         }
 
         // Populate with stub data (1 GPU matching RTX 3090).
         // When connected to a server, this will be replaced by real data.
-        let mut snaps = self.snapshots.write().unwrap();
-        if snaps.is_empty() {
-            snaps.push(NvmlGpuSnapshot::stub_rtx3090(0));
-        }
+        snaps.push(NvmlGpuSnapshot::stub_rtx3090(0));
         self.initialized.store(true, Ordering::Release);
     }
 
@@ -99,9 +102,8 @@ impl NvmlVirtualizer {
     }
 }
 
-// SAFETY: RwLock and AtomicBool are both Send + Sync.
-unsafe impl Send for NvmlVirtualizer {}
-unsafe impl Sync for NvmlVirtualizer {}
+// NvmlVirtualizer is automatically Send + Sync because RwLock<Vec<T>>
+// and AtomicBool are both Send + Sync. No unsafe impl needed.
 
 #[cfg(test)]
 mod tests {
