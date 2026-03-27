@@ -23,6 +23,7 @@ pub mod hip_interception;
 pub mod kernel_splitting;
 pub mod live_migration;
 pub mod memory;
+pub mod memory_oversubscription;
 pub mod metrics;
 pub mod multicast;
 pub mod network_resilience;
