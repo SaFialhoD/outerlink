@@ -8,7 +8,6 @@
 //! with the 22-byte OLNK wire format defined in [`crate::protocol`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -32,9 +31,9 @@ const MAX_BULK_SIZE: usize = MAX_PAYLOAD_SIZE as usize;
 /// sending and receiving can proceed concurrently without contention.
 /// Connection liveness is tracked with an [`AtomicBool`].
 pub struct TcpTransportConnection {
-    reader: Arc<Mutex<OwnedReadHalf>>,
-    writer: Arc<Mutex<OwnedWriteHalf>>,
-    connected: Arc<AtomicBool>,
+    reader: Mutex<OwnedReadHalf>,
+    writer: Mutex<OwnedWriteHalf>,
+    connected: AtomicBool,
     remote_addr: String,
 }
 
@@ -57,9 +56,9 @@ impl TcpTransportConnection {
         let (read_half, write_half) = stream.into_split();
 
         Ok(Self {
-            reader: Arc::new(Mutex::new(read_half)),
-            writer: Arc::new(Mutex::new(write_half)),
-            connected: Arc::new(AtomicBool::new(true)),
+            reader: Mutex::new(read_half),
+            writer: Mutex::new(write_half),
+            connected: AtomicBool::new(true),
             remote_addr,
         })
     }
