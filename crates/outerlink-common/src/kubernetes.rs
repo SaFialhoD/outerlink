@@ -562,7 +562,7 @@ mod tests {
     #[test]
     fn resource_name_format() {
         assert!(RESOURCE_NAME.contains('/'));
-        assert!(RESOURCE_NAME.starts_with("outerlink.dev/"));
+        assert!(RESOURCE_NAME.starts_with("outerlink.io/"));
         assert_eq!(RESOURCE_NAME, "outerlink.io/vgpu");
     }
 
