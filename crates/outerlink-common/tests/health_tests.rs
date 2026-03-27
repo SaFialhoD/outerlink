@@ -187,11 +187,22 @@ fn thermal_state_at_throttle_warn() {
 }
 
 #[test]
-fn thermal_state_between_warn_and_migrate() {
+fn thermal_state_between_warn_and_stop() {
+    let snap = make_snapshot(82.0);
+    let thresholds = ThermalThresholds::default();
+    // 82 >= throttle_warn(80) but < throttle_stop(85)
+    assert_eq!(snap.thermal_state(&thresholds), GpuHealthState::Throttled);
+}
+
+#[test]
+fn thermal_state_at_throttle_stop() {
     let snap = make_snapshot(85.0);
     let thresholds = ThermalThresholds::default();
-    // 85 >= throttle_warn(80) but < migrate(90)
-    assert_eq!(snap.thermal_state(&thresholds), GpuHealthState::Throttled);
+    // 85 >= throttle_stop(85) -> Unavailable
+    assert_eq!(
+        snap.thermal_state(&thresholds),
+        GpuHealthState::Unavailable
+    );
 }
 
 #[test]
@@ -298,6 +309,99 @@ fn phi_detector_max_samples() {
 fn node_state_healthy_when_not_ready() {
     let det = PhiAccrualDetector::new(100, 8.0, 12.0);
     assert_eq!(det.node_state(), NodeHealthState::Healthy);
+}
+
+// ---------------------------------------------------------------------------
+// PhiAccrualDetector: fault_tolerance compatibility methods
+// ---------------------------------------------------------------------------
+
+#[test]
+fn phi_detector_record_heartbeat_alias() {
+    // record_heartbeat(Instant) should work the same as heartbeat_at(Instant)
+    let mut det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    let t0 = Instant::now();
+    for i in 0..10 {
+        det.record_heartbeat(t0 + Duration::from_millis(i * 1000));
+    }
+    assert_eq!(det.sample_count(), 9);
+    assert!(det.is_ready());
+}
+
+#[test]
+fn phi_detector_phi_at_instant() {
+    // phi_at_instant(Instant) returns f64 (not Option), computed relative to last heartbeat
+    let mut det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    let t0 = Instant::now();
+    for i in 0..10 {
+        det.heartbeat_at(t0 + Duration::from_millis(i * 1000));
+    }
+    let last = t0 + Duration::from_millis(9 * 1000);
+    // Shortly after last heartbeat, phi should be low
+    let phi = det.phi_at_instant(last + Duration::from_millis(100));
+    assert!(phi < 2.0, "phi should be low shortly after heartbeat, got {}", phi);
+
+    // Long after last heartbeat, phi should be high
+    let phi_late = det.phi_at_instant(last + Duration::from_secs(30));
+    assert!(phi_late > 5.0, "phi should be high after long silence, got {}", phi_late);
+}
+
+#[test]
+fn phi_detector_phi_at_instant_returns_zero_no_data() {
+    let det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    // With no data, phi_at_instant should return 0.0
+    assert_eq!(det.phi_at_instant(Instant::now()), 0.0);
+}
+
+#[test]
+fn phi_detector_last_heartbeat_time() {
+    let mut det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    assert!(det.last_heartbeat_time().is_none());
+    let t0 = Instant::now();
+    det.heartbeat_at(t0);
+    assert_eq!(det.last_heartbeat_time(), Some(t0));
+    let t1 = t0 + Duration::from_secs(1);
+    det.heartbeat_at(t1);
+    assert_eq!(det.last_heartbeat_time(), Some(t1));
+}
+
+#[test]
+fn phi_detector_mean_interval_ms() {
+    let mut det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    let t0 = Instant::now();
+    for i in 0..10 {
+        det.heartbeat_at(t0 + Duration::from_millis(i * 50));
+    }
+    let mean = det.mean_interval_ms();
+    assert!(
+        (mean - 50.0).abs() < 1.0,
+        "mean should be ~50ms, got {}",
+        mean
+    );
+}
+
+#[test]
+fn phi_detector_mean_interval_ms_no_data() {
+    let det = PhiAccrualDetector::new(100, 8.0, 12.0);
+    // Default when no intervals
+    let mean = det.mean_interval_ms();
+    assert_eq!(mean, 1000.0); // Default 1s from health.rs
+}
+
+// ---------------------------------------------------------------------------
+// PhiAccrualDetector re-export from fault_tolerance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn phi_detector_reexported_from_fault_tolerance() {
+    // Verify that PhiAccrualDetector can be imported from fault_tolerance
+    use outerlink_common::fault_tolerance::PhiAccrualDetector as FtDetector;
+    let mut det = FtDetector::new(100, 8.0, 12.0);
+    let t0 = Instant::now();
+    det.record_heartbeat(t0);
+    det.record_heartbeat(t0 + Duration::from_secs(1));
+    det.record_heartbeat(t0 + Duration::from_secs(2));
+    // 3 heartbeats = 2 intervals = ready
+    assert!(det.is_ready());
 }
 
 // ---------------------------------------------------------------------------

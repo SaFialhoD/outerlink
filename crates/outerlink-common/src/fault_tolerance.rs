@@ -7,7 +7,7 @@
 //! Hardware-dependent functionality (ISA-L bindings, RDMA heartbeats, actual
 //! network I/O) is represented as traits with software fallback implementations.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -258,133 +258,13 @@ pub struct HeartbeatPayload {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Phi Accrual Failure Detector
+// 3. Phi Accrual Failure Detector (canonical impl in health.rs)
 // ---------------------------------------------------------------------------
 
-/// Phi accrual failure detector state per monitored node.
-///
-/// Implements the phi accrual algorithm: the "suspicion level" phi grows
-/// continuously based on how long it has been since the last heartbeat
-/// relative to the statistical distribution of past inter-arrival times.
-pub struct PhiAccrualDetector {
-    /// Sliding window of inter-arrival times (milliseconds).
-    arrival_window: VecDeque<f64>,
-    /// Maximum window size.
-    window_size: usize,
-    /// Last heartbeat received timestamp.
-    last_heartbeat: Option<Instant>,
-    /// Computed mean of inter-arrival times.
-    mean: f64,
-    /// Computed variance of inter-arrival times.
-    variance: f64,
-}
-
-impl PhiAccrualDetector {
-    /// Create a new detector with the given window size.
-    pub fn new(window_size: usize) -> Self {
-        Self {
-            arrival_window: VecDeque::with_capacity(window_size),
-            window_size,
-            last_heartbeat: None,
-            mean: 0.0,
-            variance: 0.0,
-        }
-    }
-
-    /// Record a heartbeat arrival.
-    pub fn record_heartbeat(&mut self, now: Instant) {
-        if let Some(last) = self.last_heartbeat {
-            let interval = now.duration_since(last).as_secs_f64() * 1000.0;
-            if self.arrival_window.len() >= self.window_size {
-                self.arrival_window.pop_front();
-            }
-            self.arrival_window.push_back(interval);
-            self.recompute_stats();
-        }
-        self.last_heartbeat = Some(now);
-    }
-
-    /// Compute the current phi value.
-    ///
-    /// Phi represents the suspicion level. Higher values mean higher
-    /// probability that the node has failed. Typical threshold: phi >= 6.0
-    /// corresponds to ~99.97% probability of failure.
-    pub fn phi(&self, now: Instant) -> f64 {
-        let last = match self.last_heartbeat {
-            Some(t) => t,
-            None => return 0.0, // No data yet, cannot suspect.
-        };
-
-        if self.arrival_window.is_empty() {
-            return 0.0;
-        }
-
-        let elapsed_ms = now.duration_since(last).as_secs_f64() * 1000.0;
-
-        // Phi = -log10(1 - CDF(elapsed))
-        // Using normal distribution approximation:
-        // CDF(x) = 0.5 * (1 + erf((x - mean) / (sqrt(2) * stddev)))
-        let stddev = self.variance.sqrt().max(0.01); // avoid division by zero
-        let z = (elapsed_ms - self.mean) / stddev;
-
-        // Approximate phi using log10 of complementary CDF
-        // For z > 0 (elapsed > mean): phi grows rapidly
-        // phi = -log10(1 - Phi(z)) where Phi is the standard normal CDF
-        let p = 0.5 * erfc(z / std::f64::consts::SQRT_2);
-        if p < 1e-15 {
-            15.0 // Cap at 15 to avoid infinity
-        } else {
-            -p.log10()
-        }
-    }
-
-    /// Get the last heartbeat time.
-    pub fn last_heartbeat(&self) -> Option<Instant> {
-        self.last_heartbeat
-    }
-
-    /// Get the current mean inter-arrival time in milliseconds.
-    pub fn mean_interval_ms(&self) -> f64 {
-        self.mean
-    }
-
-    /// Recompute mean and variance from the window.
-    fn recompute_stats(&mut self) {
-        if self.arrival_window.is_empty() {
-            self.mean = 0.0;
-            self.variance = 0.0;
-            return;
-        }
-        let n = self.arrival_window.len() as f64;
-        let sum: f64 = self.arrival_window.iter().sum();
-        self.mean = sum / n;
-
-        let var_sum: f64 = self.arrival_window
-            .iter()
-            .map(|x| (x - self.mean).powi(2))
-            .sum();
-        self.variance = var_sum / n;
-    }
-}
-
-/// Complementary error function approximation (Horner form).
-/// Abramowitz and Stegun approximation 7.1.26.
-fn erfc(x: f64) -> f64 {
-    if x >= 0.0 {
-        erfc_positive(x)
-    } else {
-        2.0 - erfc_positive(-x)
-    }
-}
-
-fn erfc_positive(x: f64) -> f64 {
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let poly = t
-        * (0.254829592
-            + t * (-0.284496736
-                + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-    poly * (-x * x).exp()
-}
+/// Re-export [`PhiAccrualDetector`](crate::health::PhiAccrualDetector) from
+/// the health module so that existing `fault_tolerance::PhiAccrualDetector`
+/// imports continue to work.
+pub use crate::health::PhiAccrualDetector;
 
 // ---------------------------------------------------------------------------
 // 4. XOR Encoder (software, no ISA-L dependency)
@@ -1241,7 +1121,7 @@ impl MultiLayerDetector {
 
     /// Register a node for monitoring.
     pub fn register_node(&self, node_id: NodeId) {
-        let detector = PhiAccrualDetector::new(1000);
+        let detector = PhiAccrualDetector::new(1000, self.phi_threshold, self.phi_threshold * 1.5);
         self.phi_detectors.insert(node_id, RwLock::new(detector));
         if let Ok(mut m) = self.membership.write() {
             m.add_node(node_id);
@@ -1312,7 +1192,7 @@ impl FailureDetector for MultiLayerDetector {
 
         if let Some(detector_lock) = self.phi_detectors.get(&node) {
             if let Ok(detector) = detector_lock.read() {
-                return detector.phi(Instant::now());
+                return detector.phi_at_instant(Instant::now());
             }
         }
         0.0
@@ -1513,17 +1393,17 @@ mod tests {
         assert!(matches!(result, Err(FaultToleranceError::HardwareRequired(_))));
     }
 
-    // -- Phi Accrual Detector Tests --
+    // -- Phi Accrual Detector Tests (uses re-exported health::PhiAccrualDetector) --
 
     #[test]
     fn test_phi_zero_with_no_data() {
-        let detector = PhiAccrualDetector::new(100);
-        assert_eq!(detector.phi(Instant::now()), 0.0);
+        let detector = PhiAccrualDetector::new(100, 8.0, 12.0);
+        assert_eq!(detector.phi_at_instant(Instant::now()), 0.0);
     }
 
     #[test]
     fn test_phi_low_with_regular_heartbeats() {
-        let mut detector = PhiAccrualDetector::new(100);
+        let mut detector = PhiAccrualDetector::new(100, 8.0, 12.0);
         let start = Instant::now();
 
         // Simulate 20 regular heartbeats at 100ms intervals.
@@ -1534,13 +1414,13 @@ mod tests {
 
         // Check phi right after last heartbeat: should be very low.
         let last = start + Duration::from_millis(19 * 100);
-        let phi = detector.phi(last + Duration::from_millis(10));
+        let phi = detector.phi_at_instant(last + Duration::from_millis(10));
         assert!(phi < 2.0, "phi should be low shortly after heartbeat, got {}", phi);
     }
 
     #[test]
     fn test_phi_high_with_missed_heartbeats() {
-        let mut detector = PhiAccrualDetector::new(100);
+        let mut detector = PhiAccrualDetector::new(100, 8.0, 12.0);
         let start = Instant::now();
 
         // 20 regular heartbeats at 100ms intervals.
@@ -1551,7 +1431,7 @@ mod tests {
 
         // No heartbeat for 2 seconds -- phi should be very high.
         let check_time = start + Duration::from_millis(19 * 100 + 2000);
-        let phi = detector.phi(check_time);
+        let phi = detector.phi_at_instant(check_time);
         assert!(
             phi > 5.0,
             "phi should be high after long silence, got {}",
@@ -1561,7 +1441,7 @@ mod tests {
 
     #[test]
     fn test_phi_mean_interval_tracking() {
-        let mut detector = PhiAccrualDetector::new(100);
+        let mut detector = PhiAccrualDetector::new(100, 8.0, 12.0);
         let start = Instant::now();
 
         for i in 0..10 {
@@ -1861,18 +1741,6 @@ mod tests {
         assert_eq!(config.critical_config.k, 3);
         assert_eq!(config.critical_config.m, 1);
         assert_eq!(config.recoverable_config.scheme, CodingScheme::Xor);
-    }
-
-    // -- erfc approximation test --
-
-    #[test]
-    fn test_erfc_known_values() {
-        // erfc(0) = 1.0
-        assert!((erfc(0.0) - 1.0).abs() < 0.001);
-        // erfc(large) -> 0
-        assert!(erfc(5.0) < 0.001);
-        // erfc(-large) -> 2
-        assert!((erfc(-5.0) - 2.0).abs() < 0.001);
     }
 
     // -- Checkpoint type construction tests --
