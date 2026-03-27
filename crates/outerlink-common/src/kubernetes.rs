@@ -10,8 +10,9 @@ use std::collections::HashMap;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// The Kubernetes extended resource name for OuterLink GPUs.
-pub const RESOURCE_NAME: &str = "outerlink.dev/gpu";
+/// The Kubernetes extended resource name for OuterLink virtual GPUs.
+/// Per R42 research: outerlink.io/vgpu (not .dev, vgpu not gpu).
+pub const RESOURCE_NAME: &str = "outerlink.io/vgpu";
 
 /// Default socket path where the device plugin registers with kubelet.
 pub const PLUGIN_SOCKET_PATH: &str = "/var/lib/kubelet/device-plugins/outerlink.sock";
@@ -151,11 +152,16 @@ pub struct AllocateResponse {
 /// - `OUTERLINK_SERVER` with the server address
 /// - `OUTERLINK_GPU_INDICES` with comma-separated GPU indices derived from device IDs
 /// - Library mount (read-only)
-/// - Device nodes for `/dev/nvidiactl`, `/dev/nvidia-uvm`, and per-GPU `/dev/nvidiaN`
+///
+/// If `local_gpu` is true (server-side plugin with co-located GPUs), also injects
+/// `/dev/nvidia*` device nodes. For remote GPU allocation (OutterLink's primary use
+/// case), set `local_gpu = false` — the client talks to the GPU via the network,
+/// not via local device nodes.
 pub fn build_allocate_response(
     request: &AllocateRequest,
     server_addr: &str,
     library_path: &str,
+    local_gpu: bool,
 ) -> AllocateResponse {
     // Extract GPU indices from device IDs.  Convention: id ends with the index
     // after the last '-', e.g. "node1-gpu0" -> "0".  If parsing fails, use the
@@ -189,23 +195,24 @@ pub fn build_allocate_response(
         read_only: true,
     }];
 
-    // Always expose the control devices, plus one node per allocated GPU.
-    let mut devices = vec![
-        DeviceNode {
+    // Only expose device nodes for local GPU passthrough (server-side plugin).
+    // Remote GPU allocations don't need /dev/nvidia* — the client talks via network.
+    let mut devices = Vec::new();
+    if local_gpu {
+        devices.push(DeviceNode {
             path: "/dev/nvidiactl".to_string(),
             permissions: "rw".to_string(),
-        },
-        DeviceNode {
+        });
+        devices.push(DeviceNode {
             path: "/dev/nvidia-uvm".to_string(),
             permissions: "rw".to_string(),
-        },
-    ];
-
-    for idx in &gpu_indices {
-        devices.push(DeviceNode {
-            path: format!("/dev/nvidia{}", idx),
-            permissions: "rw".to_string(),
         });
+        for idx in &gpu_indices {
+            devices.push(DeviceNode {
+                path: format!("/dev/nvidia{}", idx),
+                permissions: "rw".to_string(),
+            });
+        }
     }
 
     AllocateResponse {
@@ -438,7 +445,7 @@ mod tests {
         let req = AllocateRequest {
             device_ids: vec!["node1-gpu0".into()],
         };
-        let resp = build_allocate_response(&req, "10.0.0.1:9000", "/usr/lib/outerlink.so");
+        let resp = build_allocate_response(&req, "10.0.0.1:9000", "/usr/lib/outerlink.so", true);
         assert_eq!(resp.envs["LD_PRELOAD"], "/usr/lib/outerlink.so");
     }
 
@@ -447,7 +454,7 @@ mod tests {
         let req = AllocateRequest {
             device_ids: vec!["node1-gpu0".into()],
         };
-        let resp = build_allocate_response(&req, "10.0.0.1:9000", "/usr/lib/outerlink.so");
+        let resp = build_allocate_response(&req, "10.0.0.1:9000", "/usr/lib/outerlink.so", true);
         assert_eq!(resp.envs["OUTERLINK_SERVER"], "10.0.0.1:9000");
     }
 
@@ -456,7 +463,7 @@ mod tests {
         let req = AllocateRequest {
             device_ids: vec!["node1-gpu0".into(), "node1-gpu2".into()],
         };
-        let resp = build_allocate_response(&req, "addr", "/lib.so");
+        let resp = build_allocate_response(&req, "addr", "/lib.so", true);
         assert_eq!(resp.envs["OUTERLINK_GPU_INDICES"], "0,2");
     }
 
@@ -465,7 +472,7 @@ mod tests {
         let req = AllocateRequest {
             device_ids: vec!["x-gpu0".into()],
         };
-        let resp = build_allocate_response(&req, "addr", "/usr/lib/outerlink.so");
+        let resp = build_allocate_response(&req, "addr", "/usr/lib/outerlink.so", true);
         assert_eq!(resp.mounts.len(), 1);
         assert_eq!(resp.mounts[0].host_path, "/usr/lib/outerlink.so");
         assert!(resp.mounts[0].read_only);
@@ -476,7 +483,7 @@ mod tests {
         let req = AllocateRequest {
             device_ids: vec!["n-gpu0".into(), "n-gpu1".into()],
         };
-        let resp = build_allocate_response(&req, "addr", "/lib.so");
+        let resp = build_allocate_response(&req, "addr", "/lib.so", true);
         // 2 control devices + 2 per-GPU devices = 4
         assert_eq!(resp.devices.len(), 4);
         assert_eq!(resp.devices[0].path, "/dev/nvidiactl");
@@ -490,7 +497,7 @@ mod tests {
         let req = AllocateRequest {
             device_ids: vec![],
         };
-        let resp = build_allocate_response(&req, "addr", "/lib.so");
+        let resp = build_allocate_response(&req, "addr", "/lib.so", true);
         assert_eq!(resp.envs["OUTERLINK_GPU_INDICES"], "");
         // Still has control devices
         assert_eq!(resp.devices.len(), 2);
@@ -502,7 +509,7 @@ mod tests {
         let req = AllocateRequest {
             device_ids: vec!["arbitrary-id".into()],
         };
-        let resp = build_allocate_response(&req, "addr", "/lib.so");
+        let resp = build_allocate_response(&req, "addr", "/lib.so", true);
         assert_eq!(resp.envs["OUTERLINK_GPU_INDICES"], "0");
     }
 
@@ -556,7 +563,7 @@ mod tests {
     fn resource_name_format() {
         assert!(RESOURCE_NAME.contains('/'));
         assert!(RESOURCE_NAME.starts_with("outerlink.dev/"));
-        assert_eq!(RESOURCE_NAME, "outerlink.dev/gpu");
+        assert_eq!(RESOURCE_NAME, "outerlink.io/vgpu");
     }
 
     #[test]
