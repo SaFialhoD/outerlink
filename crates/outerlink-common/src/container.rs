@@ -102,7 +102,7 @@ impl CdiDeviceSpec {
 /// (containerd, CRI-O).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CdiSpec {
-    /// CDI spec version. Default: `"0.6.0"`.
+    /// CDI spec version. Default: `"0.8.0"`.
     pub version: String,
 
     /// Kind identifier. Default: `"outerlink/gpu"`.
@@ -119,7 +119,7 @@ impl CdiSpec {
     /// Create a new CDI spec with defaults and the given devices/edits.
     pub fn new(devices: Vec<CdiDeviceSpec>, container_edits: ContainerEdits) -> Self {
         Self {
-            version: "0.6.0".to_string(),
+            version: "0.8.0".to_string(),
             kind: "outerlink/gpu".to_string(),
             devices,
             container_edits,
@@ -261,7 +261,7 @@ pub fn build_ld_preload_env(library_path: &str, existing_ld_preload: Option<&str
 ///
 /// Returns key-value pairs for:
 /// - `LD_PRELOAD` (with the OuterLink client library)
-/// - `OUTERLINK_SERVER` (from `config.env_vars` if present)
+/// - `OUTERLINK_SERVER` (caller must place this in `config.env_vars`)
 /// - `OUTERLINK_VRAM_LIMIT` (if `vram_limit_bytes` is set)
 /// - `OUTERLINK_GPU_INDICES` (comma-separated, if non-empty)
 /// - Any additional entries from `config.env_vars`
@@ -294,9 +294,15 @@ pub fn build_container_env(
         env.push(("OUTERLINK_GPU_INDICES".to_string(), indices.join(",")));
     }
 
-    // Pass through remaining env_vars (skip LD_PRELOAD -- already handled)
+    // Pass through remaining env_vars, skipping keys already handled structurally
+    const MANAGED_KEYS: &[&str] = &[
+        "LD_PRELOAD",
+        "OUTERLINK_VRAM_LIMIT",
+        "OUTERLINK_COMPUTE_PERCENT",
+        "OUTERLINK_GPU_INDICES",
+    ];
     for (k, v) in &config.env_vars {
-        if k != "LD_PRELOAD" {
+        if !MANAGED_KEYS.contains(&k.as_str()) {
             env.push((k.clone(), v.clone()));
         }
     }
@@ -398,7 +404,7 @@ mod tests {
     #[test]
     fn cdi_spec_defaults() {
         let spec = CdiSpec::new(vec![], ContainerEdits::new());
-        assert_eq!(spec.version, "0.6.0");
+        assert_eq!(spec.version, "0.8.0");
         assert_eq!(spec.kind, "outerlink/gpu");
         assert!(spec.devices.is_empty());
     }
