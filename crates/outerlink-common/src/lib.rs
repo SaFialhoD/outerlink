@@ -10,5 +10,6 @@ pub mod protocol;
 pub mod retry;
 pub mod tcp_transport;
 pub mod transport;
+pub mod usage_metering;
 
 pub use error::{OuterLinkError, Result};
