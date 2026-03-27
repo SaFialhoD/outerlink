@@ -164,7 +164,18 @@ impl TransferSplit {
 
     /// A split is complete when every byte of `total_bytes` has been assigned
     /// to a chunk (no gaps, no shortfall).
+    /// Whether this split covers the full transfer.
+    /// For non-Redundant: total_assigned == total_bytes.
+    /// For Redundant: every chunk covers total_bytes (each is a full copy).
     pub fn is_complete(&self) -> bool {
+        if self.chunks.is_empty() {
+            return self.total_bytes == 0;
+        }
+        // Check if any chunk covers the full payload (Redundant case)
+        let all_full_copies = self.chunks.iter().all(|c| c.length == self.total_bytes);
+        if all_full_copies && self.chunks.len() > 1 {
+            return true; // Redundant: multiple full copies
+        }
         self.total_assigned_bytes() == self.total_bytes
     }
 
