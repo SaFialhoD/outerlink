@@ -159,11 +159,7 @@ impl ComputeQuota {
 
 impl Default for ComputeQuota {
     fn default() -> Self {
-        Self {
-            max_percent: 100.0,
-            time_slice_ms: 100,
-            priority: 128,
-        }
+        Self::with_params(100.0, 100, 128)
     }
 }
 
@@ -184,7 +180,12 @@ pub struct FractionConfig {
 }
 
 impl FractionConfig {
+    /// Panics if compute_percent is not finite or not in [0.0, 100.0].
     pub fn new(vram_limit_bytes: u64, compute_percent: f64, priority: u8) -> Self {
+        assert!(
+            compute_percent.is_finite() && compute_percent >= 0.0 && compute_percent <= 100.0,
+            "compute_percent must be in [0.0, 100.0], got {compute_percent}"
+        );
         Self {
             vram_limit_bytes,
             compute_percent,
@@ -273,13 +274,13 @@ impl GpuPartitionTable {
 
     /// VRAM not yet claimed by any fraction's limit.
     pub fn available_vram(&self) -> u64 {
-        let claimed: u64 = self.fractions.iter().map(|f| f.vram_quota.limit_bytes).sum();
+        let claimed: u64 = self.fractions.iter().map(|f| f.vram_quota.limit_bytes).fold(0u64, |a, v| a.saturating_add(v));
         self.total_vram.saturating_sub(claimed)
     }
 
     /// Sum of all fractions' current allocations.
     pub fn total_allocated_vram(&self) -> u64 {
-        self.fractions.iter().map(|f| f.vram_quota.allocated_bytes).sum()
+        self.fractions.iter().map(|f| f.vram_quota.allocated_bytes).fold(0u64, |a, v| a.saturating_add(v))
     }
 
     /// Number of active fractions.
@@ -289,7 +290,7 @@ impl GpuPartitionTable {
 
     /// Returns `true` if the sum of fraction limits exceeds physical VRAM.
     pub fn is_overcommitted(&self) -> bool {
-        let total_limits: u64 = self.fractions.iter().map(|f| f.vram_quota.limit_bytes).sum();
+        let total_limits: u64 = self.fractions.iter().map(|f| f.vram_quota.limit_bytes).fold(0u64, |a, v| a.saturating_add(v));
         total_limits > self.total_vram
     }
 
@@ -399,10 +400,13 @@ mod tests {
     }
 
     #[test]
-    fn vram_quota_release_saturates_at_zero() {
+    #[cfg_attr(debug_assertions, should_panic(expected = "release"))]
+    fn vram_quota_release_over_allocated_panics_in_debug() {
         let mut q = VramQuota::new(1000);
         q.try_allocate(100).unwrap();
-        q.release(500); // release more than allocated
+        q.release(500); // debug_assert fires; saturates in release
+        // In release builds: allocated_bytes == 0 (saturating)
+        #[cfg(not(debug_assertions))]
         assert_eq!(q.allocated_bytes, 0);
     }
 
