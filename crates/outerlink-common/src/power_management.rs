@@ -692,7 +692,7 @@ mod tests {
             current_watts: 100.0,
             gpu_watts: vec![100.0],
         };
-        // utilization returns 0.0 when max is zero to avoid division by zero
+        // utilization returns INFINITY when max is zero or negative (invalid budget)
         assert!(b.utilization().is_infinite());
     }
 
