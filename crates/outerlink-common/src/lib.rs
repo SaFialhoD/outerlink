@@ -4,6 +4,7 @@
 //! used by both the client (interception library) and server (GPU daemon).
 
 pub mod clock_sync;
+pub mod connection_pool;
 pub mod cuda_graph;
 pub mod cuda_types;
 pub mod discovery;
