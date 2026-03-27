@@ -131,11 +131,16 @@ pub struct HysteresisGuard {
 impl HysteresisGuard {
     /// Create a guard with default thresholds (15%, 2 seconds).
     pub fn new(initial_weight: f64) -> Self {
+        Self::with_params(initial_weight, 15.0, Duration::from_secs(2))
+    }
+
+    /// Create a guard with custom thresholds.
+    pub fn with_params(initial_weight: f64, threshold_percent: f64, hold_time: Duration) -> Self {
         Self {
             current_weight: initial_weight,
             last_change: None,
-            threshold_percent: 15.0,
-            hold_time: Duration::from_secs(2),
+            threshold_percent,
+            hold_time,
         }
     }
 
@@ -181,14 +186,13 @@ impl HysteresisGuard {
 pub struct SchedulerConfig {
     /// EWMA smoothing factor (0.0 = ignore new samples, 1.0 = no smoothing).
     pub ewma_alpha: f64,
-    /// Hysteresis threshold in percent.
+    /// Hysteresis threshold in percent — applied to HysteresisGuard.
     pub hysteresis_percent: f64,
-    /// Minimum hold time between weight changes.
+    /// Minimum hold time between weight changes — applied to HysteresisGuard.
     pub min_hold_time: Duration,
-    /// Transfers below this size are classified as [`TransferSize::Small`].
-    pub small_transfer_threshold: u64,
-    /// Transfers above this size are classified as [`TransferSize::Large`].
-    pub large_transfer_threshold: u64,
+    // NOTE: TransferSize boundaries (256KB small, 16MB large) are fixed constants
+    // in TransferSize::from_bytes. They are not configurable because they map to
+    // fundamental algorithm boundaries (latency-optimal vs bandwidth-optimal).
     /// How often the scheduler should recompute weights.
     pub rebalance_interval: Duration,
 }
@@ -199,8 +203,6 @@ impl Default for SchedulerConfig {
             ewma_alpha: 0.2,
             hysteresis_percent: 15.0,
             min_hold_time: Duration::from_secs(2),
-            small_transfer_threshold: 256 * 1024,        // 256 KB
-            large_transfer_threshold: 16 * 1024 * 1024,  // 16 MB
             rebalance_interval: Duration::from_secs(10),
         }
     }
@@ -372,6 +374,11 @@ impl ClusterBandwidthState {
             None => true,
             Some(last) => now.duration_since(last) >= self.config.rebalance_interval,
         }
+    }
+
+    /// Record that a rebalance occurred at `now`.
+    pub fn mark_rebalanced(&mut self, now: Instant) {
+        self.last_rebalance = Some(now);
     }
 
     /// Sum of all nodes' EWMA bandwidth estimates.
@@ -663,8 +670,7 @@ mod tests {
         assert!((cfg.ewma_alpha - 0.2).abs() < f64::EPSILON);
         assert!((cfg.hysteresis_percent - 15.0).abs() < f64::EPSILON);
         assert_eq!(cfg.min_hold_time, Duration::from_secs(2));
-        assert_eq!(cfg.small_transfer_threshold, 256 * 1024);
-        assert_eq!(cfg.large_transfer_threshold, 16 * 1024 * 1024);
+        assert_eq!(cfg.rebalance_interval, Duration::from_secs(10));
         assert_eq!(cfg.rebalance_interval, Duration::from_secs(10));
     }
 
