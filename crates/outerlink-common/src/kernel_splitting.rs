@@ -39,18 +39,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::cuda_types::CuFunction;
-use crate::gpu_mixing::GpuId;
+use crate::gpu_mixing::{DeviceId, GpuId, VirtualAddr};
 use crate::memory::types::NodeId;
-
-// ---------------------------------------------------------------------------
-// Type aliases
-// ---------------------------------------------------------------------------
-
-/// Virtual address in CUDA device memory.
-pub type VirtualAddr = u64;
-
-/// Device identifier in OuterLink's virtual device space.
-pub type DeviceId = u32;
 
 // ---------------------------------------------------------------------------
 // Kernel classification types
