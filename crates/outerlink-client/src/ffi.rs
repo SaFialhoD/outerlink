@@ -105,6 +105,26 @@ fn parse_result(resp: &[u8]) -> u32 {
     u32::from_le_bytes(resp[0..4].try_into().unwrap())
 }
 
+// ---------------------------------------------------------------------------
+// Fork safety
+// ---------------------------------------------------------------------------
+
+/// Called by the C interposition layer's `pthread_atfork` child handler.
+///
+/// After `fork()`, the child process inherits the parent's address space but
+/// not its threads -- the Tokio runtime, TCP connections, and pthread state
+/// are all invalid. Since `OnceLock` cannot be reset, we set a flag so that
+/// subsequent CUDA calls can detect the forked state and warn the user.
+#[no_mangle]
+pub extern "C" fn ol_client_reset_after_fork() {
+    crate::FORK_DETECTED.store(true, Ordering::Release);
+    tracing::warn!(
+        "OuterLink: fork detected in child process. \
+         The client was initialized in the parent and cannot be safely reused. \
+         Re-exec or call cuInit() to re-initialize."
+    );
+}
+
 /// Explicit init entry point for the C layer.
 ///
 /// Initializes the global client singleton and attempts to connect to the
@@ -5884,6 +5904,7 @@ pub extern "C" fn ol_cuLaunchKernelEx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FORK_DETECTED;
     use std::ffi::CStr;
 
     // -- Init tests --
@@ -9446,5 +9467,44 @@ mod tests {
         // Query a large param index -- stub should return InvalidValue
         let result = ol_cuFuncGetParamInfo(func, 999, &mut offset, &mut size);
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- Fork detection tests --
+
+    #[test]
+    fn test_fork_detected_initially_false() {
+        // FORK_DETECTED should default to false (no fork has occurred)
+        assert!(!FORK_DETECTED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_ol_client_reset_after_fork_sets_flag() {
+        // Reset to known state first
+        FORK_DETECTED.store(false, Ordering::Release);
+        assert!(!FORK_DETECTED.load(Ordering::Acquire));
+
+        // Simulate what the C fork handler calls
+        ol_client_reset_after_fork();
+
+        // Flag should now be true
+        assert!(FORK_DETECTED.load(Ordering::Acquire));
+
+        // Clean up for other tests
+        FORK_DETECTED.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn test_fork_detected_idempotent() {
+        // Calling reset_after_fork multiple times should be safe
+        FORK_DETECTED.store(false, Ordering::Release);
+
+        ol_client_reset_after_fork();
+        assert!(FORK_DETECTED.load(Ordering::Acquire));
+
+        ol_client_reset_after_fork();
+        assert!(FORK_DETECTED.load(Ordering::Acquire));
+
+        // Clean up
+        FORK_DETECTED.store(false, Ordering::Release);
     }
 }

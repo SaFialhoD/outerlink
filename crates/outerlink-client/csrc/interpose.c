@@ -53,12 +53,33 @@ static void *(*real_dlsym)(void *handle, const char *name) = NULL;
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 static int initialized = 0;
 
+/* -----------------------------------------------------------------------
+ * Fork safety
+ *
+ * After fork(), the child inherits the parent's address space but not its
+ * threads -- the Tokio runtime, TCP connections, and pthread state are all
+ * invalid. We register a pthread_atfork child handler that:
+ *   1. Resets `initialized` and `init_once` so the C layer knows it needs
+ *      re-initialization.
+ *   2. Calls ol_client_reset_after_fork() in Rust to set the FORK_DETECTED
+ *      flag and log a warning.
+ * ----------------------------------------------------------------------- */
+
+static void child_after_fork(void) {
+    initialized = 0;
+    init_once = PTHREAD_ONCE_INIT;
+    ol_client_reset_after_fork();
+}
+
 static void do_init(void) {
     /* Resolve the real dlsym if we haven't already */
     if (!real_dlsym) {
         real_dlsym = (void *(*)(void *, const char *))
             __libc_dlsym(RTLD_NEXT, "dlsym");
     }
+
+    /* Register fork handler so the child process knows the client is stale */
+    pthread_atfork(NULL, NULL, child_after_fork);
 
     /* Initialize the Rust client (connects to server, sets up handle tables) */
     ol_client_init();

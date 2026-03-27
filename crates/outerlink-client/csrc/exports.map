@@ -1,0 +1,29 @@
+/*
+ * OuterLink Client Symbol Visibility Map
+ *
+ * Controls which symbols are exported from the outerlink-client cdylib (.so).
+ * LD_PRELOAD interception requires dlsym and the hook_* functions to be
+ * visible. Everything else is hidden to avoid polluting the application's
+ * symbol namespace and to prevent accidental symbol collisions.
+ *
+ * Usage: linked via -Wl,--version-script=csrc/exports.map in build.rs.
+ */
+
+OUTERLINK_1.0 {
+    global:
+        /* dlsym override -- the core interposition entry point */
+        dlsym;
+
+        /* CUDA Driver API hook functions */
+        hook_*;
+
+        /* NVML hook functions (future) */
+        nvml_hook_*;
+
+        /* Rust FFI exports called by the C layer */
+        ol_*;
+
+    local:
+        /* Hide everything else */
+        *;
+};
