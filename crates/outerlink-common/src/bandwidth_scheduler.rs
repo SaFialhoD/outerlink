@@ -381,6 +381,15 @@ impl ClusterBandwidthState {
         self.last_rebalance = Some(now);
     }
 
+    /// Build a HysteresisGuard pre-configured from this cluster's scheduler config.
+    pub fn make_hysteresis_guard(&self, initial_weight: f64) -> HysteresisGuard {
+        HysteresisGuard::with_params(
+            initial_weight,
+            self.config.hysteresis_percent,
+            self.config.min_hold_time,
+        )
+    }
+
     /// Sum of all nodes' EWMA bandwidth estimates.
     pub fn total_bandwidth_bps(&self) -> u64 {
         self.nodes.iter().map(|n| n.ewma_bps).sum()
@@ -670,7 +679,6 @@ mod tests {
         assert!((cfg.ewma_alpha - 0.2).abs() < f64::EPSILON);
         assert!((cfg.hysteresis_percent - 15.0).abs() < f64::EPSILON);
         assert_eq!(cfg.min_hold_time, Duration::from_secs(2));
-        assert_eq!(cfg.rebalance_interval, Duration::from_secs(10));
         assert_eq!(cfg.rebalance_interval, Duration::from_secs(10));
     }
 
