@@ -374,7 +374,7 @@ impl ReconnectPolicy {
     /// Compute the delay for the current attempt, then advance the counter.
     ///
     /// Returns `None` if `should_retry()` is false (attempts exhausted).
-    /// Jitter is deterministic: `(attempt * 7 + 13) % 25` percent of the base delay.
+    /// Jitter is deterministic: `(attempt * 7 + 13) % 26` percent of the base delay (0-25%).
     pub fn next_delay(&mut self) -> Option<Duration> {
         if !self.should_retry() {
             return None;
@@ -559,7 +559,6 @@ mod tests {
         assert_eq!(cfg.bulk_connections, 2);
         assert_eq!(cfg.max_idle_secs, 300);
         assert_eq!(cfg.health_check_interval_secs, 30);
-        assert_eq!(cfg.health_check_interval_secs, 30);
     }
 
     #[test]
@@ -680,14 +679,6 @@ mod tests {
         assert_eq!(policy.max_attempts, 5);
         assert_eq!(policy.base_delay_ms, 1000);
         assert_eq!(policy.max_delay_ms, 30_000);
-    }
-
-    #[test]
-    fn test_reconnect_policy_new() {
-        let policy = ReconnectPolicy::new(5, 1000, 30_000);
-        assert_eq!(policy.max_attempts, 5);
-        assert_eq!(policy.base_delay_ms, 1000);
-        assert_eq!(policy.current_attempt, 0);
     }
 
     #[test]
