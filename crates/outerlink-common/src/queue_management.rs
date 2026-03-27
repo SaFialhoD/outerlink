@@ -701,7 +701,7 @@ mod tests {
     fn test_select_fifo() {
         let (jobs, _) = make_jobs_with_times();
         let tenants = vec![Tenant::new("t1", "A", 8), Tenant::new("t2", "B", 8)];
-        let idx = select_next_job(&jobs, &SchedulingPolicy::Fifo, &tenants);
+        let idx = select_next_job(&jobs, &SchedulingPolicy::Fifo, &tenants, 16);
         assert_eq!(idx, Some(0)); // j1 submitted first
     }
 
@@ -709,7 +709,7 @@ mod tests {
     fn test_select_priority() {
         let (jobs, _) = make_jobs_with_times();
         let tenants = vec![Tenant::new("t1", "A", 8), Tenant::new("t2", "B", 8)];
-        let idx = select_next_job(&jobs, &SchedulingPolicy::Priority, &tenants);
+        let idx = select_next_job(&jobs, &SchedulingPolicy::Priority, &tenants, 16);
         assert_eq!(idx, Some(1)); // j2 has priority 200
     }
 
@@ -720,7 +720,7 @@ mod tests {
         t1.gpu_used = 6; // high utilization
         let t2 = Tenant::new("t2", "B", 8); // gpu_used=0, underserved
         let tenants = vec![t1, t2];
-        let idx = select_next_job(&jobs, &SchedulingPolicy::FairShare, &tenants);
+        let idx = select_next_job(&jobs, &SchedulingPolicy::FairShare, &tenants, 16);
         assert_eq!(idx, Some(1)); // j2 belongs to t2 (underserved)
     }
 
@@ -731,14 +731,14 @@ mod tests {
         t1.gpu_used = 4;
         let t2 = Tenant::new("t2", "B", 8); // 0 used
         let tenants = vec![t1, t2];
-        let idx = select_next_job(&jobs, &SchedulingPolicy::DominantResourceFairness, &tenants);
+        let idx = select_next_job(&jobs, &SchedulingPolicy::DominantResourceFairness, &tenants, 16);
         assert_eq!(idx, Some(1)); // t2 has lowest DRF
     }
 
     #[test]
     fn test_select_empty_queue() {
         let tenants = vec![Tenant::new("t1", "A", 8)];
-        let idx = select_next_job(&[], &SchedulingPolicy::Fifo, &tenants);
+        let idx = select_next_job(&[], &SchedulingPolicy::Fifo, &tenants, 16);
         assert_eq!(idx, None);
     }
 
@@ -749,7 +749,7 @@ mod tests {
             j.started_at = Some(Instant::now());
         }
         let tenants = vec![Tenant::new("t1", "A", 8), Tenant::new("t2", "B", 8)];
-        let idx = select_next_job(&jobs, &SchedulingPolicy::Fifo, &tenants);
+        let idx = select_next_job(&jobs, &SchedulingPolicy::Fifo, &tenants, 16);
         assert_eq!(idx, None);
     }
 
@@ -758,7 +758,7 @@ mod tests {
         let (mut jobs, _) = make_jobs_with_times();
         jobs[0].started_at = Some(Instant::now()); // j1 already running
         let tenants = vec![Tenant::new("t1", "A", 8), Tenant::new("t2", "B", 8)];
-        let idx = select_next_job(&jobs, &SchedulingPolicy::Fifo, &tenants);
+        let idx = select_next_job(&jobs, &SchedulingPolicy::Fifo, &tenants, 16);
         assert_eq!(idx, Some(1)); // j2 is next pending (FIFO by submit time)
     }
 }
