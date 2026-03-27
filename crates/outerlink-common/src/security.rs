@@ -99,19 +99,29 @@ pub fn generate_node_cert(
     ca_key_pem: &str,
     config: &NodeCertConfig,
 ) -> Result<CertPair, String> {
-    use rcgen::{CertificateParams, DnType, Issuer, KeyPair};
+    use rcgen::{CertificateParams, DnType, Issuer, KeyPair, SanType};
 
     // Reconstruct CA issuer from PEM
     let ca_key = KeyPair::from_pem(ca_key_pem).map_err(|e| e.to_string())?;
     let ca_issuer =
         Issuer::from_ca_cert_pem(ca_cert_pem, ca_key).map_err(|e| e.to_string())?;
 
-    // Collect all SANs: hostname + GPU UUIDs
-    let mut san_names = vec![config.hostname.clone()];
-    san_names.extend(config.gpu_uuids.iter().cloned());
+    // Build SANs: hostname as DNS + node_id and GPU UUIDs as URIs
+    let mut params =
+        CertificateParams::new(vec![config.hostname.clone()]).map_err(|e| e.to_string())?;
 
-    // Use CertificateParams::new which handles SAN parsing (DNS vs IP)
-    let mut params = CertificateParams::new(san_names).map_err(|e| e.to_string())?;
+    // Embed node_id as a URI SAN for machine identity
+    let node_uri = format!("urn:outerlink:node:{}", config.node_id);
+    let node_ia5: rcgen::string::Ia5String = node_uri.try_into().map_err(|e| format!("{e:?}"))?;
+    params.subject_alt_names.push(SanType::URI(node_ia5));
+
+    // Embed GPU UUIDs as URI SANs (not DNS — they're not hostnames)
+    for uuid in &config.gpu_uuids {
+        let gpu_uri = format!("urn:outerlink:gpu:{uuid}");
+        let gpu_ia5: rcgen::string::Ia5String = gpu_uri.try_into().map_err(|e| format!("{e:?}"))?;
+        params.subject_alt_names.push(SanType::URI(gpu_ia5));
+    }
+
     params.distinguished_name = rcgen::DistinguishedName::new();
     params.distinguished_name.push(DnType::CommonName, &config.hostname);
     params
