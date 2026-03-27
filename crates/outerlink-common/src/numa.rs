@@ -284,7 +284,7 @@ pub fn build_affinity_plan(
             thread_name: format!("worker-{}", i),
             target_cores: if pin_threads {
                 // Assign one core per thread, cycling if needed
-                vec![gpu_cores[i % gpu_cores.len()]]
+                if gpu_cores.is_empty() { vec![] } else { vec![gpu_cores[i % gpu_cores.len()]] }
             } else {
                 vec![]
             },
@@ -298,7 +298,7 @@ pub fn build_affinity_plan(
             target_cores: if pin_threads {
                 // Use the second half of cores for network
                 let offset = nic_cores.len() / 2;
-                vec![nic_cores[(offset + i) % nic_cores.len()]]
+                if nic_cores.is_empty() { vec![] } else { vec![nic_cores[(offset + i) % nic_cores.len()]] }
             } else {
                 vec![]
             },
@@ -315,7 +315,7 @@ pub fn build_affinity_plan(
         // For the type layer we just pick the GPU node as the "primary".
         gpu_node_id
     } else {
-        gpu_node_id
+        nic_node_id
     };
 
     AffinityPlan {
