@@ -3,6 +3,7 @@
 //! Defines the health states for GPUs, NICs, and nodes, plus the
 //! state machine transitions triggered by monitoring events.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// GPU health state.
@@ -128,11 +129,20 @@ pub struct GpuHealthSnapshot {
 
 impl GpuHealthSnapshot {
     /// Determine health state from thermal readings.
+    ///
+    /// Maps to R34's four thermal tiers:
+    /// - >= emergency (95C): Failed (requires manual intervention)
+    /// - >= migrate (90C): Unavailable (migrate existing work away)
+    /// - >= throttle_stop (85C): Unavailable (stop scheduling, begin draining)
+    /// - >= throttle_warn (80C): Throttled (reduce priority)
+    /// - below throttle_warn: Available
     pub fn thermal_state(&self, thresholds: &ThermalThresholds) -> GpuHealthState {
         if self.temperature >= thresholds.emergency {
             GpuHealthState::Failed
         } else if self.temperature >= thresholds.migrate {
             GpuHealthState::Unavailable
+        } else if self.temperature >= thresholds.throttle_stop {
+            GpuHealthState::Unavailable // stop scheduling, begin draining
         } else if self.temperature >= thresholds.throttle_warn {
             GpuHealthState::Throttled
         } else {
@@ -147,8 +157,8 @@ impl GpuHealthSnapshot {
 /// which represents the suspicion level that the monitored node has failed.
 #[derive(Debug, Clone)]
 pub struct PhiAccrualDetector {
-    /// Recent heartbeat intervals in milliseconds.
-    intervals: Vec<f64>,
+    /// Recent heartbeat intervals in milliseconds (bounded FIFO).
+    intervals: VecDeque<f64>,
     /// Maximum number of intervals to track.
     max_samples: usize,
     /// Time of last heartbeat.
@@ -163,7 +173,7 @@ impl PhiAccrualDetector {
     /// Create a new detector.
     pub fn new(max_samples: usize, suspect_threshold: f64, failed_threshold: f64) -> Self {
         Self {
-            intervals: Vec::with_capacity(max_samples),
+            intervals: VecDeque::with_capacity(max_samples),
             max_samples,
             last_heartbeat: None,
             suspect_threshold,
@@ -181,9 +191,9 @@ impl PhiAccrualDetector {
         if let Some(last) = self.last_heartbeat {
             let interval = time.duration_since(last).as_secs_f64() * 1000.0;
             if self.intervals.len() >= self.max_samples {
-                self.intervals.remove(0);
+                self.intervals.pop_front();
             }
-            self.intervals.push(interval);
+            self.intervals.push_back(interval);
         }
         self.last_heartbeat = Some(time);
     }
