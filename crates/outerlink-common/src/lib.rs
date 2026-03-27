@@ -3,6 +3,7 @@
 //! Shared types, protocol definitions, transport traits, and handle translation
 //! used by both the client (interception library) and server (GPU daemon).
 
+pub mod api_recording;
 pub mod bandwidth_scheduler;
 pub mod clock_sync;
 pub mod connection_pool;
