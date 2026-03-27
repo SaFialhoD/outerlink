@@ -427,9 +427,9 @@ mod tests {
         assert_eq!(cfg.max_recv_wr, 256);
         assert_eq!(cfg.max_send_sge, 4);
         assert_eq!(cfg.max_recv_sge, 4);
-        assert_eq!(cfg.max_inline_data, 256);
+        assert_eq!(cfg.max_inline_data, 220);
         assert!(!cfg.sq_sig_all);
-        assert_eq!(cfg.cq_moderation_count, 64);
+        assert_eq!(cfg.cq_moderation_count, 100);
         assert_eq!(cfg.cq_moderation_period_us, 50);
     }
 
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(cfg.cq_size, 4096);
         assert_eq!(cfg.max_outstanding_sends, 1024);
         assert_eq!(cfg.max_outstanding_recvs, 1024);
-        assert_eq!(cfg.inline_threshold, 256);
+        assert_eq!(cfg.inline_threshold, 220);
         assert!(cfg.use_shared_receive_queue);
     }
 
