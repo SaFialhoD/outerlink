@@ -59,17 +59,18 @@ pub enum TransferMode {
 }
 
 impl TransferMode {
-    /// Number of memcpy-equivalent copies the kernel performs for this mode.
+    /// Total end-to-end copies in the full host-staged pipeline
+    /// (kernel network-stack + CUDA D2H/H2D). Per R39 spec:
     ///
-    /// Standard:          4 (app->ksend, ksend->wire, wire->krecv, krecv->app)
-    /// MsgZeroCopy:       2 (wire->krecv, krecv->app -- send side is zero-copy)
-    /// IoUringRegistered: 1 (wire->app via pre-registered buffer, minimal copy)
-    /// OpenDma:           0 (NIC DMA engines do everything)
+    /// Standard:          4 (ksend-copy + krecv-copy + cudaD2H + cudaH2D)
+    /// MsgZeroCopy:       3 (krecv-copy + cudaD2H + cudaH2D; send side DMA-direct)
+    /// IoUringRegistered: 2 (cudaD2H + cudaH2D; both NIC copies eliminated)
+    /// OpenDma:           0 (NIC DMA engines read/write GPU VRAM directly)
     pub fn copies_required(&self) -> u32 {
         match self {
             Self::Standard => 4,
-            Self::MsgZeroCopy => 2,
-            Self::IoUringRegistered => 1,
+            Self::MsgZeroCopy => 3,
+            Self::IoUringRegistered => 2,
             Self::OpenDma => 0,
         }
     }
@@ -450,12 +451,12 @@ mod tests {
 
     #[test]
     fn transfer_mode_copies_msg_zerocopy() {
-        assert_eq!(TransferMode::MsgZeroCopy.copies_required(), 2);
+        assert_eq!(TransferMode::MsgZeroCopy.copies_required(), 3);
     }
 
     #[test]
     fn transfer_mode_copies_iouring() {
-        assert_eq!(TransferMode::IoUringRegistered.copies_required(), 1);
+        assert_eq!(TransferMode::IoUringRegistered.copies_required(), 2);
     }
 
     #[test]
