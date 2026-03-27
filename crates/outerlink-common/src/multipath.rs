@@ -104,7 +104,7 @@ impl SplitStrategy {
         match self {
             Self::RoundRobin => "Equal-sized chunks rotated across interfaces",
             Self::WeightedBandwidth => "Chunk sizes proportional to interface bandwidth",
-            Self::LatencyOptimal => "Route via lowest-latency interface first",
+            Self::LatencyOptimal => "Bandwidth-proportional split (latency measurement not yet implemented)",
             Self::Redundant => "Send full payload on every interface for redundancy",
         }
     }
@@ -171,7 +171,7 @@ impl TransferSplit {
         if self.chunks.is_empty() {
             return self.total_bytes == 0;
         }
-        // Check if any chunk covers the full payload (Redundant case)
+        // Check if all chunks cover the full payload (Redundant case)
         let all_full_copies = self.chunks.iter().all(|c| c.length == self.total_bytes);
         if all_full_copies && self.chunks.len() > 1 {
             return true; // Redundant: multiple full copies
