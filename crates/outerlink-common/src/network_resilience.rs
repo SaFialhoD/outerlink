@@ -258,6 +258,8 @@ impl ConnectionHealth {
                 // Physical link restored; wait for heartbeat to confirm app-level health.
                 if self.state == LinkState::Down {
                     self.state = LinkState::Degraded;
+                    self.missed_heartbeats = 0; // Reset so check_health doesn't immediately revert to Down
+                    self.last_heartbeat = None; // Force re-evaluation from created_at
                 }
             }
             LinkEvent::SpeedChange(new_bps) => {
@@ -326,8 +328,8 @@ mod tests {
         let cfg = NetworkConfig::default();
         assert_eq!(cfg.heartbeat_interval_ms, 1000);
         assert_eq!(cfg.heartbeat_timeout_ms, 3000);
-        assert_eq!(cfg.suspect_after_missed, 2);
-        assert_eq!(cfg.failed_after_missed, 3);
+        assert_eq!(cfg.suspect_after_missed, 3);
+        assert_eq!(cfg.failed_after_missed, 5);
         assert_eq!(cfg.mtu, 9000);
         assert_eq!(cfg.tcp_user_timeout_ms, 15_000);
     }
@@ -444,53 +446,61 @@ mod tests {
 
     #[test]
     fn test_connection_health_check_no_heartbeat_ever() {
-        let mut ch = ConnectionHealth::new(1_000_000);
-        let config = NetworkConfig::default();
+        // Create connection 10s in the past so timeout fires
+        let past = Instant::now() - Duration::from_secs(10);
+        let mut ch = ConnectionHealth::new_at(1_000_000, past);
+        let config = NetworkConfig::default(); // suspect=3, failed=5
         let now = Instant::now();
 
-        // First check: no heartbeat ever = 1 missed
+        // First check: no heartbeat ever, 10s > 3s timeout = 1 missed
         let state = ch.check_health(&config, now);
         assert_eq!(ch.missed_heartbeats, 1);
-        assert_eq!(state, LinkState::Up); // < suspect_after_missed(2)
+        assert_eq!(state, LinkState::Up); // < suspect_after_missed(3)
     }
 
     #[test]
     fn test_connection_health_transitions_to_degraded() {
-        let mut ch = ConnectionHealth::new(1_000_000);
-        let config = NetworkConfig::default(); // suspect_after_missed = 2
+        let past = Instant::now() - Duration::from_secs(10);
+        let mut ch = ConnectionHealth::new_at(1_000_000, past);
+        let config = NetworkConfig::default(); // suspect_after_missed = 3
         let now = Instant::now();
 
-        ch.check_health(&config, now);
-        assert_eq!(ch.missed_heartbeats, 1);
-
-        let state = ch.check_health(&config, now);
-        assert_eq!(ch.missed_heartbeats, 2);
+        ch.check_health(&config, now); // missed=1 -> Up
+        ch.check_health(&config, now); // missed=2 -> Up
+        let state = ch.check_health(&config, now); // missed=3 -> Degraded
+        assert_eq!(ch.missed_heartbeats, 3);
         assert_eq!(state, LinkState::Degraded);
     }
 
     #[test]
     fn test_connection_health_transitions_to_down() {
-        let mut ch = ConnectionHealth::new(1_000_000);
-        let config = NetworkConfig::default(); // failed_after_missed = 3
+        let past = Instant::now() - Duration::from_secs(10);
+        let mut ch = ConnectionHealth::new_at(1_000_000, past);
+        let config = NetworkConfig::default(); // failed_after_missed = 5
         let now = Instant::now();
 
-        ch.check_health(&config, now);
-        ch.check_health(&config, now);
-        let state = ch.check_health(&config, now);
-        assert_eq!(ch.missed_heartbeats, 3);
+        for _ in 0..4 {
+            ch.check_health(&config, now);
+        }
+        assert_eq!(ch.missed_heartbeats, 4);
+        assert_eq!(ch.state, LinkState::Degraded);
+
+        let state = ch.check_health(&config, now); // missed=5 -> Down
+        assert_eq!(ch.missed_heartbeats, 5);
         assert_eq!(state, LinkState::Down);
     }
 
     #[test]
     fn test_connection_health_recovery_after_heartbeat() {
-        let mut ch = ConnectionHealth::new(1_000_000);
-        let config = NetworkConfig::default();
+        let past = Instant::now() - Duration::from_secs(10);
+        let mut ch = ConnectionHealth::new_at(1_000_000, past);
+        let config = NetworkConfig::default(); // failed=5
         let now = Instant::now();
 
-        // Drive to Down
-        ch.check_health(&config, now);
-        ch.check_health(&config, now);
-        ch.check_health(&config, now);
+        // Drive to Down (5 misses)
+        for _ in 0..5 {
+            ch.check_health(&config, now);
+        }
         assert_eq!(ch.state, LinkState::Down);
 
         // Heartbeat arrives — recovery
@@ -498,7 +508,7 @@ mod tests {
         assert_eq!(ch.state, LinkState::Up);
         assert_eq!(ch.missed_heartbeats, 0);
 
-        // Next check should be Up since heartbeat is fresh
+        // Next check should be Up since heartbeat is fresh (now == last_heartbeat)
         let state = ch.check_health(&config, now);
         assert_eq!(state, LinkState::Up);
     }
