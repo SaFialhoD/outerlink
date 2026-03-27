@@ -47,8 +47,20 @@ impl XidRecoveryAction {
     /// Return the [`XidSeverity`] classification from `crate::health` for
     /// this Xid code. Bridges the health-monitoring severity with the
     /// recovery-tier classification.
+    /// Derive severity from recovery tier, handling Info-level Xids correctly.
+    /// Does not delegate to classify_xid (which has coverage gaps for R48 codes).
     pub fn severity(&self) -> XidSeverity {
-        crate::health::classify_xid(self.xid_code)
+        match self.tier {
+            RecoveryTier::PoolEviction => XidSeverity::Critical,
+            RecoveryTier::GpuReset => XidSeverity::Warning,
+            RecoveryTier::ContextRecreate => {
+                // Info-level Xids that need no real recovery
+                match self.xid_code {
+                    45 | 68 | 94 => XidSeverity::Info,
+                    _ => XidSeverity::Warning,
+                }
+            }
+        }
     }
 }
 
@@ -234,7 +246,7 @@ impl EccCounters {
 
     /// High retired page count or pending retirement warrants investigation.
     pub fn needs_investigation(&self) -> bool {
-        self.retired_pages > RETIRED_PAGE_INVESTIGATION_THRESHOLD || self.pending_retirement
+        self.retired_pages >= RETIRED_PAGE_INVESTIGATION_THRESHOLD || self.pending_retirement
     }
 }
 
@@ -261,6 +273,11 @@ pub enum ThermalAction {
 
 impl ThermalAction {
     /// Classify a GPU temperature into the appropriate thermal action.
+    ///
+    /// Thresholds per R48 Q7: 85C reduce, 90C stop, 95C migrate.
+    /// 100C emergency is an extension beyond R48 for hardware protection.
+    /// NOTE: `health::ThermalThresholds::default()` uses 80/85/90/95 which is 5C
+    /// more conservative. This function uses R48's authoritative thresholds.
     pub fn from_temperature(temp_c: f64) -> Self {
         if temp_c >= 100.0 {
             Self::EmergencyShutdown
@@ -314,10 +331,10 @@ impl GpuRecoveryLog {
 
     /// Return events whose timestamp is within `window` of now.
     pub fn recent_xids(&self, window: Duration) -> Vec<&RecoveryEvent> {
-        let cutoff = Instant::now() - window;
+        let now = Instant::now();
         self.events
             .iter()
-            .filter(|e| e.timestamp >= cutoff)
+            .filter(|e| now.duration_since(e.timestamp) <= window)
             .collect()
     }
 
