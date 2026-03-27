@@ -528,7 +528,8 @@ mod tests {
     #[test]
     fn pool_config_default_values() {
         let cfg = PoolConfig::default();
-        assert_eq!(cfg.per_class_capacity, [64, 32, 16, 4, 1]);
+        assert_eq!(cfg.per_class_capacity, [64, 32, 16, 8, 1]);
+        assert_eq!(cfg.spill_policy, SpillPolicy::SpillToUnpinned);
         assert_eq!(cfg.max_total_bytes, 512 * 1024 * 1024);
         assert_eq!(cfg.spill_threshold_percent, 95);
         assert!(cfg.grow_on_demand);
