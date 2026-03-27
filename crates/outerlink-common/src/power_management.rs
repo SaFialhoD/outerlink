@@ -142,7 +142,7 @@ pub struct WolConfig {
     /// MAC address of the target NIC (e.g. "AA:BB:CC:DD:EE:FF").
     pub mac_address: String,
     /// Broadcast address to send magic packets to.
-    pub broadcast_address: String,
+    pub broadcast_ip: String,
     /// UDP port for Wake-on-LAN magic packets.
     pub magic_packet_port: u16,
     /// Number of times to re-send the magic packet if no acknowledgment.
@@ -156,7 +156,7 @@ impl WolConfig {
     pub fn new(mac_address: impl Into<String>) -> Self {
         Self {
             mac_address: mac_address.into(),
-            broadcast_address: "255.255.255.255:9".to_string(),
+            broadcast_ip: "255.255.255.255".to_string(),
             magic_packet_port: 9,
             retry_count: 3,
             retry_delay_ms: 2000,
@@ -243,18 +243,9 @@ impl IdleDetector {
             }
         };
 
-        let new_state = if let Some(off_secs) = self.policy.off_after_secs {
-            if idle_secs >= off_secs {
-                PowerState::Off
-            } else if idle_secs >= self.policy.suspend_after_secs {
-                PowerState::Suspended
-            } else if idle_secs >= self.policy.low_power_after_secs {
-                PowerState::LowPower
-            } else if idle_secs >= self.policy.idle_threshold_secs {
-                PowerState::Idle
-            } else {
-                PowerState::Active
-            }
+        // Single cascade � check Off first (if configured), then descend.
+        let new_state = if self.policy.off_after_secs.map_or(false, |off| idle_secs >= off) {
+            PowerState::Off
         } else if idle_secs >= self.policy.suspend_after_secs {
             PowerState::Suspended
         } else if idle_secs >= self.policy.low_power_after_secs {
@@ -298,9 +289,10 @@ pub struct PowerBudget {
 
 impl PowerBudget {
     /// Current utilization as a fraction (0.0 .. 1.0+).
+    /// Returns f64::INFINITY if max_watts <= 0 (invalid budget, always over).
     pub fn utilization(&self) -> f64 {
         if self.max_watts <= 0.0 {
-            return 0.0;
+            return f64::INFINITY;
         }
         self.current_watts / self.max_watts
     }
@@ -434,7 +426,7 @@ mod tests {
     fn wol_config_defaults() {
         let cfg = WolConfig::new("AA:BB:CC:DD:EE:FF");
         assert_eq!(cfg.mac_address, "AA:BB:CC:DD:EE:FF");
-        assert_eq!(cfg.broadcast_address, "255.255.255.255:9");
+        assert_eq!(cfg.broadcast_ip, "255.255.255.255");
         assert_eq!(cfg.magic_packet_port, 9);
         assert_eq!(cfg.retry_count, 3);
         assert_eq!(cfg.retry_delay_ms, 2000);
@@ -701,7 +693,7 @@ mod tests {
             gpu_watts: vec![100.0],
         };
         // utilization returns 0.0 when max is zero to avoid division by zero
-        assert_eq!(b.utilization(), 0.0);
+        assert!(b.utilization().is_infinite());
     }
 
     // -- format_power_state_duration ----------------------------------------
