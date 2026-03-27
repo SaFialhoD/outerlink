@@ -187,10 +187,18 @@ fn thermal_state_at_throttle_warn() {
 }
 
 #[test]
-fn thermal_state_between_warn_and_migrate() {
+fn thermal_state_at_throttle_stop() {
     let snap = make_snapshot(85.0);
     let thresholds = ThermalThresholds::default();
-    // 85 >= throttle_warn(80) but < migrate(90)
+    // 85.0 == throttle_stop: stop scheduling, begin draining -> Unavailable
+    assert_eq!(snap.thermal_state(&thresholds), GpuHealthState::Unavailable);
+}
+
+#[test]
+fn thermal_state_between_warn_and_stop() {
+    let snap = make_snapshot(82.0);
+    let thresholds = ThermalThresholds::default();
+    // 80 <= 82 < 85: throttled, reduced priority
     assert_eq!(snap.thermal_state(&thresholds), GpuHealthState::Throttled);
 }
 
