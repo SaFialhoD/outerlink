@@ -24,6 +24,7 @@ pub mod persistent_kernels;
 pub mod protocol;
 pub mod retry;
 pub mod scatter_gather;
+pub mod security;
 pub mod tcp_transport;
 pub mod time_slicing;
 pub mod transport;

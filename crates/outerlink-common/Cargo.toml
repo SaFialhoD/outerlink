@@ -18,7 +18,10 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
+jsonwebtoken = { workspace = true }
 mdns-sd = { workspace = true }
+rcgen = { workspace = true }
+time = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
