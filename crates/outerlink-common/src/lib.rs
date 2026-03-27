@@ -6,6 +6,7 @@
 pub mod clock_sync;
 pub mod cuda_graph;
 pub mod cuda_types;
+pub mod discovery;
 pub mod dpu_offload;
 pub mod error;
 pub mod fault_tolerance;
