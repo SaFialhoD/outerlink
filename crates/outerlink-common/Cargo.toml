@@ -20,6 +20,7 @@ serde = { workspace = true }
 async-trait = { workspace = true }
 jsonwebtoken = { workspace = true }
 mdns-sd = { workspace = true }
+metrics = { workspace = true }
 rcgen = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }

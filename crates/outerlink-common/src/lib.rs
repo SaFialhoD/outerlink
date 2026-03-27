@@ -18,6 +18,7 @@ pub mod health;
 pub mod kernel_splitting;
 pub mod live_migration;
 pub mod memory;
+pub mod metrics;
 pub mod multicast;
 pub mod nvml_types;
 pub mod persistent_kernels;
