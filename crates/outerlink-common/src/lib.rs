@@ -24,6 +24,7 @@ pub mod handle;
 pub mod health;
 pub mod hip_interception;
 pub mod kernel_splitting;
+pub mod kubernetes;
 pub mod live_migration;
 pub mod memory;
 pub mod memory_oversubscription;
