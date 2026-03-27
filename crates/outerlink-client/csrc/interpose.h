@@ -471,4 +471,46 @@ CUresult hook_cuGetProcAddress_v2(const char *symbol, void **pfn,
                                   int cudaVersion, cuuint64_t flags,
                                   void *symbolStatus);
 
+/* -----------------------------------------------------------------------
+ * NVML hook declarations and Rust FFI imports
+ *
+ * NVML (NVIDIA Management Library) functions are intercepted so that
+ * applications querying GPU health/status (nvidia-smi, nvtop, PyTorch
+ * device info, etc.) see the virtual GPU pool instead of local hardware.
+ * ----------------------------------------------------------------------- */
+
+/* NVML Rust FFI imports (implemented in nvml_ffi.rs) */
+extern unsigned int nvml_hook_nvmlInit(void);
+extern unsigned int nvml_hook_nvmlInit_v2(void);
+extern unsigned int nvml_hook_nvmlInitWithFlags(unsigned int flags);
+extern unsigned int nvml_hook_nvmlShutdown(void);
+extern unsigned int nvml_hook_nvmlSystemGetDriverVersion(unsigned char *version, unsigned int length);
+extern unsigned int nvml_hook_nvmlSystemGetNVMLVersion(unsigned char *version, unsigned int length);
+extern unsigned int nvml_hook_nvmlSystemGetCudaDriverVersion(int *cudaDriverVersion);
+extern unsigned int nvml_hook_nvmlSystemGetCudaDriverVersion_v2(int *cudaDriverVersion);
+extern unsigned int nvml_hook_nvmlDeviceGetCount(unsigned int *deviceCount);
+extern unsigned int nvml_hook_nvmlDeviceGetCount_v2(unsigned int *deviceCount);
+extern unsigned int nvml_hook_nvmlDeviceGetHandleByIndex(unsigned int index, unsigned long long *device);
+extern unsigned int nvml_hook_nvmlDeviceGetHandleByIndex_v2(unsigned int index, unsigned long long *device);
+extern unsigned int nvml_hook_nvmlDeviceGetHandleByUUID(const unsigned char *uuid, unsigned long long *device);
+extern unsigned int nvml_hook_nvmlDeviceGetName(unsigned long long device, unsigned char *name, unsigned int length);
+extern unsigned int nvml_hook_nvmlDeviceGetUUID(unsigned long long device, unsigned char *uuid, unsigned int length);
+extern unsigned int nvml_hook_nvmlDeviceGetMemoryInfo(unsigned long long device, void *memory);
+extern unsigned int nvml_hook_nvmlDeviceGetMemoryInfo_v2(unsigned long long device, void *memory);
+extern unsigned int nvml_hook_nvmlDeviceGetUtilizationRates(unsigned long long device, void *utilization);
+extern unsigned int nvml_hook_nvmlDeviceGetTemperature(unsigned long long device, unsigned int sensorType, unsigned int *temp);
+extern unsigned int nvml_hook_nvmlDeviceGetPowerUsage(unsigned long long device, unsigned int *power);
+extern unsigned int nvml_hook_nvmlDeviceGetPowerManagementLimit(unsigned long long device, unsigned int *limit);
+extern unsigned int nvml_hook_nvmlDeviceGetFanSpeed(unsigned long long device, unsigned int *speed);
+extern unsigned int nvml_hook_nvmlDeviceGetFanSpeed_v2(unsigned long long device, unsigned int fan, unsigned int *speed);
+extern unsigned int nvml_hook_nvmlDeviceGetClockInfo(unsigned long long device, unsigned int type, unsigned int *clockMHz);
+extern unsigned int nvml_hook_nvmlDeviceGetPciInfo(unsigned long long device, void *pci);
+extern unsigned int nvml_hook_nvmlDeviceGetPciInfo_v3(unsigned long long device, void *pci);
+extern unsigned int nvml_hook_nvmlDeviceGetCudaComputeCapability(unsigned long long device, int *major, int *minor);
+extern unsigned int nvml_hook_nvmlDeviceGetIndex(unsigned long long device, unsigned int *index);
+extern unsigned int nvml_hook_nvmlDeviceGetNumGpuCores(unsigned long long device, unsigned int *numCores);
+extern unsigned int nvml_hook_nvmlDeviceGetArchitecture(unsigned long long device, unsigned int *arch);
+extern unsigned int nvml_hook_nvmlDeviceGetComputeRunningProcesses_v3(unsigned long long device, unsigned int *infoCount, void *infos);
+extern const unsigned char *nvml_hook_nvmlErrorString(unsigned int result);
+
 #endif /* OUTERLINK_INTERPOSE_H */

@@ -206,6 +206,10 @@ pub enum MessageType {
     GraphExecDestroy = 0x00EC,
     GraphDestroy = 0x00ED,
 
+    // NVML virtualization
+    NvmlSnapshotRequest = 0x0100,
+    NvmlSnapshotResponse = 0x0101,
+
     // Response (server -> client)
     Response = 0x00F0,
     Error = 0x00FF,
@@ -357,6 +361,8 @@ impl MessageType {
             0x00EB => Some(Self::GraphLaunch),
             0x00EC => Some(Self::GraphExecDestroy),
             0x00ED => Some(Self::GraphDestroy),
+            0x0100 => Some(Self::NvmlSnapshotRequest),
+            0x0101 => Some(Self::NvmlSnapshotResponse),
             0x00F0 => Some(Self::Response),
             0x00FF => Some(Self::Error),
             _ => None,
@@ -492,5 +498,25 @@ mod tests {
         let mt = MessageType::from_raw(0x004B).unwrap();
         assert_eq!(mt, MessageType::FuncGetParamInfo);
         assert_eq!(mt as u16, 0x004B);
+    }
+
+    #[test]
+    fn test_nvml_message_types() {
+        let req = MessageType::from_raw(0x0100).unwrap();
+        assert_eq!(req, MessageType::NvmlSnapshotRequest);
+        assert_eq!(req as u16, 0x0100);
+
+        let resp = MessageType::from_raw(0x0101).unwrap();
+        assert_eq!(resp, MessageType::NvmlSnapshotResponse);
+        assert_eq!(resp as u16, 0x0101);
+    }
+
+    #[test]
+    fn test_nvml_header_roundtrip() {
+        let header = MessageHeader::new_request(99, MessageType::NvmlSnapshotRequest, 0);
+        let bytes = header.to_bytes();
+        let decoded = MessageHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::NvmlSnapshotRequest);
+        assert_eq!(decoded.request_id, 99);
     }
 }
