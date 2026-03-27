@@ -22,7 +22,8 @@ pub const GPU_POWER_WATTS: &str = "outerlink_gpu_power_watts";
 // ---------------------------------------------------------------------------
 pub const TRANSFER_BYTES_TOTAL: &str = "outerlink_transfer_bytes_total";
 pub const TRANSFER_DURATION_SECONDS: &str = "outerlink_transfer_duration_seconds";
-pub const TRANSFER_BANDWIDTH_BYTES_PER_SEC: &str = "outerlink_transfer_bandwidth_bps";
+// NOTE: Instantaneous bandwidth gauge removed per review — operators should derive
+// bandwidth from rate(outerlink_transfer_bytes_total[1m]) in PromQL instead.
 
 // ---------------------------------------------------------------------------
 // CUDA interception metrics
@@ -34,8 +35,8 @@ pub const CUDA_ERRORS_TOTAL: &str = "outerlink_cuda_errors_total";
 // ---------------------------------------------------------------------------
 // Cluster metrics
 // ---------------------------------------------------------------------------
-pub const CLUSTER_NODES_TOTAL: &str = "outerlink_cluster_nodes_total";
-pub const CLUSTER_GPUS_TOTAL: &str = "outerlink_cluster_gpus_total";
+pub const CLUSTER_NODES: &str = "outerlink_cluster_nodes";
+pub const CLUSTER_GPUS: &str = "outerlink_cluster_gpus";
 pub const CLUSTER_VRAM_AVAILABLE: &str = "outerlink_cluster_vram_available_bytes";
 
 // ---------------------------------------------------------------------------
@@ -78,30 +79,43 @@ pub fn record_gpu_power(gpu_index: u32, watts: f64) {
 }
 
 /// Record a data transfer.
+/// Bandwidth should be derived via `rate(outerlink_transfer_bytes_total[1m])` in PromQL.
 pub fn record_transfer(direction: &str, bytes: u64, duration_secs: f64) {
     counter!(TRANSFER_BYTES_TOTAL, "direction" => direction.to_owned()).increment(bytes);
     histogram!(TRANSFER_DURATION_SECONDS, "direction" => direction.to_owned())
         .record(duration_secs);
-    if duration_secs > 0.0 {
-        gauge!(TRANSFER_BANDWIDTH_BYTES_PER_SEC, "direction" => direction.to_owned())
-            .set(bytes as f64 / duration_secs);
-    }
 }
 
-/// Record a CUDA API call.
+/// Categorize a CUDA function name into a fixed set of buckets
+/// to prevent label cardinality explosion (222+ functions).
+fn cuda_call_category(function: &str) -> &'static str {
+    if function.starts_with("cuMem") { "mem" }
+    else if function.starts_with("cuLaunch") { "launch" }
+    else if function.starts_with("cuEvent") { "event" }
+    else if function.starts_with("cuStream") { "stream" }
+    else if function.starts_with("cuCtx") { "ctx" }
+    else if function.starts_with("cuModule") { "module" }
+    else if function.starts_with("cuDevice") { "device" }
+    else { "other" }
+}
+
+/// Record a CUDA API call. Function names are bucketed into categories
+/// (mem, launch, event, stream, ctx, module, device, other) to prevent
+/// cardinality explosion with 222+ intercepted functions.
 pub fn record_cuda_call(function: &str, duration_secs: f64, success: bool) {
-    counter!(CUDA_CALLS_TOTAL, "function" => function.to_owned()).increment(1);
-    histogram!(CUDA_CALL_DURATION_SECONDS, "function" => function.to_owned())
+    let category = cuda_call_category(function);
+    counter!(CUDA_CALLS_TOTAL, "category" => category).increment(1);
+    histogram!(CUDA_CALL_DURATION_SECONDS, "category" => category)
         .record(duration_secs);
     if !success {
-        counter!(CUDA_ERRORS_TOTAL, "function" => function.to_owned()).increment(1);
+        counter!(CUDA_ERRORS_TOTAL, "category" => category).increment(1);
     }
 }
 
 /// Update cluster-level gauges.
 pub fn record_cluster_state(nodes: u32, gpus: u32, vram_available: u64) {
-    gauge!(CLUSTER_NODES_TOTAL).set(nodes as f64);
-    gauge!(CLUSTER_GPUS_TOTAL).set(gpus as f64);
+    gauge!(CLUSTER_NODES).set(nodes as f64);
+    gauge!(CLUSTER_GPUS).set(gpus as f64);
     gauge!(CLUSTER_VRAM_AVAILABLE).set(vram_available as f64);
 }
 
@@ -148,12 +162,11 @@ mod tests {
             GPU_POWER_WATTS,
             TRANSFER_BYTES_TOTAL,
             TRANSFER_DURATION_SECONDS,
-            TRANSFER_BANDWIDTH_BYTES_PER_SEC,
             CUDA_CALLS_TOTAL,
             CUDA_CALL_DURATION_SECONDS,
             CUDA_ERRORS_TOTAL,
-            CLUSTER_NODES_TOTAL,
-            CLUSTER_GPUS_TOTAL,
+            CLUSTER_NODES,
+            CLUSTER_GPUS,
             CLUSTER_VRAM_AVAILABLE,
             CONNECTIONS_ACTIVE,
             CONNECTION_ERRORS_TOTAL,
