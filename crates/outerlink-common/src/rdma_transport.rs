@@ -158,9 +158,9 @@ impl Default for QueuePairConfig {
             max_recv_wr: 256,
             max_send_sge: 4,
             max_recv_sge: 4,
-            max_inline_data: 256,
+            max_inline_data: 220,
             sq_sig_all: false,
-            cq_moderation_count: 64,
+            cq_moderation_count: 100,
             cq_moderation_period_us: 50,
         }
     }
@@ -253,7 +253,7 @@ impl Default for RdmaPoolConfig {
             cq_size: 4096,
             max_outstanding_sends: 1024,
             max_outstanding_recvs: 1024,
-            inline_threshold: 256,
+            inline_threshold: 220,
             use_shared_receive_queue: true,
         }
     }
@@ -624,7 +624,7 @@ mod tests {
             max_qp: 65536,
             max_cq: 65536,
             max_mr: 16777216,
-            max_inline_data: 256,
+            max_inline_data: 220,
             active_mtu: MtuSize::Mtu4096,
         };
         assert_eq!(info.device_name, "mlx5_0");
