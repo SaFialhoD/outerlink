@@ -307,7 +307,7 @@ fn log10_normal_cdf_complement(y: f64) -> f64 {
 
 /// System memory pressure level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MemoryPressure {
+pub enum HostMemoryPressure {
     /// >30% available -- normal.
     Normal,
     /// 15-30% available -- caution.
@@ -318,7 +318,7 @@ pub enum MemoryPressure {
     Emergency,
 }
 
-impl MemoryPressure {
+impl HostMemoryPressure {
     /// Classify from percentage of available memory.
     pub fn from_available_percent(percent: f64) -> Self {
         if percent > 30.0 {

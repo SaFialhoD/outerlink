@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use outerlink_common::health::{
-    classify_xid, GpuHealthSnapshot, GpuHealthState, MemoryPressure, NicHealthState,
+    classify_xid, GpuHealthSnapshot, GpuHealthState, HostMemoryPressure, NicHealthState,
     NodeHealthState, PhiAccrualDetector, ThermalThresholds, XidSeverity,
 };
 
@@ -301,60 +301,60 @@ fn node_state_healthy_when_not_ready() {
 }
 
 // ---------------------------------------------------------------------------
-// MemoryPressure
+// HostMemoryPressure
 // ---------------------------------------------------------------------------
 
 #[test]
 fn memory_pressure_normal() {
     assert_eq!(
-        MemoryPressure::from_available_percent(50.0),
-        MemoryPressure::Normal
+        HostMemoryPressure::from_available_percent(50.0),
+        HostMemoryPressure::Normal
     );
     assert_eq!(
-        MemoryPressure::from_available_percent(31.0),
-        MemoryPressure::Normal
+        HostMemoryPressure::from_available_percent(31.0),
+        HostMemoryPressure::Normal
     );
 }
 
 #[test]
 fn memory_pressure_warning() {
     assert_eq!(
-        MemoryPressure::from_available_percent(30.0),
-        MemoryPressure::Warning
+        HostMemoryPressure::from_available_percent(30.0),
+        HostMemoryPressure::Warning
     );
     assert_eq!(
-        MemoryPressure::from_available_percent(16.0),
-        MemoryPressure::Warning
+        HostMemoryPressure::from_available_percent(16.0),
+        HostMemoryPressure::Warning
     );
 }
 
 #[test]
 fn memory_pressure_critical() {
     assert_eq!(
-        MemoryPressure::from_available_percent(15.0),
-        MemoryPressure::Critical
+        HostMemoryPressure::from_available_percent(15.0),
+        HostMemoryPressure::Critical
     );
     assert_eq!(
-        MemoryPressure::from_available_percent(6.0),
-        MemoryPressure::Critical
+        HostMemoryPressure::from_available_percent(6.0),
+        HostMemoryPressure::Critical
     );
 }
 
 #[test]
 fn memory_pressure_emergency() {
     assert_eq!(
-        MemoryPressure::from_available_percent(5.0),
-        MemoryPressure::Emergency
+        HostMemoryPressure::from_available_percent(5.0),
+        HostMemoryPressure::Emergency
     );
     assert_eq!(
-        MemoryPressure::from_available_percent(0.0),
-        MemoryPressure::Emergency
+        HostMemoryPressure::from_available_percent(0.0),
+        HostMemoryPressure::Emergency
     );
 }
 
 #[test]
 fn memory_pressure_ordering() {
-    assert!(MemoryPressure::Normal < MemoryPressure::Warning);
-    assert!(MemoryPressure::Warning < MemoryPressure::Critical);
-    assert!(MemoryPressure::Critical < MemoryPressure::Emergency);
+    assert!(HostMemoryPressure::Normal < HostMemoryPressure::Warning);
+    assert!(HostMemoryPressure::Warning < HostMemoryPressure::Critical);
+    assert!(HostMemoryPressure::Critical < HostMemoryPressure::Emergency);
 }
