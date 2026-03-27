@@ -195,7 +195,7 @@ impl ConnectionInfo {
     }
 
     /// Fraction of traffic that is outbound (sent / total). Returns 0.0 if no traffic.
-    pub fn utilization(&self) -> f64 {
+    pub fn send_ratio(&self) -> f64 {
         let total = self.bytes_sent + self.bytes_received;
         if total == 0 {
             return 0.0;
@@ -227,12 +227,8 @@ pub struct PoolConfig {
 
     /// Interval (seconds) between health check probes.
     pub health_check_interval_secs: u64,
-
-    /// Base delay (milliseconds) before first reconnect attempt.
-    pub reconnect_delay_ms: u64,
-
-    /// Maximum number of reconnect attempts before giving up.
-    pub max_reconnect_attempts: u32,
+    // NOTE: Reconnect delay and max attempts live in ReconnectPolicy (single source of truth).
+    // Do NOT duplicate them here — use ReconnectPolicy::new() directly.
 }
 
 impl Default for PoolConfig {
@@ -243,8 +239,6 @@ impl Default for PoolConfig {
             bulk_connections: 2,
             max_idle_secs: 300,
             health_check_interval_secs: 30,
-            reconnect_delay_ms: 1000,
-            max_reconnect_attempts: 5,
         }
     }
 }
@@ -362,17 +356,6 @@ pub struct ReconnectPolicy {
 }
 
 impl ReconnectPolicy {
-    /// Create a new policy from a [`PoolConfig`].
-    pub fn from_config(config: &PoolConfig) -> Self {
-        Self {
-            current_attempt: 0,
-            max_attempts: config.max_reconnect_attempts,
-            base_delay_ms: config.reconnect_delay_ms,
-            // Default max: 30 seconds
-            max_delay_ms: 30_000,
-        }
-    }
-
     /// Create a policy with explicit parameters.
     pub fn new(max_attempts: u32, base_delay_ms: u64, max_delay_ms: u64) -> Self {
         Self {
@@ -545,7 +528,7 @@ mod tests {
     fn test_connection_info_utilization_no_traffic() {
         let id = ConnectionId::new(PriorityLane::Data, 0, "node-1");
         let info = ConnectionInfo::new(id);
-        assert_eq!(info.utilization(), 0.0);
+        assert_eq!(info.send_ratio(), 0.0);
     }
 
     #[test]
@@ -554,7 +537,7 @@ mod tests {
         let mut info = ConnectionInfo::new(id);
         info.bytes_sent = 1000;
         info.bytes_received = 0;
-        assert_eq!(info.utilization(), 1.0);
+        assert_eq!(info.send_ratio(), 1.0);
     }
 
     #[test]
@@ -563,7 +546,7 @@ mod tests {
         let mut info = ConnectionInfo::new(id);
         info.bytes_sent = 500;
         info.bytes_received = 500;
-        assert!((info.utilization() - 0.5).abs() < f64::EPSILON);
+        assert!((info.send_ratio() - 0.5).abs() < f64::EPSILON);
     }
 
     // -- PoolConfig tests --
@@ -576,8 +559,7 @@ mod tests {
         assert_eq!(cfg.bulk_connections, 2);
         assert_eq!(cfg.max_idle_secs, 300);
         assert_eq!(cfg.health_check_interval_secs, 30);
-        assert_eq!(cfg.reconnect_delay_ms, 1000);
-        assert_eq!(cfg.max_reconnect_attempts, 5);
+        assert_eq!(cfg.health_check_interval_secs, 30);
     }
 
     #[test]
@@ -701,9 +683,8 @@ mod tests {
     }
 
     #[test]
-    fn test_reconnect_policy_from_config() {
-        let config = PoolConfig::default();
-        let policy = ReconnectPolicy::from_config(&config);
+    fn test_reconnect_policy_new() {
+        let policy = ReconnectPolicy::new(5, 1000, 30_000);
         assert_eq!(policy.max_attempts, 5);
         assert_eq!(policy.base_delay_ms, 1000);
         assert_eq!(policy.current_attempt, 0);
