@@ -26,6 +26,7 @@
 
 /* Initialization */
 extern void     ol_client_init(void);
+extern void     ol_client_reset_after_fork(void);
 extern CUresult ol_cuInit(unsigned int flags);
 extern CUresult ol_cuDriverGetVersion(int *driverVersion);
 

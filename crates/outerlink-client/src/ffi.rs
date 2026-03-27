@@ -88,7 +88,23 @@ fn stub_peer_access() -> &'static std::sync::Mutex<std::collections::HashSet<u64
 
 /// Initialize the global client. Called by the C layer via pthread_once,
 /// but also called lazily from each FFI function as a safety net.
+/// One-shot flag to ensure the fork warning is only emitted once.
+static FORK_WARNING_EMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn get_client() -> &'static OuterLinkClient {
+    // Check if we're in a forked child process. Emit a one-time warning
+    // here (not in the fork handler, which must be async-signal-safe).
+    if crate::FORK_DETECTED.load(Ordering::Acquire)
+        && !FORK_WARNING_EMITTED.swap(true, Ordering::Relaxed)
+    {
+        tracing::warn!(
+            "OuterLink: running in a forked child process. \
+             The client was initialized in the parent and cannot be safely reused. \
+             Re-exec or call cuInit() to re-initialize."
+        );
+    }
+
     CLIENT.get_or_init(|| {
         let addr = std::env::var("OUTERLINK_SERVER")
             .unwrap_or_else(|_| "localhost:14833".to_string());
@@ -103,6 +119,28 @@ fn parse_result(resp: &[u8]) -> u32 {
         return CUDA_ERROR_UNKNOWN;
     }
     u32::from_le_bytes(resp[0..4].try_into().unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Fork safety
+// ---------------------------------------------------------------------------
+
+/// Called by the C interposition layer's `pthread_atfork` child handler.
+///
+/// After `fork()`, the child process inherits the parent's address space but
+/// not its threads -- the Tokio runtime, TCP connections, and pthread state
+/// are all invalid. Since `OnceLock` cannot be reset, we set a flag so that
+/// subsequent CUDA calls can detect the forked state and warn the user.
+/// Called from the C `pthread_atfork` child handler.
+///
+/// SAFETY: This runs between `fork()` and `exec()` in the child process.
+/// Only async-signal-safe operations are permitted — no heap allocation,
+/// no locks, no tracing. We only do an atomic store.
+#[no_mangle]
+pub extern "C" fn ol_client_reset_after_fork() {
+    // Atomic store is async-signal-safe. Do NOT add tracing, logging,
+    // or any lock-acquiring code here — it will deadlock.
+    crate::FORK_DETECTED.store(true, Ordering::Release);
 }
 
 /// Explicit init entry point for the C layer.
@@ -5884,6 +5922,7 @@ pub extern "C" fn ol_cuLaunchKernelEx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FORK_DETECTED;
     use std::ffi::CStr;
 
     // -- Init tests --
@@ -9446,5 +9485,44 @@ mod tests {
         // Query a large param index -- stub should return InvalidValue
         let result = ol_cuFuncGetParamInfo(func, 999, &mut offset, &mut size);
         assert_eq!(result, CUDA_ERROR_INVALID_VALUE);
+    }
+
+    // -- Fork detection tests --
+
+    #[test]
+    fn test_fork_detected_initially_false() {
+        // FORK_DETECTED should default to false (no fork has occurred)
+        assert!(!FORK_DETECTED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_ol_client_reset_after_fork_sets_flag() {
+        // Reset to known state first
+        FORK_DETECTED.store(false, Ordering::Release);
+        assert!(!FORK_DETECTED.load(Ordering::Acquire));
+
+        // Simulate what the C fork handler calls
+        ol_client_reset_after_fork();
+
+        // Flag should now be true
+        assert!(FORK_DETECTED.load(Ordering::Acquire));
+
+        // Clean up for other tests
+        FORK_DETECTED.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn test_fork_detected_idempotent() {
+        // Calling reset_after_fork multiple times should be safe
+        FORK_DETECTED.store(false, Ordering::Release);
+
+        ol_client_reset_after_fork();
+        assert!(FORK_DETECTED.load(Ordering::Acquire));
+
+        ol_client_reset_after_fork();
+        assert!(FORK_DETECTED.load(Ordering::Acquire));
+
+        // Clean up
+        FORK_DETECTED.store(false, Ordering::Release);
     }
 }

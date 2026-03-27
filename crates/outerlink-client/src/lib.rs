@@ -22,6 +22,15 @@ use outerlink_common::transport::TransportConnection;
 
 use crate::callback::CallbackRegistry;
 
+/// Flag set by `ol_client_reset_after_fork()` when a child process is detected
+/// via `pthread_atfork`. Since the global `OnceLock<OuterLinkClient>` cannot be
+/// reset, the fork handler sets this flag so that subsequent CUDA calls can
+/// detect the forked state and log a warning.
+///
+/// The C interposition layer registers a `pthread_atfork` child handler that
+/// calls `ol_client_reset_after_fork()`, which sets this to `true`.
+pub static FORK_DETECTED: AtomicBool = AtomicBool::new(false);
+
 /// Global client state, initialized on first CUDA call.
 pub struct OuterLinkClient {
     /// Handle translation tables

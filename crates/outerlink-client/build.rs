@@ -38,6 +38,12 @@ fn main() {
         // Link system libraries needed by the interposition layer
         println!("cargo:rustc-link-lib=dl");
         println!("cargo:rustc-link-lib=pthread");
+
+        // Apply version script to control symbol visibility.
+        // Only dlsym, hook_*, nvml_hook_*, and ol_* are exported;
+        // everything else is hidden to avoid namespace pollution.
+        println!("cargo:rustc-cdylib-link-arg=-Wl,--version-script=csrc/exports.map");
+        println!("cargo:rerun-if-changed=csrc/exports.map");
     }
 
     // Rebuild if any C source or the build script changes
