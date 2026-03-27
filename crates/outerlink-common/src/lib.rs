@@ -5,6 +5,7 @@
 
 pub mod cuda_types;
 pub mod error;
+pub mod gpu_sharing;
 pub mod handle;
 pub mod protocol;
 pub mod retry;
