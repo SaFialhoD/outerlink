@@ -76,8 +76,8 @@ impl Default for NetworkConfig {
         Self {
             heartbeat_interval_ms: 1000,
             heartbeat_timeout_ms: 3000,
-            suspect_after_missed: 2,
-            failed_after_missed: 3,
+            suspect_after_missed: 3, // R47: phi-8 ≈ 3 missed before suspicion
+            failed_after_missed: 5, // R47: phi-8 ≈ 5 missed before declaration
             mtu: 9000,
             tcp_user_timeout_ms: 15_000,
         }
@@ -170,6 +170,8 @@ impl Default for DegradationPolicy {
 pub struct ConnectionHealth {
     /// Current link state.
     pub state: LinkState,
+    /// When this connection was created (used as reference when no heartbeat received yet).
+    pub created_at: Instant,
     /// Timestamp of the last successful heartbeat, if any.
     pub last_heartbeat: Option<Instant>,
     /// Number of consecutive missed heartbeats.
@@ -181,8 +183,14 @@ pub struct ConnectionHealth {
 impl ConnectionHealth {
     /// Create a new `ConnectionHealth` in `Up` state with the given max bandwidth.
     pub fn new(max_bps: u64) -> Self {
+        Self::new_at(max_bps, Instant::now())
+    }
+
+    /// Create with an explicit creation time (for testing).
+    pub fn new_at(max_bps: u64, created_at: Instant) -> Self {
         Self {
             state: LinkState::Up,
+            created_at,
             last_heartbeat: None,
             missed_heartbeats: 0,
             bandwidth: BandwidthEstimate::new(max_bps),
@@ -205,11 +213,10 @@ impl ConnectionHealth {
     pub fn check_health(&mut self, config: &NetworkConfig, now: Instant) -> LinkState {
         let timeout = Duration::from_millis(config.heartbeat_timeout_ms);
 
-        let timed_out = match self.last_heartbeat {
-            Some(last) => now.duration_since(last) > timeout,
-            // No heartbeat ever received — treat as missed
-            None => true,
-        };
+        // Use last heartbeat time, or creation time if no heartbeat received yet.
+        // This ensures the first "miss" only fires after a real timeout elapses.
+        let reference = self.last_heartbeat.unwrap_or(self.created_at);
+        let timed_out = now.duration_since(reference) > timeout;
 
         if timed_out {
             self.missed_heartbeats = self.missed_heartbeats.saturating_add(1);
@@ -239,6 +246,30 @@ impl ConnectionHealth {
         let bits = bytes * 8;
         let sample_bps = (bits as f64 / secs) as u64;
         self.bandwidth.update(sample_bps);
+    }
+
+    /// Apply a link event, immediately updating state.
+    pub fn apply_event(&mut self, event: &LinkEvent) {
+        match event {
+            LinkEvent::LinkDown => {
+                self.state = LinkState::Down;
+            }
+            LinkEvent::LinkUp => {
+                // Physical link restored; wait for heartbeat to confirm app-level health.
+                if self.state == LinkState::Down {
+                    self.state = LinkState::Degraded;
+                }
+            }
+            LinkEvent::SpeedChange(new_bps) => {
+                // Update max bandwidth; state unchanged.
+                self.bandwidth.max_bps = *new_bps;
+            }
+            LinkEvent::ErrorThreshold => {
+                if self.state == LinkState::Up {
+                    self.state = LinkState::Degraded;
+                }
+            }
+        }
     }
 }
 
