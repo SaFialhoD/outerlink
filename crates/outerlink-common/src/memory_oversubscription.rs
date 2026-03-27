@@ -14,12 +14,12 @@ pub const DEFAULT_PAGE_SIZE: usize = 2 * 1024 * 1024;
 pub const DEFAULT_SPILL_WATERMARK_PERCENT: f64 = 85.0;
 
 // ---------------------------------------------------------------------------
-// EvictionPolicy
+// OversubEvictionPolicy
 // ---------------------------------------------------------------------------
 
 /// Policy used to select which resident page to evict to host RAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EvictionPolicy {
+pub enum OversubEvictionPolicy {
     /// Least Recently Used -- evict the page with the oldest `last_access_ns`.
     LRU,
     /// Least Frequently Used -- evict the page with the lowest `access_count`.
@@ -30,7 +30,7 @@ pub enum EvictionPolicy {
     FIFO,
 }
 
-impl EvictionPolicy {
+impl OversubEvictionPolicy {
     /// Human-readable description of the policy.
     pub fn description(&self) -> &'static str {
         match self {
@@ -42,7 +42,7 @@ impl EvictionPolicy {
     }
 }
 
-impl fmt::Display for EvictionPolicy {
+impl fmt::Display for OversubEvictionPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LRU => write!(f, "LRU"),
@@ -67,7 +67,7 @@ pub struct OversubConfig {
     /// Maximum host RAM available for spilled pages (bytes).
     pub host_spill_limit_bytes: u64,
     /// Policy for choosing eviction victims.
-    pub eviction_policy: EvictionPolicy,
+    pub eviction_policy: OversubEvictionPolicy,
     /// Size of each virtual page (bytes). Defaults to 2 MiB.
     pub page_size_bytes: usize,
     /// Physical VRAM usage percentage at which eviction begins.
@@ -80,7 +80,7 @@ impl OversubConfig {
         physical_vram_bytes: u64,
         virtual_vram_bytes: u64,
         host_spill_limit_bytes: u64,
-        eviction_policy: EvictionPolicy,
+        eviction_policy: OversubEvictionPolicy,
     ) -> Self {
         Self {
             physical_vram_bytes,
@@ -349,7 +349,7 @@ impl PageTable {
     /// Only considers pages currently resident in GPU VRAM.
     /// Returns the virtual address of the selected victim, or `None` if no
     /// resident pages exist.
-    pub fn select_victim(&self, policy: &EvictionPolicy) -> Option<u64> {
+    pub fn select_victim(&self, policy: &OversubEvictionPolicy) -> Option<u64> {
         let resident: Vec<&VirtualPage> = self
             .pages
             .iter()
@@ -361,22 +361,22 @@ impl PageTable {
         }
 
         match policy {
-            EvictionPolicy::LRU => resident
+            OversubEvictionPolicy::LRU => resident
                 .iter()
                 .min_by_key(|p| p.last_access_ns)
                 .map(|p| p.virtual_addr),
-            EvictionPolicy::LFU => resident
+            OversubEvictionPolicy::LFU => resident
                 .iter()
                 .min_by_key(|p| p.access_count)
                 .map(|p| p.virtual_addr),
-            EvictionPolicy::Random => {
+            OversubEvictionPolicy::Random => {
                 // Deterministic "random": pick the middle element.
                 // Real randomness would require an RNG dependency; for a pure
                 // types crate we keep it simple and deterministic.
                 let idx = resident.len() / 2;
                 Some(resident[idx].virtual_addr)
             }
-            EvictionPolicy::FIFO => {
+            OversubEvictionPolicy::FIFO => {
                 // First allocated = lowest virtual address among residents.
                 resident
                     .iter()
@@ -468,7 +468,7 @@ mod tests {
     /// Helper: create a standard test config (24 GB physical, 48 GB virtual,
     /// 32 GB host spill).
     fn test_config() -> OversubConfig {
-        OversubConfig::new(24 * GB, 48 * GB, 32 * GB, EvictionPolicy::LRU)
+        OversubConfig::new(24 * GB, 48 * GB, 32 * GB, OversubEvictionPolicy::LRU)
     }
 
     // -- OversubConfig defaults -----------------------------------------------
@@ -487,22 +487,22 @@ mod tests {
 
     #[test]
     fn config_stores_values() {
-        let cfg = OversubConfig::new(8 * GB, 16 * GB, 12 * GB, EvictionPolicy::LFU);
+        let cfg = OversubConfig::new(8 * GB, 16 * GB, 12 * GB, OversubEvictionPolicy::LFU);
         assert_eq!(cfg.physical_vram_bytes, 8 * GB);
         assert_eq!(cfg.virtual_vram_bytes, 16 * GB);
         assert_eq!(cfg.host_spill_limit_bytes, 12 * GB);
-        assert_eq!(cfg.eviction_policy, EvictionPolicy::LFU);
+        assert_eq!(cfg.eviction_policy, OversubEvictionPolicy::LFU);
     }
 
-    // -- EvictionPolicy -------------------------------------------------------
+    // -- OversubEvictionPolicy -------------------------------------------------------
 
     #[test]
     fn eviction_policy_description_not_empty() {
         for policy in [
-            EvictionPolicy::LRU,
-            EvictionPolicy::LFU,
-            EvictionPolicy::Random,
-            EvictionPolicy::FIFO,
+            OversubEvictionPolicy::LRU,
+            OversubEvictionPolicy::LFU,
+            OversubEvictionPolicy::Random,
+            OversubEvictionPolicy::FIFO,
         ] {
             assert!(!policy.description().is_empty(), "{policy:?} description empty");
         }
@@ -510,10 +510,10 @@ mod tests {
 
     #[test]
     fn eviction_policy_display() {
-        assert_eq!(EvictionPolicy::LRU.to_string(), "LRU");
-        assert_eq!(EvictionPolicy::LFU.to_string(), "LFU");
-        assert_eq!(EvictionPolicy::Random.to_string(), "Random");
-        assert_eq!(EvictionPolicy::FIFO.to_string(), "FIFO");
+        assert_eq!(OversubEvictionPolicy::LRU.to_string(), "LRU");
+        assert_eq!(OversubEvictionPolicy::LFU.to_string(), "LFU");
+        assert_eq!(OversubEvictionPolicy::Random.to_string(), "Random");
+        assert_eq!(OversubEvictionPolicy::FIFO.to_string(), "FIFO");
     }
 
     // -- PageLocation ---------------------------------------------------------
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn allocate_exceeds_virtual_limit() {
-        let cfg = OversubConfig::new(GB, 2 * PAGE as u64, GB, EvictionPolicy::LRU);
+        let cfg = OversubConfig::new(GB, 2 * PAGE as u64, GB, OversubEvictionPolicy::LRU);
         let mut pt = PageTable::new(cfg);
         pt.allocate(PAGE).unwrap();
         pt.allocate(PAGE).unwrap();
@@ -636,7 +636,7 @@ mod tests {
             physical_vram_bytes: PAGE as u64,
             virtual_vram_bytes: 10 * PAGE as u64,
             host_spill_limit_bytes: 10 * PAGE as u64,
-            eviction_policy: EvictionPolicy::LRU,
+            eviction_policy: OversubEvictionPolicy::LRU,
             page_size_bytes: PAGE,
             spill_watermark_percent: 50.0, // 50% of 1 page = 0.5 pages
         };
@@ -655,7 +655,7 @@ mod tests {
         // Give a1 an older timestamp, a2 a newer one.
         pt.page_mut(a1).unwrap().last_access_ns = 100;
         pt.page_mut(a2).unwrap().last_access_ns = 200;
-        let victim = pt.select_victim(&EvictionPolicy::LRU).unwrap();
+        let victim = pt.select_victim(&OversubEvictionPolicy::LRU).unwrap();
         assert_eq!(victim, a1, "LRU should pick the page with oldest access");
     }
 
@@ -666,7 +666,7 @@ mod tests {
         let a2 = pt.allocate(PAGE).unwrap();
         pt.page_mut(a1).unwrap().access_count = 50;
         pt.page_mut(a2).unwrap().access_count = 10;
-        let victim = pt.select_victim(&EvictionPolicy::LFU).unwrap();
+        let victim = pt.select_victim(&OversubEvictionPolicy::LFU).unwrap();
         assert_eq!(victim, a2, "LFU should pick the page with fewest accesses");
     }
 
@@ -675,7 +675,7 @@ mod tests {
         let mut pt = PageTable::new(test_config());
         let a1 = pt.allocate(PAGE).unwrap();
         let _a2 = pt.allocate(PAGE).unwrap();
-        let victim = pt.select_victim(&EvictionPolicy::FIFO).unwrap();
+        let victim = pt.select_victim(&OversubEvictionPolicy::FIFO).unwrap();
         assert_eq!(victim, a1, "FIFO should pick the first allocated page");
     }
 
@@ -683,7 +683,7 @@ mod tests {
     fn select_victim_random_returns_some() {
         let mut pt = PageTable::new(test_config());
         pt.allocate(3 * PAGE).unwrap();
-        assert!(pt.select_victim(&EvictionPolicy::Random).is_some());
+        assert!(pt.select_victim(&OversubEvictionPolicy::Random).is_some());
     }
 
     #[test]
@@ -691,7 +691,7 @@ mod tests {
         let mut pt = PageTable::new(test_config());
         let addr = pt.allocate(PAGE).unwrap();
         pt.spill_page(addr).unwrap();
-        assert!(pt.select_victim(&EvictionPolicy::LRU).is_none());
+        assert!(pt.select_victim(&OversubEvictionPolicy::LRU).is_none());
     }
 
     // -- reported vram --------------------------------------------------------
@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn spill_page_host_limit_exceeded() {
-        let cfg = OversubConfig::new(GB, 10 * GB, PAGE as u64, EvictionPolicy::LRU);
+        let cfg = OversubConfig::new(GB, 10 * GB, PAGE as u64, OversubEvictionPolicy::LRU);
         let mut pt = PageTable::new(cfg);
         let a1 = pt.allocate(PAGE).unwrap();
         let a2 = pt.allocate(PAGE).unwrap();
