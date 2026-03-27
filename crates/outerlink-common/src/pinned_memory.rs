@@ -90,6 +90,9 @@ pub struct PoolConfig {
     /// Range 0..=100.
     pub spill_threshold_percent: u8,
 
+    /// What to do when the pool is full and a new allocation is requested.
+    pub spill_policy: SpillPolicy,
+
     /// Whether the pool may allocate additional buffers beyond the initial
     /// per-class capacity, up to `max_total_bytes`.
     pub grow_on_demand: bool,
@@ -98,10 +101,11 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            // 64 Tiny, 32 Small, 16 Medium, 4 Large, 1 Huge
-            per_class_capacity: [64, 32, 16, 4, 1],
+            // 64 Tiny, 32 Small, 16 Medium, 8 Large (128MB for 100GbE per R49), 1 Huge
+            per_class_capacity: [64, 32, 16, 8, 1],
             max_total_bytes: 512 * 1024 * 1024, // 512 MiB
             spill_threshold_percent: 95,
+            spill_policy: SpillPolicy::SpillToUnpinned,
             grow_on_demand: true,
         }
     }
@@ -198,8 +202,9 @@ impl AllocationResult {
 /// (shrink, stop growing, reject new allocations).
 #[derive(Debug, Clone)]
 pub struct MemoryPressureConfig {
-    /// Below this percent available, the pool is "healthy" -- no action needed.
-    /// Above this, the pool may grow freely.
+    /// When system available RAM is above this percent, the pool is healthy
+    /// and may grow freely. Below this threshold, growth stops and the warning
+    /// and critical thresholds take over.
     pub healthy_percent: f64,
     /// Below this percent available, emit warnings and stop growing.
     pub warning_percent: f64,
