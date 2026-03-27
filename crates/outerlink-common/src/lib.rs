@@ -5,6 +5,7 @@
 
 pub mod cuda_types;
 pub mod error;
+pub mod gpu_recovery;
 pub mod handle;
 pub mod health;
 pub mod protocol;
