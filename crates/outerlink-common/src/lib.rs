@@ -20,6 +20,7 @@ pub mod live_migration;
 pub mod memory;
 pub mod metrics;
 pub mod multicast;
+pub mod network_resilience;
 pub mod nvml_types;
 pub mod persistent_kernels;
 pub mod protocol;
