@@ -31,9 +31,13 @@ pub struct UsageAccumulator {
     /// Accumulated VRAM usage in byte-seconds.
     /// Converted to GB-hours by [`Self::vram_gb_hours`].
     vram_byte_secs: u64,
+    /// Sub-second nanosecond remainder for VRAM time accumulation.
+    vram_ns_remainder: u64,
     kernel_launches: u64,
     bytes_transferred_h2d: u64,
     bytes_transferred_d2h: u64,
+    bytes_transferred_d2d: u64,
+    bytes_transferred_p2p: u64,
     cuda_api_calls: u64,
     created_at: Instant,
     last_updated: Option<Instant>,
@@ -46,9 +50,12 @@ impl UsageAccumulator {
             context_id,
             gpu_time_ns: 0,
             vram_byte_secs: 0,
+            vram_ns_remainder: 0,
             kernel_launches: 0,
             bytes_transferred_h2d: 0,
             bytes_transferred_d2h: 0,
+            bytes_transferred_d2d: 0,
+            bytes_transferred_p2p: 0,
             cuda_api_calls: 0,
             created_at: Instant::now(),
             last_updated: None,
@@ -112,9 +119,11 @@ impl UsageAccumulator {
             TransferDirection::DeviceToHost => {
                 self.bytes_transferred_d2h = self.bytes_transferred_d2h.saturating_add(bytes);
             }
-            TransferDirection::DeviceToDevice | TransferDirection::PeerToPeer => {
-                // D2D and P2P are tracked separately -- they don't count as H2D or D2H.
-                // A future extension could add dedicated counters for these.
+            TransferDirection::DeviceToDevice => {
+                self.bytes_transferred_d2d = self.bytes_transferred_d2d.saturating_add(bytes);
+            }
+            TransferDirection::PeerToPeer => {
+                self.bytes_transferred_p2p = self.bytes_transferred_p2p.saturating_add(bytes);
             }
         }
         self.last_updated = Some(Instant::now());
@@ -130,12 +139,12 @@ impl UsageAccumulator {
     ///
     /// `current_vram_bytes` is the number of VRAM bytes currently allocated
     /// by this context, and `elapsed_ns` is the time since the last update.
-    /// Adds `current_vram_bytes * elapsed_ns` to the internal byte-nanosecond
-    /// accumulator.
+    /// Accumulates byte-seconds with sub-second precision via a nanosecond
+    /// remainder that carries across calls.
     pub fn update_vram_time(&mut self, current_vram_bytes: u64, elapsed_ns: u64) {
-        // Convert elapsed from nanoseconds to seconds (integer division).
-        // For sub-second granularity, callers should invoke this frequently.
-        let elapsed_secs = elapsed_ns / 1_000_000_000;
+        let total_ns = self.vram_ns_remainder.saturating_add(elapsed_ns);
+        let elapsed_secs = total_ns / 1_000_000_000;
+        self.vram_ns_remainder = total_ns % 1_000_000_000;
         self.vram_byte_secs = self
             .vram_byte_secs
             .saturating_add(current_vram_bytes.saturating_mul(elapsed_secs));
@@ -193,7 +202,8 @@ impl UsageSnapshot {
             snapshot_at_epoch_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis() as u64,
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
         }
     }
 
