@@ -79,15 +79,18 @@ pub struct DriverVersion {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
+    /// Original patch string preserving zero-padding (e.g. "03").
+    patch_str: String,
 }
 
 impl DriverVersion {
     /// Create a new DriverVersion.
     pub fn new(major: u32, minor: u32, patch: u32) -> Self {
-        Self { major, minor, patch }
+        Self { major, minor, patch, patch_str: format!("{:02}", patch) }
     }
 
     /// Parse from the string format NVIDIA uses, e.g. "535.129.03".
+    /// Preserves the original patch formatting for round-trip fidelity.
     pub fn from_string(s: &str) -> Option<Self> {
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() != 3 {
@@ -96,13 +99,13 @@ impl DriverVersion {
         let major = parts[0].parse::<u32>().ok()?;
         let minor = parts[1].parse::<u32>().ok()?;
         let patch = parts[2].parse::<u32>().ok()?;
-        Some(Self { major, minor, patch })
+        Some(Self { major, minor, patch, patch_str: parts[2].to_string() })
     }
 }
 
 impl fmt::Display for DriverVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch_str)
     }
 }
 
@@ -255,28 +258,23 @@ impl VersionedFunctionTable {
     /// exceed the given CUDA version's minor number.
     ///
     /// Heuristic: CUDA function version N was typically introduced in
-    /// toolkit version N.0 or earlier. We pick the highest version <= cuda_version.minor
-    /// when the major matches the expected range. For safety, if the base
-    /// function has only one variant we always return it.
-    pub fn lookup(&self, name: &str, cuda_version: &CudaVersion) -> Option<&FunctionVersion> {
+    /// Look up the best function variant for a given CUDA version.
+    ///
+    /// CUDA guarantees backward compatibility: newer drivers always support
+    /// older function ABI versions. Since function version suffixes (_v2, _v3)
+    /// are ABI revisions — NOT CUDA minor version numbers — the correct strategy
+    /// is to return the highest available variant. cuGetProcAddress on the server
+    /// side will resolve to the actual supported version at runtime.
+    ///
+    /// The `cuda_version` parameter is reserved for future use when we have a
+    /// per-function "introduced at" table. Currently unused.
+    pub fn lookup(&self, name: &str, _cuda_version: &CudaVersion) -> Option<&FunctionVersion> {
         let variants = self.functions.get(name)?;
         if variants.is_empty() {
             return None;
         }
-        // Pick the highest version whose version_number <= cuda_version.minor,
-        // falling back to the lowest version if none qualifies.
-        let mut best: Option<&FunctionVersion> = None;
-        for v in variants {
-            let vn = v.version_number();
-            if vn <= cuda_version.minor {
-                match best {
-                    Some(b) if b.version_number() >= vn => {}
-                    _ => best = Some(v),
-                }
-            }
-        }
-        // Fallback: return the v1 (unversioned) variant if nothing matched
-        best.or_else(|| variants.iter().find(|v| v.version_number() == 1))
+        // Return the highest ABI version available.
+        variants.iter().max_by_key(|v| v.version_number())
     }
 
     /// Total number of registered variants (across all base names).
@@ -470,7 +468,7 @@ mod tests {
     #[test]
     fn driver_version_display() {
         let dv = DriverVersion::new(535, 129, 3);
-        assert_eq!(dv.to_string(), "535.129.3");
+        assert_eq!(dv.to_string(), "535.129.03");
     }
 
     // --- VersionNegotiation ---
@@ -577,25 +575,25 @@ mod tests {
     }
 
     #[test]
-    fn function_table_lookup_picks_highest_compatible() {
+    fn function_table_lookup_picks_highest_version() {
         let mut table = VersionedFunctionTable::new();
         table.register(FunctionVersion::from_full_name("cuMemAlloc"));
         table.register(FunctionVersion::from_full_name("cuMemAlloc_v2"));
 
-        // CUDA 12.4 should pick v2 (version_number=2, 2 <= 4)
+        // Always picks the highest ABI version (CUDA backward compat guarantee)
         let result = table.lookup("cuMemAlloc", &CudaVersion::new(12, 4)).unwrap();
         assert_eq!(result.version_number(), 2);
     }
 
     #[test]
-    fn function_table_lookup_fallback_to_v1() {
+    fn function_table_lookup_highest_even_for_cuda_12_0() {
         let mut table = VersionedFunctionTable::new();
         table.register(FunctionVersion::from_full_name("cuMemAlloc"));
         table.register(FunctionVersion::from_full_name("cuMemAlloc_v2"));
 
-        // CUDA 12.0 with minor=0: v2 not <= 0, so fallback to v1
+        // CUDA 12.0 still gets v2 — ABI versions != CUDA minor versions
         let result = table.lookup("cuMemAlloc", &CudaVersion::new(12, 0)).unwrap();
-        assert_eq!(result.version_number(), 1);
+        assert_eq!(result.version_number(), 2);
     }
 
     #[test]
