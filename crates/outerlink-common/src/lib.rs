@@ -14,6 +14,7 @@ pub mod error;
 pub mod fault_tolerance;
 pub mod gpu_mixing;
 pub mod gpu_recovery;
+pub mod gpu_sharing;
 pub mod gpu_storage;
 pub mod handle;
 pub mod health;
