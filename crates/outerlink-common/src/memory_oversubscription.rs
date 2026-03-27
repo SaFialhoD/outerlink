@@ -196,6 +196,8 @@ pub enum OversubError {
     PageNotFound(u64),
     /// Allocation size is invalid (zero or not page-aligned).
     InvalidSize,
+    /// Page exists but is in Evicted state — must be restored before spilling.
+    PageEvicted(u64),
 }
 
 impl fmt::Display for OversubError {
@@ -205,6 +207,7 @@ impl fmt::Display for OversubError {
             Self::OutOfHostSpill => write!(f, "host spill buffer exhausted"),
             Self::PageNotFound(addr) => write!(f, "page not found at virtual address {addr:#x}"),
             Self::InvalidSize => write!(f, "invalid allocation size"),
+            Self::PageEvicted(addr) => write!(f, "page at 0x{addr:x} is evicted; restore before spilling"),
         }
     }
 }
@@ -227,7 +230,11 @@ pub struct PageTable {
     config: OversubConfig,
     /// Next virtual address to hand out.
     next_virtual_addr: u64,
-    /// Current host spill offset (bump allocator — never reclaimed; TODO: free-list).
+    /// Current host spill offset (bump allocator).
+    /// FIXME: host spill space is never reclaimed when pages are freed. The spill
+    /// buffer will exhaust under repeated alloc/spill/free cycles even when
+    /// instantaneous usage is low. A free-list is required before production use.
+    /// Partial mitigation: reset to 0 when all pages are freed (in `free()`).
     next_host_offset: u64,
     /// Tracks allocation base address -> total size for multi-page free.
     allocations: std::collections::HashMap<u64, u64>,
@@ -300,6 +307,12 @@ impl PageTable {
         if let Some(alloc_size) = self.allocations.remove(&virtual_addr) {
             let end = virtual_addr + alloc_size;
             self.pages.retain(|p| p.virtual_addr < virtual_addr || p.virtual_addr >= end);
+            // Reset address cursor when table is empty to avoid permanent address space leak.
+            // TODO: proper free-list for partial address reuse.
+            if self.pages.is_empty() {
+                self.next_virtual_addr = 0x1_0000_0000;
+                self.next_host_offset = 0;
+            }
         }
     }
 
@@ -389,9 +402,9 @@ impl PageTable {
         if let PageLocation::HostRam { host_offset } = page.physical_location {
             return Ok(host_offset);
         }
-        // Evicted pages have no VRAM data to spill.
+        // Evicted pages have no VRAM data to spill — must be restored first.
         if page.physical_location == PageLocation::Evicted {
-            return Err(OversubError::PageNotFound(virtual_addr));
+            return Err(OversubError::PageEvicted(virtual_addr));
         }
 
         let offset = self.next_host_offset;
