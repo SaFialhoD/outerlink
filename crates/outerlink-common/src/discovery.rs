@@ -17,14 +17,32 @@ pub const SERVICE_TYPE: &str = "_outterlink._tcp.local.";
 /// Default control plane port.
 pub const DEFAULT_PORT: u16 = 14833;
 
+/// Current protocol version.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 // TXT record keys used in mDNS announcements.
-pub const TXT_VERSION: &str = "version";
-pub const TXT_CLUSTER: &str = "cluster";
-pub const TXT_GPUS: &str = "gpus";
-pub const TXT_VRAM: &str = "vram";
-pub const TXT_RDMA: &str = "rdma";
-pub const TXT_JOINED: &str = "joined";
-pub const TXT_NODE_ID: &str = "node_id";
+pub(crate) const TXT_VERSION: &str = "version";
+pub(crate) const TXT_CLUSTER: &str = "cluster";
+pub(crate) const TXT_GPUS: &str = "gpus";
+pub(crate) const TXT_VRAM: &str = "vram";
+pub(crate) const TXT_RDMA: &str = "rdma";
+pub(crate) const TXT_JOINED: &str = "joined";
+pub(crate) const TXT_NODE_ID: &str = "node_id";
+
+/// Parse a boolean from a TXT record value, accepting common spellings.
+fn parse_bool_lenient(s: &str) -> Option<bool> {
+    match s.to_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Get a non-empty string from a TXT record.
+fn non_empty(txt: &HashMap<String, String>, key: &str) -> Option<String> {
+    let v = txt.get(key)?;
+    if v.is_empty() { None } else { Some(v.clone()) }
+}
 
 /// Information about a discovered OutterLink node.
 #[derive(Debug, Clone)]
@@ -59,19 +77,20 @@ impl DiscoveredNode {
         txt: &HashMap<String, String>,
     ) -> Option<Self> {
         Some(Self {
-            node_id: txt.get(TXT_NODE_ID)?.clone(),
+            node_id: non_empty(txt, TXT_NODE_ID)?,
             addr,
             hostname,
             protocol_version: txt.get(TXT_VERSION)?.parse().ok()?,
-            cluster_id: txt.get(TXT_CLUSTER)?.clone(),
+            cluster_id: non_empty(txt, TXT_CLUSTER)?,
             gpu_count: txt.get(TXT_GPUS)?.parse().ok()?,
             total_vram: txt.get(TXT_VRAM)?.parse().ok()?,
-            rdma_capable: txt.get(TXT_RDMA)?.parse().ok()?,
+            rdma_capable: parse_bool_lenient(txt.get(TXT_RDMA)?)?,
             joined_at: txt.get(TXT_JOINED)?.parse().ok()?,
         })
     }
 
     /// Build TXT record map for mDNS announcement.
+    #[must_use]
     pub fn to_txt_records(&self) -> HashMap<String, String> {
         let mut txt = HashMap::new();
         txt.insert(TXT_NODE_ID.into(), self.node_id.clone());
@@ -143,14 +162,16 @@ pub struct LocalNodeIdentity {
 impl LocalNodeIdentity {
     /// Create a new identity with current timestamp.
     pub fn new(cluster_id: String, gpu_count: u32, total_vram: u64, rdma_capable: bool) -> Self {
-        let joined_at = SystemTime::now()
+        let joined_at: u64 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+            .expect("system clock predates UNIX epoch")
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
 
         Self {
             node_id: uuid::Uuid::new_v4().to_string(),
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
             cluster_id,
             gpu_count,
             total_vram,
@@ -181,6 +202,7 @@ impl LocalNodeIdentity {
 /// Ties are broken by `node_id` (lexicographic order).
 ///
 /// Returns `None` if the slice is empty.
+#[must_use]
 pub fn elect_coordinator(nodes: &[DiscoveredNode]) -> Option<&DiscoveredNode> {
     nodes.iter().min_by(|a, b| {
         a.joined_at
