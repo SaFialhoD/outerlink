@@ -62,7 +62,7 @@ impl Default for CheckpointConfig {
             interval_secs: 300,
             max_snapshots: 3,
             async_write: true,
-            compression: CompressionMethod::None,
+            compression: CompressionMethod::Lz4, // Lz4 is the safe default: 5% overhead, ~2-3x compression
             include_optimizer_state: true,
             storage_path: "/var/lib/outerlink/checkpoints".to_string(),
         }
@@ -222,7 +222,7 @@ impl CheckpointStorage {
 /// Estimates checkpoint duration in milliseconds.
 ///
 /// `bandwidth_bps` is in bits per second.
-/// Applies a compression overhead factor: None=0%, Lz4=5%, Zstd=10-30% based on level.
+/// Applies a compression overhead factor: None=0%, Lz4=5%, Zstd=11-32% based on level (10 + level, clamped 1-22).
 ///
 /// Returns `u64::MAX` if bandwidth is zero.
 pub fn estimate_checkpoint_time(
@@ -273,7 +273,7 @@ mod tests {
         assert_eq!(cfg.interval_secs, 300);
         assert_eq!(cfg.max_snapshots, 3);
         assert!(cfg.async_write);
-        assert!(matches!(cfg.compression, CompressionMethod::None));
+        assert!(matches!(cfg.compression, CompressionMethod::Lz4));
         assert!(cfg.include_optimizer_state);
         assert_eq!(cfg.storage_path, "/var/lib/outerlink/checkpoints");
     }
@@ -358,7 +358,7 @@ mod tests {
             vram_snapshot_bytes: 1024 * 1024,
             dirty_pages: 100,
             total_pages: 100,
-            compression: CompressionMethod::None,
+            compression: CompressionMethod::Lz4, // Lz4 is the safe default: 5% overhead, ~2-3x compression
             duration_ms: 500,
             framework: FrameworkType::PyTorch,
         };
@@ -390,7 +390,7 @@ mod tests {
             vram_snapshot_bytes: 0,
             dirty_pages: 0,
             total_pages: 0,
-            compression: CompressionMethod::None,
+            compression: CompressionMethod::Lz4, // Lz4 is the safe default: 5% overhead, ~2-3x compression
             duration_ms: 0,
             framework: FrameworkType::Unknown,
         };
@@ -423,7 +423,7 @@ mod tests {
             vram_snapshot_bytes: 0,
             dirty_pages: 0,
             total_pages: 0,
-            compression: CompressionMethod::None,
+            compression: CompressionMethod::Lz4, // Lz4 is the safe default: 5% overhead, ~2-3x compression
             duration_ms: 0,
             framework: FrameworkType::Unknown,
         };
@@ -548,7 +548,7 @@ mod tests {
             vram_snapshot_bytes: 100,
             dirty_pages: 1,
             total_pages: 10,
-            compression: CompressionMethod::None,
+            compression: CompressionMethod::Lz4, // Lz4 is the safe default: 5% overhead, ~2-3x compression
             duration_ms: 50,
             framework: FrameworkType::PyTorch,
         };
@@ -559,7 +559,7 @@ mod tests {
             vram_snapshot_bytes: 200,
             dirty_pages: 2,
             total_pages: 10,
-            compression: CompressionMethod::None,
+            compression: CompressionMethod::Lz4, // Lz4 is the safe default: 5% overhead, ~2-3x compression
             duration_ms: 60,
             framework: FrameworkType::PyTorch,
         };
@@ -595,7 +595,7 @@ mod tests {
                 vram_snapshot_bytes: 100,
                 dirty_pages: 1,
                 total_pages: 10,
-                compression: CompressionMethod::None,
+                compression: CompressionMethod::Lz4, // Lz4 is the safe default: 5% overhead, ~2-3x compression
                 duration_ms: 50,
                 framework: FrameworkType::Unknown,
             })
