@@ -35,5 +35,6 @@ pub mod tcp_transport;
 pub mod time_slicing;
 pub mod transport;
 pub mod virtual_nvlink;
+pub mod zero_copy;
 
 pub use error::{OuterLinkError, Result};
