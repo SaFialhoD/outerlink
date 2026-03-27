@@ -71,6 +71,15 @@ static void child_after_fork(void) {
     ol_client_reset_after_fork();
 }
 
+/* Separate once-guard for pthread_atfork registration.
+ * NOT reset in child_after_fork -- prevents double-registration
+ * on fork+reinit cycles. */
+static pthread_once_t fork_handler_once = PTHREAD_ONCE_INIT;
+
+static void register_fork_handler(void) {
+    pthread_atfork(NULL, NULL, child_after_fork);
+}
+
 static void do_init(void) {
     /* Resolve the real dlsym if we haven't already */
     if (!real_dlsym) {
@@ -78,8 +87,8 @@ static void do_init(void) {
             __libc_dlsym(RTLD_NEXT, "dlsym");
     }
 
-    /* Register fork handler so the child process knows the client is stale */
-    pthread_atfork(NULL, NULL, child_after_fork);
+    /* Register fork handler (once per process, not reset on fork) */
+    pthread_once(&fork_handler_once, register_fork_handler);
 
     /* Initialize the Rust client (connects to server, sets up handle tables) */
     ol_client_init();
