@@ -6,6 +6,7 @@
 pub mod cuda_types;
 pub mod error;
 pub mod handle;
+pub mod metrics;
 pub mod protocol;
 pub mod retry;
 pub mod tcp_transport;
