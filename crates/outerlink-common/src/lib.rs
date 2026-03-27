@@ -37,6 +37,7 @@ pub mod security;
 pub mod tcp_transport;
 pub mod time_slicing;
 pub mod transport;
+pub mod usage_metering;
 pub mod virtual_nvlink;
 pub mod zero_copy;
 
