@@ -8,6 +8,7 @@ pub mod error;
 pub mod handle;
 pub mod protocol;
 pub mod retry;
+pub mod security;
 pub mod tcp_transport;
 pub mod transport;
 
