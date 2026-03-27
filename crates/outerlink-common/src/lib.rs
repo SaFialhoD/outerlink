@@ -23,6 +23,7 @@ pub mod multicast;
 pub mod network_resilience;
 pub mod nvml_types;
 pub mod persistent_kernels;
+pub mod pinned_memory;
 pub mod protocol;
 pub mod retry;
 pub mod scatter_gather;
