@@ -227,8 +227,10 @@ pub struct PageTable {
     config: OversubConfig,
     /// Next virtual address to hand out.
     next_virtual_addr: u64,
-    /// Current host spill offset (monotonically increasing simple allocator).
+    /// Current host spill offset (bump allocator — never reclaimed; TODO: free-list).
     next_host_offset: u64,
+    /// Tracks allocation base address -> total size for multi-page free.
+    allocations: std::collections::HashMap<u64, u64>,
 }
 
 impl PageTable {
@@ -236,12 +238,23 @@ impl PageTable {
     ///
     /// Virtual addresses start at `0x1_0000_0000` to avoid confusion with
     /// real GPU pointers in the low address range.
+    /// Create a new page table. Panics if virtual_vram < physical_vram or physical_vram is 0.
     pub fn new(config: OversubConfig) -> Self {
+        assert!(
+            config.physical_vram_bytes > 0,
+            "physical_vram_bytes must be > 0"
+        );
+        assert!(
+            config.virtual_vram_bytes >= config.physical_vram_bytes,
+            "virtual_vram_bytes ({}) must be >= physical_vram_bytes ({})",
+            config.virtual_vram_bytes, config.physical_vram_bytes
+        );
         Self {
             pages: Vec::new(),
             config,
             next_virtual_addr: 0x1_0000_0000,
             next_host_offset: 0,
+            allocations: std::collections::HashMap::new(),
         }
     }
 
@@ -275,17 +288,19 @@ impl PageTable {
         }
 
         self.next_virtual_addr = base_addr + size as u64;
+        self.allocations.insert(base_addr, size as u64);
         Ok(base_addr)
     }
 
     /// Free the page(s) starting at `virtual_addr`.
     ///
-    /// Removes all contiguous pages that were part of the allocation rooted
-    /// at `virtual_addr`. Currently removes only the single page at that
-    /// address; multi-page freeing is handled by removing all pages whose
-    /// address falls within the original allocation range.
+    /// Removes all pages in the allocation range [virtual_addr, virtual_addr + size).
+    /// Freeing an address not in the allocation map is a no-op.
     pub fn free(&mut self, virtual_addr: u64) {
-        self.pages.retain(|p| p.virtual_addr != virtual_addr);
+        if let Some(alloc_size) = self.allocations.remove(&virtual_addr) {
+            let end = virtual_addr + alloc_size;
+            self.pages.retain(|p| p.virtual_addr < virtual_addr || p.virtual_addr >= end);
+        }
     }
 
     /// Total bytes currently resident in GPU VRAM.
@@ -360,6 +375,8 @@ impl PageTable {
 
     /// Mark a page as spilled to host RAM. Returns the host offset assigned.
     ///
+    /// Idempotent: if the page is already spilled, returns the existing offset.
+    /// Only pages currently in GpuVram can be spilled. Evicted pages return an error.
     /// Fails with `OutOfHostSpill` if the host spill limit is exceeded.
     pub fn spill_page(&mut self, virtual_addr: u64) -> Result<u64, OversubError> {
         let page = self
@@ -367,6 +384,15 @@ impl PageTable {
             .iter_mut()
             .find(|p| p.virtual_addr == virtual_addr)
             .ok_or(OversubError::PageNotFound(virtual_addr))?;
+
+        // Already spilled — return existing offset (idempotent).
+        if let PageLocation::HostRam { host_offset } = page.physical_location {
+            return Ok(host_offset);
+        }
+        // Evicted pages have no VRAM data to spill.
+        if page.physical_location == PageLocation::Evicted {
+            return Err(OversubError::PageNotFound(virtual_addr));
+        }
 
         let offset = self.next_host_offset;
         if offset + page.size_bytes as u64 > self.config.host_spill_limit_bytes {
