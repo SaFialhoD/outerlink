@@ -14,6 +14,7 @@ pub mod gpu_mixing;
 pub mod gpu_storage;
 pub mod hip_interception;
 pub mod handle;
+pub mod health;
 pub mod kernel_splitting;
 pub mod live_migration;
 pub mod memory;
