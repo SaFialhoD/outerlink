@@ -107,9 +107,15 @@ impl VramQuota {
         Ok(())
     }
 
-    /// Release `bytes` back. Saturates at zero (never underflows).
+    /// Release `bytes` back. Debug-asserts that bytes <= allocated_bytes.
+    /// Saturates at zero in release builds as a safety net.
     #[inline]
     pub fn release(&mut self, bytes: u64) {
+        debug_assert!(
+            bytes <= self.allocated_bytes,
+            "release({bytes}) exceeds allocated_bytes({})",
+            self.allocated_bytes
+        );
         self.allocated_bytes = self.allocated_bytes.saturating_sub(bytes);
     }
 }
@@ -130,17 +136,19 @@ pub struct ComputeQuota {
 }
 
 impl ComputeQuota {
-    /// Create with defaults: 100% compute, 100ms slice, priority 128.
+    /// Create with defaults: 100ms slice, priority 128.
+    /// Panics if max_percent is not finite or not in [0.0, 100.0].
     pub fn new(max_percent: f64) -> Self {
-        Self {
-            max_percent,
-            time_slice_ms: 100,
-            priority: 128,
-        }
+        Self::with_params(max_percent, 100, 128)
     }
 
     /// Create with all parameters specified.
+    /// Panics if max_percent is not finite or not in [0.0, 100.0].
     pub fn with_params(max_percent: f64, time_slice_ms: u32, priority: u8) -> Self {
+        assert!(
+            max_percent.is_finite() && max_percent >= 0.0 && max_percent <= 100.0,
+            "max_percent must be in [0.0, 100.0], got {max_percent}"
+        );
         Self {
             max_percent,
             time_slice_ms,
@@ -246,9 +254,12 @@ impl GpuPartitionTable {
     }
 
     /// Add a new fraction. Returns the assigned context_id.
+    /// Panics if context_id counter is exhausted (u64::MAX — unreachable in practice).
     pub fn add_fraction(&mut self, config: &FractionConfig) -> u64 {
         let id = self.next_context_id;
-        self.next_context_id += 1;
+        self.next_context_id = self.next_context_id
+            .checked_add(1)
+            .expect("context_id counter exhausted");
         self.fractions.push(GpuFraction::from_config(config, id));
         id
     }
