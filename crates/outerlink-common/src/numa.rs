@@ -113,8 +113,11 @@ impl NumaTopology {
     }
 
     /// Returns `true` if the GPU and NIC are on the same NUMA node.
-    pub fn gpu_nic_same_node(&self, gpu_node: u32, nic_node: u32) -> bool {
-        gpu_node == nic_node
+    /// Returns `None` if either device is not found in the topology.
+    pub fn gpu_nic_same_node(&self, gpu_pci: &str, nic_pci: &str) -> Option<bool> {
+        let gpu_node = self.find_node_for_device(gpu_pci)?;
+        let nic_node = self.find_node_for_device(nic_pci)?;
+        Some(gpu_node == nic_node)
     }
 }
 

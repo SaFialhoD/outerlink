@@ -174,12 +174,12 @@ fn topology_find_device_missing() {
 fn topology_gpu_nic_same_node_true() {
     // Single socket -- everything is on node 0
     let topo = single_socket_topology();
-    assert!(topo.gpu_nic_same_node(0, 0));
+    assert_eq!(topo.gpu_nic_same_node("0000:01:00.0", "0000:02:00.0"), Some(true));
 }
 
 #[test]
 fn topology_gpu_nic_same_node_false() {
-    assert!(!dual_socket_topology().gpu_nic_same_node(0, 1));
+    assert_eq!(dual_socket_topology().gpu_nic_same_node("0000:01:00.0", "0000:82:00.0"), Some(false));
 }
 
 #[test]
