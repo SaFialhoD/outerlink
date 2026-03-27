@@ -254,10 +254,6 @@ impl VersionedFunctionTable {
             .push(func);
     }
 
-    /// Look up the highest-version variant whose version number does not
-    /// exceed the given CUDA version's minor number.
-    ///
-    /// Heuristic: CUDA function version N was typically introduced in
     /// Look up the best function variant for a given CUDA version.
     ///
     /// CUDA guarantees backward compatibility: newer drivers always support
