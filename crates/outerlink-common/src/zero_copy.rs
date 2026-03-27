@@ -8,12 +8,12 @@
 //!
 //! # Transfer Mode Progression
 //!
-//! | Phase | Mode              | Kernel copies | CPU involved? |
-//! |-------|-------------------|---------------|---------------|
-//! | 1.0   | Standard          | 4             | yes           |
-//! | 1.5   | MsgZeroCopy       | 2             | yes           |
-//! | 1.7   | IoUringRegistered | 1             | yes           |
-//! | 5.0   | OpenDma           | 0             | no            |
+//! | Phase | Mode              | Total copies | CPU involved? |
+//! |-------|-------------------|--------------|---------------|
+//! | 1.0   | Standard          | 4            | yes           |
+//! | 1.5   | MsgZeroCopy       | 3            | yes           |
+//! | 1.7   | IoUringRegistered | 2            | yes           |
+//! | 5.0   | OpenDma           | 0            | no            |
 //!
 //! # Safety notes
 //!
@@ -156,12 +156,11 @@ impl TransferPath {
     /// The actual mode that will be used, after downgrading based on buffer
     /// pinning requirements.
     ///
-    /// Downgrade rules:
-    /// - `OpenDma` requires both pinned -> downgrades to `IoUringRegistered`
-    ///   if possible, else `MsgZeroCopy` if src pinned, else `Standard`.
-    /// - `IoUringRegistered` requires both pinned -> downgrades to
-    ///   `MsgZeroCopy` if src pinned, else `Standard`.
-    /// - `MsgZeroCopy` requires src pinned -> downgrades to `Standard`.
+    /// Downgrade rules (pinning-based only; for config-aware routing use
+    /// `select_transfer_mode`):
+    /// - `OpenDma` requires both pinned -> `MsgZeroCopy` if src pinned, else `Standard`.
+    /// - `IoUringRegistered` requires both pinned -> `MsgZeroCopy` if src pinned, else `Standard`.
+    /// - `MsgZeroCopy` requires src pinned -> `Standard` if not.
     /// - `Standard` never downgrades.
     pub fn effective_mode(&self) -> TransferMode {
         match self.mode {
